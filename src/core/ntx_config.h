@@ -3,7 +3,10 @@
 
 #include <stdint.h>
 
-#define NTX_VERSION "0.1.0" /* keep in sync with CHANGELOG.md */
+/* Base version of a local build. Release builds override it: make ntx NTX_VERSION=1.2.3 */
+#ifndef NTX_VERSION
+#define NTX_VERSION "0.1.0"
+#endif
 
 typedef struct {
     const char *store_dir;

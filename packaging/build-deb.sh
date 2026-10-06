@@ -24,6 +24,9 @@ cd "$(dirname "$0")/.."
 glibc=$(getconf GNU_LIBC_VERSION | grep -Eo '[0-9]+\.[0-9]+$')
 [ -n "$glibc" ] || { echo "error: cannot detect the glibc version" >&2; exit 1; }
 
+# Debian sorts "0.1.0-rc1" after "0.1.0"; "~" sorts before, which is what a pre-release needs.
+deb_version=${version/-/\~}
+
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
 
@@ -38,7 +41,7 @@ chmod 0644 "$root/usr/share/doc/ntx/changelog.gz"
 size_kb=$(du -sk "$root/usr" | cut -f1)
 cat > "$root/DEBIAN/control" <<EOF
 Package: ntx
-Version: $version
+Version: $deb_version
 Section: net
 Priority: optional
 Architecture: $arch

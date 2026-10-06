@@ -1,36 +1,34 @@
 # Releasing
 
-A release is produced by pushing a version tag. The workflow
-[`.github/workflows/release.yml`](../.github/workflows/release.yml) does the rest.
+Releases are made by GitHub Actions
+([`.github/workflows/release.yml`](../.github/workflows/release.yml)). The version number comes from git, not from
+a file: the workflow passes it to the build (`make ntx NTX_VERSION=1.2.3`), so `ntx --version`, the `.deb` and the
+release all agree. The `NTX_VERSION` default in `src/core/ntx_config.h` is only what a local build prints.
 
-## Steps
+## How a version is chosen
 
-1. Set the version in `src/core/ntx_config.h` (`NTX_VERSION`), for example `"0.2.0"`.
-2. In `CHANGELOG.md`, make sure there is a section whose heading starts with that version
-   (`## 0.2.0 - 2026-11-01`). Its text becomes the release notes; the workflow fails if the section is missing.
-3. Commit, then tag and push:
+| Event | Version |
+|-------|---------|
+| Push to `main` | The highest stable tag `vX.Y.Z` with the patch number plus one (`v0.1.0` first, then `v0.1.1`, ...). Pre-release tags are ignored when counting. |
+| Push of a tag `vX.Y.Z` | Exactly that version. Use this to start a new minor or major line: tagging `v0.2.0` makes the next push release `v0.2.1`. |
+| Push of a tag `vX.Y.Z-suffix` (for example `v0.1.0-rc1`) | Exactly that version, published as a pre-release. |
+| Manual run from the Actions tab | The next patch version is built and tested, and the files are kept as workflow artifacts. Nothing is published. |
 
-   ```sh
-   git tag v0.2.0
-   git push origin v0.2.0
-   ```
+Put `[skip release]` in the head commit message of a push to `main` to skip the release (the workflow then does
+nothing). Only one release runs at a time. If several pushes arrive while one is running, GitHub keeps only the
+newest of the waiting runs, so not every push is guaranteed its own version.
 
-   The tag must be `v` plus exactly `NTX_VERSION`, otherwise the workflow stops. A version with a hyphen
-   (`v0.2.0-rc1`) is published as a pre-release.
-
-## Trying it without publishing
-
-The workflow can also be started by hand from the Actions tab (`workflow_dispatch`). That run builds, tests
-and packages on both architectures and keeps the files as workflow artifacts, but it never creates a release:
-only a pushed tag does.
+The release notes are the section of `CHANGELOG.md` whose heading starts with the version (`## 0.1.0 - ...`; a
+pre-release suffix is ignored when looking it up), followed by an install hint and the list of commits since the
+previous release. Versions without a changelog section get only the commit list.
 
 ## What the workflow does
 
-On Ubuntu 22.04 runners, one for x86-64 and one for arm64, it runs `make ntx`, `make size`, `make test`,
+On Ubuntu 22.04 runners, one for x86-64 and one for arm64, it builds, runs `make size`, `make test`,
 `make test-cli`, `make test-net`, `make test-ipc` and `make test-tls13`, and only then packages. Nothing is
 published unless both architectures pass.
 
-The release contains:
+Each release contains:
 
 | File | Contents |
 |------|----------|
@@ -39,12 +37,13 @@ The release contains:
 | `SHA256SUMS` | Checksums of all of the above |
 
 The `.deb` is built by [`packaging/build-deb.sh`](../packaging/build-deb.sh). It depends only on `libc6`, with the
-minimum version taken from the glibc of the build machine. The binaries are dynamically linked against glibc;
-there is no static (musl) release build.
+minimum version taken from the glibc of the build machine. For a pre-release the package version uses `~`
+(`0.1.0~rc1`) so that it sorts before `0.1.0`. The binaries are dynamically linked against glibc; there is no
+static (musl) release build.
 
 ## Building a package by hand
 
 ```sh
-make ntx
+make ntx NTX_VERSION=0.2.0
 packaging/build-deb.sh 0.2.0 amd64 ./ntx dist   # or arm64, matching the machine that built ./ntx
 ```

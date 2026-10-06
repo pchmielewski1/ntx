@@ -57,9 +57,10 @@ No OpenSSL, no libcurl, no cmake: the binary links against `libc` and `libm` onl
 
 ## Install
 
-Tagged releases on the [Releases page](https://github.com/pchmielewski1/ntx/releases) ship, for
-x86-64 and arm64 Linux: a plain binary, a `.deb` package and a `SHA256SUMS` file. They are built on
-Ubuntu 22.04 (glibc 2.35), so they also run on older distributions.
+Every push to `main` that passes the tests is published on the
+[Releases page](https://github.com/pchmielewski1/ntx/releases) with the next version number. Each release has,
+for x86-64 and arm64 Linux, a plain binary, a `.deb` package and a `SHA256SUMS` file. They are built on
+Ubuntu 22.04 (glibc 2.35), so they also run on older distributions. See [docs/releasing.md](docs/releasing.md).
 
 ```sh
 sudo apt install ./ntx_<version>_amd64.deb     # or _arm64.deb; installs /usr/bin/ntx

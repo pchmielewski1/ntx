@@ -1,20 +1,76 @@
 name: release
 
-# Pushing a tag such as v0.1.0 builds ntx for x86-64 and arm64, runs the full test set on each, and publishes a
-# GitHub release with the binaries, .deb packages and a SHA256SUMS file.
+# Every push to main publishes a new release with the patch number incremented (v0.1.0, v0.1.1, ...), unless
+# the head commit message contains "[skip release]". Pushing a tag vX.Y.Z (or vX.Y.Z-rc1, published as a
+# pre-release) publishes exactly that version instead. Each release has the binaries and .deb packages for
+# x86-64 and arm64 and a SHA256SUMS file; nothing is published unless the tests pass on both architectures.
 on:
   push:
+    branches: [main]
     tags: ['v*']
-  # Manual run from the Actions tab: builds and tests everything and uploads the files as workflow artifacts,
-  # but publishes nothing (only a pushed tag creates a release).
+  # Manual run from the Actions tab: builds and tests everything and keeps the files as workflow artifacts,
+  # but publishes nothing.
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# One release at a time, so two quick pushes cannot pick the same version number.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  version:
+    name: pick the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      build: ${{ steps.v.outputs.build }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          build=true
+          publish=true
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if ! printf '%s' "$GITHUB_REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+              echo "::error::tag $GITHUB_REF_NAME is not of the form vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-suffix"
+              exit 1
+            fi
+            version="${GITHUB_REF_NAME#v}"
+          else
+            # Next patch number after the highest stable tag (pre-release tags are ignored); 0.1.0 if there is none.
+            last=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+            if [ -z "$last" ]; then
+              version=0.1.0
+            else
+              IFS=. read -r major minor patch <<< "${last#v}"
+              version="$major.$minor.$((patch + 1))"
+            fi
+            if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+              publish=false
+            elif printf '%s' "$COMMIT_MESSAGE" | grep -qF '[skip release]'; then
+              build=false
+              publish=false
+            fi
+          fi
+          echo "version=$version build=$build publish=$publish"
+          {
+            echo "version=$version"
+            echo "build=$build"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+
   build:
     name: build (${{ matrix.arch }})
+    needs: version
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: true
       matrix:
@@ -23,26 +79,20 @@ jobs:
           - { runner: ubuntu-22.04,     arch: x86_64,  deb_arch: amd64 }
           - { runner: ubuntu-22.04-arm, arch: aarch64, deb_arch: arm64 }
     runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Version (a tag must match the version in the source)
-        run: |
-          src_version=$(sed -n 's/^#define NTX_VERSION "\(.*\)".*/\1/p' src/core/ntx_config.h)
-          if [ "$GITHUB_REF_TYPE" = tag ] && [ "${GITHUB_REF_NAME#v}" != "$src_version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match NTX_VERSION $src_version in src/core/ntx_config.h"
-            exit 1
-          fi
-          echo "VERSION=$src_version" >> "$GITHUB_ENV"
-
       - name: Build
-        run: make ntx
+        run: make ntx NTX_VERSION="$VERSION"
 
       - name: Size gate (< 1 MiB)
         run: make size
 
       - name: Tests
         run: |
+          ./ntx --version
           make test
           make test-cli
           make test-net
@@ -65,11 +115,13 @@ jobs:
 
   publish:
     name: publish release
-    needs: build
-    if: github.ref_type == 'tag'
+    needs: [version, build]
+    if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -87,16 +139,11 @@ jobs:
 
       - name: Release notes
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          # The CHANGELOG.md section for this version ("## <version> ..." up to the next "## ").
-          awk -v v="$version" '
+          # The CHANGELOG.md section for this version, if there is one ("## <version> ..." up to the next "## ").
+          awk -v v="${VERSION%%-*}" '
             /^## / { if (found) exit; if (index($0, "## " v " ") == 1 || $0 == "## " v) found = 1; next }
             found { print }
           ' CHANGELOG.md > notes.md
-          if [ ! -s notes.md ]; then
-            echo "::error::CHANGELOG.md has no section for version $version"
-            exit 1
-          fi
           cat >> notes.md <<'EOF'
 
           ## Install
@@ -105,16 +152,18 @@ jobs:
           - **Any Linux:** download the binary for your CPU (`x86_64` or `aarch64`), `chmod +x` it and run it.
           - Check the download against `SHA256SUMS`.
           EOF
-          sed -i "s/@VERSION@/$version/" notes.md
+          sed -i "s/@VERSION@/$VERSION/" notes.md
 
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
           flags=""
-          case "$version" in *-*) flags="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "ntx $version" \
+          case "$VERSION" in *-*) flags="--prerelease" ;; esac
+          # --generate-notes appends the list of commits since the previous release to the notes above.
+          gh release create "v$VERSION" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "ntx $VERSION" \
             --notes-file notes.md \
+            --generate-notes \
             $flags

@@ -8,10 +8,12 @@ HARDEN_CFLAGS ?= -fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 
 HARDEN_LDFLAGS ?= -pie -Wl,-z,relro,-z,now,-z,noexecstack
 LDLIBS := -lm
 SRCS := $(shell find src -name '*.c')
+# Release builds set the version from the git tag: make ntx NTX_VERSION=1.2.3 (default: see src/core/ntx_config.h).
+VERSION_DEFINE := $(if $(NTX_VERSION),-DNTX_VERSION='"$(NTX_VERSION)"')
 
 .PHONY: all test test-net test-cli test-interop test-ipc interop_ipc size static clean probe test-live test-tls13
 
-ntx: $(SRCS) ; $(CC) $(CFLAGS) $(HARDEN_CFLAGS) -o $@ $(SRCS) $(LDFLAGS) $(HARDEN_LDFLAGS) $(LDLIBS)
+ntx: $(SRCS) ; $(CC) $(CFLAGS) $(HARDEN_CFLAGS) $(VERSION_DEFINE) -o $@ $(SRCS) $(LDFLAGS) $(HARDEN_LDFLAGS) $(LDLIBS)
 all: ntx
 probe: test/trk_http_probe.c src/proto/ntx_http.c src/proto/ntx_tracker.c src/proto/ntx_bencode.c src/net/ntx_sock.c src/net/ntx_addr.c src/net/ntx_proxy.c src/proto/ntx_doh.c src/proto/ntx_h2.c src/net/ntx_tls.c src/net/ntx_tls_rec.c src/ui/ntx_diag.c src/crypto/ntx_sha1.c src/crypto/ntx_sha256.c src/crypto/ntx_hmac.c src/crypto/ntx_aes.c src/crypto/ntx_rng.c src/crypto/ntx_x25519_fe.c src/crypto/ntx_x25519.c src/crypto/ntx_bignum.c src/crypto/ntx_rsa_pkcs1.c src/crypto/ntx_p256.c src/proto/ntx_http_url.c src/proto/ntx_https.c src/proto/ntx_https_pin.c src/crypto/ntx_hkdf.c src/net/ntx_tls13.c
 	$(CC) $(CFLAGS) -I. -o trk_http_probe test/trk_http_probe.c src/proto/ntx_http.c src/proto/ntx_tracker.c src/proto/ntx_bencode.c src/net/ntx_sock.c src/net/ntx_addr.c src/net/ntx_proxy.c src/proto/ntx_doh.c src/proto/ntx_h2.c src/net/ntx_tls.c src/net/ntx_tls_rec.c src/ui/ntx_diag.c src/crypto/ntx_sha1.c src/crypto/ntx_sha256.c src/crypto/ntx_hmac.c src/crypto/ntx_aes.c src/crypto/ntx_rng.c src/crypto/ntx_x25519_fe.c src/crypto/ntx_x25519.c src/crypto/ntx_bignum.c src/crypto/ntx_rsa_pkcs1.c src/crypto/ntx_p256.c src/proto/ntx_http_url.c src/proto/ntx_https.c src/proto/ntx_https_pin.c src/crypto/ntx_hkdf.c src/net/ntx_tls13.c $(LDFLAGS) $(LDLIBS)
