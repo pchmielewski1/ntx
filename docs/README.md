@@ -15,6 +15,7 @@ welcome.
 | [testing.md](testing.md) | `make` test targets and what each suite covers |
 | [fuzzing.md](fuzzing.md) | libFuzzer harnesses and the crypto-change policy |
 | [module-map.md](module-map.md) | Every source file under `src/` and its responsibility |
+| [releasing.md](releasing.md) | How a release is built and published (binaries, `.deb`) |
 | [roadmap.md](roadmap.md) | Ideas and known gaps; nothing there is promised |
 
 Outside this directory:

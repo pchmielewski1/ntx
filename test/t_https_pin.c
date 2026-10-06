@@ -98,6 +98,7 @@ static int test_pin_file(void) {
         if (c == EOF || c == '\n' || c == '\r') break;
         hex[i] = (char)c;
     }
+    hex[i] = '\0';
     fclose(f);
     if (strlen(hex) != 64u) return fail("hex vector len");
     if (hex_to_bin(hex, exp, 32) != 0) return fail("hex vector decode");

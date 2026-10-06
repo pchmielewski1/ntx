@@ -1,0 +1,120 @@
+name: release
+
+# Pushing a tag such as v0.1.0 builds ntx for x86-64 and arm64, runs the full test set on each, and publishes a
+# GitHub release with the binaries, .deb packages and a SHA256SUMS file.
+on:
+  push:
+    tags: ['v*']
+  # Manual run from the Actions tab: builds and tests everything and uploads the files as workflow artifacts,
+  # but publishes nothing (only a pushed tag creates a release).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Ubuntu 22.04 (glibc 2.35) so the binaries also run on older distributions.
+          - { runner: ubuntu-22.04,     arch: x86_64,  deb_arch: amd64 }
+          - { runner: ubuntu-22.04-arm, arch: aarch64, deb_arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version (a tag must match the version in the source)
+        run: |
+          src_version=$(sed -n 's/^#define NTX_VERSION "\(.*\)".*/\1/p' src/core/ntx_config.h)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "${GITHUB_REF_NAME#v}" != "$src_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match NTX_VERSION $src_version in src/core/ntx_config.h"
+            exit 1
+          fi
+          echo "VERSION=$src_version" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: make ntx
+
+      - name: Size gate (< 1 MiB)
+        run: make size
+
+      - name: Tests
+        run: |
+          make test
+          make test-cli
+          make test-net
+          make test-ipc
+          make test-tls13
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp ntx "dist/ntx-${VERSION}-linux-${{ matrix.arch }}"
+          strip --strip-unneeded "dist/ntx-${VERSION}-linux-${{ matrix.arch }}"
+          packaging/build-deb.sh "$VERSION" "${{ matrix.deb_arch }}" ./ntx dist
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The CHANGELOG.md section for this version ("## <version> ..." up to the next "## ").
+          awk -v v="$version" '
+            /^## / { if (found) exit; if (index($0, "## " v " ") == 1 || $0 == "## " v) found = 1; next }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for version $version"
+            exit 1
+          fi
+          cat >> notes.md <<'EOF'
+
+          ## Install
+
+          - **Debian / Ubuntu:** `sudo apt install ./ntx_@VERSION@_amd64.deb` (or `_arm64.deb`).
+          - **Any Linux:** download the binary for your CPU (`x86_64` or `aarch64`), `chmod +x` it and run it.
+          - Check the download against `SHA256SUMS`.
+          EOF
+          sed -i "s/@VERSION@/$version/" notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          flags=""
+          case "$version" in *-*) flags="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "ntx $version" \
+            --notes-file notes.md \
+            $flags

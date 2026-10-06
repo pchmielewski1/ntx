@@ -355,7 +355,7 @@ static int sm_input_state(ntx_utp_conn *c, const ntx_utp_hdr *h) {
     int16_t d = (int16_t)(h->ack_nr - c->send_acked);
     if (d > 0) {
         uint32_t outstanding_before = c->cur_window;
-        struct ntx_utp_fl oldest;
+        struct ntx_utp_fl oldest = {0}; /* silences a false -Wmaybe-uninitialized on older gcc */
         int have_oldest = 0;
         while (c->fl_n > 0 &&
                (int16_t)(c->fl[c->fl_head].seq - h->ack_nr) <= 0) {

@@ -55,6 +55,19 @@ SPKI pins instead of system DNS and a CA store) is small enough to audit yoursel
 
 No OpenSSL, no libcurl, no cmake: the binary links against `libc` and `libm` only.
 
+## Install
+
+Tagged releases on the [Releases page](https://github.com/pchmielewski1/ntx/releases) ship, for
+x86-64 and arm64 Linux: a plain binary, a `.deb` package and a `SHA256SUMS` file. They are built on
+Ubuntu 22.04 (glibc 2.35), so they also run on older distributions.
+
+```sh
+sudo apt install ./ntx_<version>_amd64.deb     # or _arm64.deb; installs /usr/bin/ntx
+# or, any Linux: chmod +x ntx-<version>-linux-x86_64 && ./ntx-<version>-linux-x86_64 <magnet|file.torrent>
+```
+
+Or build from source, as below.
+
 ## Quick start
 
 ```sh
