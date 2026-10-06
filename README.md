@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/images/ntx-banner.jpg" alt="ntx: a tiny BitTorrent client in C" width="720"></p>
+
 # ntx
 
 A BitTorrent client in one small C binary. **C11 + POSIX, `libc` + `libm` only**: no OpenSSL,
