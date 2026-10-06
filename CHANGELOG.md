@@ -2,7 +2,7 @@
 
 ## 0.1.0 - 2026-10-06
 
-First public version. Version `0.1.0` is also what `ntx --version` prints.
+First public version. `ntx --version` prints the version of the release it was built for.
 
 ### Features
 - BitTorrent v1, v2 and hybrid (BEP 52) downloading and seeding; magnet links, `.torrent` files,
