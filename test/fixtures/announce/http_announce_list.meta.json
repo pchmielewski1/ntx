@@ -1,0 +1,43 @@
+{
+  "date": "2026-09-03",
+  "expected": {
+    "interval": 1800,
+    "leechers": 17,
+    "peers4": [
+      [
+        "192.0.2.10",
+        6881
+      ],
+      [
+        "192.0.2.11",
+        6882
+      ],
+      [
+        "192.0.2.12",
+        6883
+      ],
+      [
+        "192.0.2.13",
+        6884
+      ]
+    ],
+    "peers6": [
+      [
+        "2001:db8::5",
+        6999
+      ],
+      [
+        "2001:db8::11",
+        6998
+      ],
+      [
+        "2001:db8:0:0:0:0:0:100",
+        6997
+      ]
+    ],
+    "seeders": 42
+  },
+  "name": "http_announce_list",
+  "scrub_notes": "Privacy-scrubbed synthetic fixture: no real peers, trackers or DHT nodes. All IPv4 addresses from RFC 5737 documentation space 192.0.2.0/24, all IPv6 from 2001:db8::/48. IDs, tokens, counters and ports are fixed synthetic constants. Generated offline by test/scripts/gen_fixtures_announce_dht_pe.py; no clock dependence in output.",
+  "source": "synthesized from docs/protocol.md (trackers: HTTP, compact 6 B/peer; BEP32 peers6 18 B/peer)"
+}

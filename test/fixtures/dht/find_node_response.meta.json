@@ -1,0 +1,40 @@
+{
+  "date": "2026-09-03",
+  "expected": {
+    "id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3",
+    "nodes": [
+      [
+        "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+        "192.0.2.51",
+        7000
+      ],
+      [
+        "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+        "192.0.2.52",
+        7001
+      ],
+      [
+        "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+        "192.0.2.53",
+        7002
+      ]
+    ],
+    "nodes6": [
+      [
+        "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
+        "2001:db8::51",
+        7100
+      ],
+      [
+        "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+        "2001:db8::52",
+        7101
+      ]
+    ],
+    "tid": "1122",
+    "y": "r"
+  },
+  "name": "find_node_response",
+  "scrub_notes": "Privacy-scrubbed synthetic fixture: no real peers, trackers or DHT nodes. All IPv4 addresses from RFC 5737 documentation space 192.0.2.0/24, all IPv6 from 2001:db8::/48. IDs, tokens, counters and ports are fixed synthetic constants. Generated offline by test/scripts/gen_fixtures_announce_dht_pe.py; no clock dependence in output.",
+  "source": "synthesized from docs/protocol.md (DHT BEP5 find_node response, dual-stack)"
+}

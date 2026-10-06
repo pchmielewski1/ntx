@@ -1,0 +1,71 @@
+# Build output (Makefile)
+*.o
+*.d
+*.a
+build/
+.test.tmp
+
+# Binaries: the main one (ntx) and the tests (test/t_*.c -> test/t_*)
+/ntx
+test/t_*
+!test/t_*.c
+
+# Temporary debug / test files
+test/debug_*
+.dbg*
+.t_*
+.tui_test.raw
+.test.be9
+.test.dh
+.test.magnet.log
+.crash.log
+.live.log
+ntx-verbose.log
+.live.exit
+.test.torrent
+.test_min
+.test_quick
+.test_tmp*
+tmp.txt
+
+# Downloaded data (ntx_store)
+downloads/
+test/store_test.tmp
+test/t1_store.tmp
+test/t1p1.tmp
+test/t1p2.tmp
+test/t2_store/
+test/t3_store/
+
+# Scratch space for tests and scripts (the real tests are tracked)
+test/.scratch/
+test/.ntx-size-baseline
+test/wt-*/
+test/scripts/__pycache__/
+**/__pycache__/
+*.pyc
+
+# AI-assistant tooling and its working documents (never published)
+docs/superpowers/
+.superpowers/
+.claude/
+.cursor/
+.opencode/
+.gitnexus/
+AGENTS.md
+CLAUDE.md
+
+# sshfs/fuse leftovers
+.fuse_hidden*
+
+# Editors / OS
+*~
+*.swp
+.vscode/
+.idea/
+.DS_Store
+
+# Probe binary (make probe) and other temporary binaries
+/trk_http_probe
+.test-live.tmp
+.tls_probe.tmp

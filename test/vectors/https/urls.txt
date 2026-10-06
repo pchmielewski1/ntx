@@ -1,0 +1,16 @@
+# URL test vectors for ntx_http_url_parse (rfc-refs S1)
+# format: <url>  # <expected host> <expected port> <expected path>
+http://host/path
+# host=host port=80 path=/path
+https://host/path
+# host=host port=443 path=/path
+http://h:8080/announce
+# host=h port=8080 path=/announce
+https://[::1]:8443/announce
+# host=::1 port=8443 path=/announce (IPv6 literal in brackets)
+http://host
+# host=host port=80 path=/ (missing path -> "/")
+http://h/announce?info_hash=x&peer_id=y
+# host=h port=80 path=/announce query=info_hash=x&peer_id=y
+http://a.b.example:6969/t
+# host=a.b.example port=6969 path=/t (subdomain, non-standard port)

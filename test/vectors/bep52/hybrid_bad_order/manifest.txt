@@ -1,0 +1,14 @@
+# bep52 fixture manifest
+fixture: hybrid_bad_order
+kind: hybrid_bad_order
+piece_len: 16384
+np_total: 5
+addr_end: 72768
+data_size: 60000
+ih_full: 49d15dd7847b3a4afce7d323eab1b928322a6545259f5c820b40414e203c7d23
+ih_trunc: 49d15dd7847b3a4afce7d323eab1b928322a6545
+ih_sha1: 5e93b770aa4fc943704670427fe5e73d726f659b
+file: idx=0 fp=0 np=2 len=20000 root=e2a139676dd8d00982b2aae618d7a8820cbf9960cc3b93888bcb4f8c371d3fc1 path=a.bin
+file: idx=1 fp=2 np=3 len=40000 root=132467fc2a5119ef04b2cffb14b0104967f6adf8b049686f3bbe2234270b5706 path=b.bin
+layer: idx=0 4859ab6a09c814ba29e2a98e015bbe083a27bbb650f4800c5b50ef67e181d1ebc66fb3eabd7d8d56c4a39c60aa1a8ea7c4fef1ebda14e10d5ca6bf8fe0112a06
+layer: idx=1 130968f00c0274265da60386328e1d22f7ee510972fb71bda527da00b9343e75fc12792ddee1b71fa55a74c01a577e82676d34d48caa6afc57d8928b4ab08c4f8f679aec530f90ca122bd1c4ab069d4d417be60a6afe0e13cedd961365621144

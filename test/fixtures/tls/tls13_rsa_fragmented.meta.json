@@ -1,0 +1,23 @@
+{
+  "name": "tls13_rsa_fragmented",
+  "source": "test/scripts/tls13_ref.py (independent Python reference; RFC 8446)",
+  "date": "2026-10-05",
+  "scrub_notes": "No PII: synthetic SNI 'tls13-mock', RFC 7748 test keys, self-signed fixture cert.",
+  "client": {
+    "sni": "tls13-mock",
+    "alpn": "http/1.1",
+    "client_priv_hex": "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+    "client_random_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    "ch_sha256_hex": "98c60cefa6bb42b9e4cbbe72a4404914fd2ab0ae83ef6b33df74ebabec4d1e73"
+  },
+  "expected": {
+    "outcome": "ok",
+    "tls_version": 13,
+    "alpn": "http/1.1",
+    "spki_sha256_hex": "4e6c8df5c50ab1b4aa443ad86ca99f7f440b7a0607397e3edd5db446a72099b6",
+    "c_ap_secret_hex": "e59e762435fbc5b3d0c9b654ac9268099f4f6150db380e133ba3bdccf01a8824",
+    "s_ap_secret_hex": "72d18fb8f4c3aea38141967a51790d96517167c66f4cb1b4d1d5525d0aaccccd",
+    "client_flight_hex": "1403030001011703030035131bae8a09c1216836b1c085fd372272d5f4745c5a7fe3a26c563ec8516abb552508d7248841732b2b6b6f476ee578936b24cc52c1",
+    "app_data_hex": "4e545831332d4150502d4f4b2d50414444454421"
+  }
+}

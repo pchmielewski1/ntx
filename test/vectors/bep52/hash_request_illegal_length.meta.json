@@ -1,0 +1,34 @@
+{
+  "generator": "test/scripts/bep52_hash_msgs.py",
+  "bep": "BEP52 hash exchange",
+  "msg": {
+    "name": "hash request",
+    "id": 21
+  },
+  "framing": {
+    "length_prefix": "BE uint32 = 1 + payload_bytes",
+    "msg_id_bytes": 1,
+    "payload_bytes": 48,
+    "total_bytes": 53
+  },
+  "fields": {
+    "pieces_root": "5cc423c5830b77242ff1d3ff10a50f59de7ba44584eda92579df2527e15b4814",
+    "base_layer": 0,
+    "index": 0,
+    "length": 3,
+    "proof_layers": 0
+  },
+  "legality": "illegal",
+  "source": {
+    "seed": "bep52-hash-msgs",
+    "file_size": 262144,
+    "leaf_size": 16384,
+    "piece_length": 131072,
+    "piece_layer": 3,
+    "note": "pieces_root = SHA2-256 merkle root (BF=2, 16KiB leaves) of the deterministic file content(seed,i) tiled to file_size"
+  },
+  "violations": [
+    "length-must-be-power-of-two (BEP52: length >= 2 and power of two)"
+  ],
+  "expected": "well-formed framing; validation MUST reject"
+}

@@ -1,0 +1,56 @@
+{
+  "generator": "test/scripts/bep52_hash_msgs.py",
+  "bep": "BEP52 hash exchange",
+  "msg": {
+    "name": "hashes",
+    "id": 22
+  },
+  "framing": {
+    "length_prefix": "BE uint32 = 1 + payload_bytes",
+    "msg_id_bytes": 1,
+    "payload_bytes": 240,
+    "total_bytes": 245
+  },
+  "fields": {
+    "pieces_root": "5cc423c5830b77242ff1d3ff10a50f59de7ba44584eda92579df2527e15b4814",
+    "base_layer": 0,
+    "index": 0,
+    "length": 4,
+    "proof_layers": 3,
+    "hashes": {
+      "count": 6,
+      "bytes": 192,
+      "hex": "4cb63b34415fcb1c7d00daa48cda468c22c1d215ac2c208821d4eb02f650732162b03306d375753651cfcd83df8fa4f8a9450460f0abec8189bcf76c6c080fa1ce1140ad2fd9fec5fe1ed170fc44f44534dde673c57fb530ec52cd43f73adaa0650fc3351a45854f7a835eda65cb590f1bb84ba52980bf8a61dd161b5f9284b7e14cfdb1b8f15244351973651c8159f40fc4730d0aa7feefff15ce220d243adf2d44bf70ca23d8611f41476d15e16852e2fb5e6db6fb71de909cef32cfa519fe"
+    }
+  },
+  "legality": "legal",
+  "source": {
+    "seed": "bep52-hash-msgs",
+    "file_size": 262144,
+    "leaf_size": 16384,
+    "piece_length": 131072,
+    "piece_layer": 3,
+    "note": "pieces_root = SHA2-256 merkle root (BF=2, 16KiB leaves) of the deterministic file content(seed,i) tiled to file_size"
+  },
+  "omission": {
+    "rule": "BEP52: first log2(length)-1 proof layers are omitted from hashes when the requested span contains them; they still count towards proof_layers",
+    "log2_length_minus_1": 1,
+    "requested_proof_layers": 3,
+    "omitted_layers": [
+      1
+    ],
+    "included_uncle_layers": [
+      2,
+      3
+    ],
+    "wire_hash_count": 6
+  },
+  "correlates_with": {
+    "pieces_root": "5cc423c5830b77242ff1d3ff10a50f59de7ba44584eda92579df2527e15b4814",
+    "base_layer": 0,
+    "index": 0,
+    "length": 4,
+    "proof_layers": 3
+  },
+  "expected": "hashes must fold to pieces_root (see fold in meta)"
+}

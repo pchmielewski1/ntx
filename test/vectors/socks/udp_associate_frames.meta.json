@@ -1,0 +1,167 @@
+{
+ "bin": "test/vectors/socks/udp_associate_frames.bin",
+ "bin_sha256": "56186c52476c5ae4e9ee0d23c49d98b9dafd181e42a90a456d0ea07dbbc52543",
+ "cases": [
+  {
+   "atyp": 1,
+   "dst": "0a000001",
+   "expected": "ok",
+   "hex": "050300010a0000011ae1",
+   "len": 10,
+   "name": "request_v4_basic",
+   "off": 0,
+   "port": 6881,
+   "type": "request"
+  },
+  {
+   "atyp": 4,
+   "dst": "20010db8000000000000000000000001",
+   "expected": "ok",
+   "hex": "0503000420010db80000000000000000000000011ae1",
+   "len": 22,
+   "name": "request_v6_basic",
+   "off": 10,
+   "port": 6881,
+   "type": "request"
+  },
+  {
+   "atyp": 1,
+   "data": "2100beef000abcde00000000001000000001000275545044415441",
+   "dst": "0a000001",
+   "expected": "ok",
+   "hex": "000000010a0000011ae12100beef000abcde00000000001000000001000275545044415441",
+   "len": 37,
+   "name": "encap_v4_basic",
+   "off": 32,
+   "port": 6881,
+   "type": "encap"
+  },
+  {
+   "atyp": 4,
+   "data": "2100beef000abcde00000000001000000001000275545044415441",
+   "dst": "20010db8000000000000000000000001",
+   "expected": "ok",
+   "hex": "0000000420010db80000000000000000000000011ae12100beef000abcde00000000001000000001000275545044415441",
+   "len": 49,
+   "name": "encap_v6_basic",
+   "off": 69,
+   "port": 6881,
+   "type": "encap"
+  },
+  {
+   "atyp": 1,
+   "data": "",
+   "dst": "0a000001",
+   "expected": "ok",
+   "hex": "000000010a0000011ae2",
+   "len": 10,
+   "name": "encap_empty_data",
+   "off": 118,
+   "port": 6882,
+   "type": "encap"
+  },
+  {
+   "atyp": 1,
+   "data": "2100beef000abcde00000000001000000001000275545044415441",
+   "dst": "0a000001",
+   "expected": "ok",
+   "hex": "000000010a0000011ae12100beef000abcde00000000001000000001000275545044415441",
+   "len": 37,
+   "name": "decap_v4_basic",
+   "off": 128,
+   "port": 6881,
+   "type": "decap"
+  },
+  {
+   "atyp": 4,
+   "data": "2100beef000abcde00000000001000000001000275545044415441",
+   "dst": "20010db8000000000000000000000001",
+   "expected": "ok",
+   "hex": "0000000420010db80000000000000000000000011ae12100beef000abcde00000000001000000001000275545044415441",
+   "len": 49,
+   "name": "decap_v6_basic",
+   "off": 165,
+   "port": 6881,
+   "type": "decap"
+  },
+  {
+   "atyp": 1,
+   "data": "",
+   "dst": "0a000001",
+   "expected": "ok",
+   "hex": "000000010a0000011ae2",
+   "len": 10,
+   "name": "decap_empty_data",
+   "off": 214,
+   "port": 6882,
+   "type": "decap"
+  },
+  {
+   "expected": "reject",
+   "hex": "000100010a0000011ae12100beef000abcde00000000001000000001000275545044415441",
+   "len": 37,
+   "name": "decap_rsv_nonzero_reject",
+   "off": 224,
+   "reject": "rsv",
+   "type": "decap"
+  },
+  {
+   "expected": "reject",
+   "hex": "000001010a0000011ae12100beef000abcde00000000001000000001000275545044415441",
+   "len": 37,
+   "name": "decap_frag_nonzero_reject",
+   "off": 261,
+   "reject": "frag",
+   "type": "decap"
+  },
+  {
+   "expected": "reject",
+   "hex": "0000000304686f73741ae12100beef000abcde00000000001000000001000275545044415441",
+   "len": 38,
+   "name": "decap_atyp_domain_reject",
+   "off": 298,
+   "reject": "atyp_domain",
+   "type": "decap"
+  },
+  {
+   "expected": "reject",
+   "hex": "000000090a0000011ae12100beef000abcde00000000001000000001000275545044415441",
+   "len": 37,
+   "name": "decap_atyp_unknown_reject",
+   "off": 336,
+   "reject": "atyp_unknown",
+   "type": "decap"
+  },
+  {
+   "expected": "reject",
+   "hex": "000000010a000001",
+   "len": 8,
+   "name": "decap_truncated_v4_reject",
+   "off": 373,
+   "reject": "truncated",
+   "type": "decap"
+  },
+  {
+   "expected": "reject",
+   "hex": "0000000420010db8000000000000000000000001",
+   "len": 20,
+   "name": "decap_truncated_v6_reject",
+   "off": 381,
+   "reject": "truncated",
+   "type": "decap"
+  },
+  {
+   "expected": "reject",
+   "hex": "000000010a00",
+   "len": 6,
+   "name": "decap_short_header_reject",
+   "off": 401,
+   "reject": "short",
+   "type": "decap"
+  }
+ ],
+ "count": 15,
+ "normative": "RFC 1928 section 7",
+ "task": "p6b-16-socks-udp",
+ "vectors": "socks-udp-associate-frames"
+}

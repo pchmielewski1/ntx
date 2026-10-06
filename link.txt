@@ -1,0 +1,1 @@
+magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Example.Content.1080p&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce&tr=udp%3A%2F%2Fexodus.desync.com%3A6969%2Fannounce

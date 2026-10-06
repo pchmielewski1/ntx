@@ -1,0 +1,325 @@
+{
+ "bin": "test/vectors/utp/demux_classify.bin",
+ "bin_sha256": "0031bdb6f0c1cbf25d319c28b9fc469ed8d6bf451b7b5020f34da30b04a2ec0e",
+ "cases": [
+  {
+   "expected": "dht",
+   "hex": "64313a6164323a6969356565333a6964363a6e6f6465696430323a71343a70696e67313a740401313a79313a7165",
+   "len": 46,
+   "name": "dht_ping_d",
+   "off": 0
+  },
+  {
+   "expected": "dht",
+   "hex": "6c6465343a6e616d65693432656565",
+   "len": 15,
+   "name": "dht_list_l",
+   "off": 46
+  },
+  {
+   "expected": "dht",
+   "hex": "693132333465",
+   "len": 6,
+   "name": "dht_int_i",
+   "off": 61
+  },
+  {
+   "expected": "dht",
+   "hex": "64",
+   "len": 1,
+   "name": "dht_one_byte_d",
+   "off": 67
+  },
+  {
+   "expected": "dht",
+   "hex": "6c",
+   "len": 1,
+   "name": "dht_one_byte_l",
+   "off": 68
+  },
+  {
+   "expected": "dht",
+   "hex": "69",
+   "len": 1,
+   "name": "dht_one_byte_i",
+   "off": 69
+  },
+  {
+   "expected": "dht",
+   "hex": "64001122",
+   "len": 4,
+   "name": "udp_64_is_dht",
+   "off": 70
+  },
+  {
+   "expected": "dht",
+   "hex": "6caabb",
+   "len": 3,
+   "name": "udp_6c_is_dht",
+   "off": 74
+  },
+  {
+   "expected": "dht",
+   "hex": "69cc",
+   "len": 2,
+   "name": "udp_69_is_dht",
+   "off": 77
+  },
+  {
+   "expected": "utp",
+   "hex": "0100beef000abcde000000000010000000010000",
+   "len": 20,
+   "name": "utp_type0_ver1",
+   "off": 79
+  },
+  {
+   "expected": "utp",
+   "hex": "01",
+   "len": 1,
+   "name": "utp_one_byte_type0",
+   "off": 99
+  },
+  {
+   "expected": "utp",
+   "hex": "1100bef0000abcde000000000010000000010000",
+   "len": 20,
+   "name": "utp_type1_ver1",
+   "off": 100
+  },
+  {
+   "expected": "utp",
+   "hex": "11",
+   "len": 1,
+   "name": "utp_one_byte_type1",
+   "off": 120
+  },
+  {
+   "expected": "utp",
+   "hex": "2100bef1000abcde000000000010000000010000",
+   "len": 20,
+   "name": "utp_type2_ver1",
+   "off": 121
+  },
+  {
+   "expected": "utp",
+   "hex": "21",
+   "len": 1,
+   "name": "utp_one_byte_type2",
+   "off": 141
+  },
+  {
+   "expected": "utp",
+   "hex": "3100bef2000abcde000000000010000000010000",
+   "len": 20,
+   "name": "utp_type3_ver1",
+   "off": 142
+  },
+  {
+   "expected": "utp",
+   "hex": "31",
+   "len": 1,
+   "name": "utp_one_byte_type3",
+   "off": 162
+  },
+  {
+   "expected": "utp",
+   "hex": "4100bef3000abcde000000000010000000010000",
+   "len": 20,
+   "name": "utp_type4_ver1",
+   "off": 163
+  },
+  {
+   "expected": "utp",
+   "hex": "41",
+   "len": 1,
+   "name": "utp_one_byte_type4",
+   "off": 183
+  },
+  {
+   "expected": "utp",
+   "hex": "41001234000abcde000000000010000000010000",
+   "len": 20,
+   "name": "utp_syn",
+   "off": 184
+  },
+  {
+   "expected": "utp",
+   "hex": "41",
+   "len": 1,
+   "name": "utp_syn_one_byte",
+   "off": 204
+  },
+  {
+   "expected": "drop",
+   "hex": "0000000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_ver0_type0",
+   "off": 205
+  },
+  {
+   "expected": "drop",
+   "hex": "0200000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type0_ver2",
+   "off": 225
+  },
+  {
+   "expected": "drop",
+   "hex": "0300000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type0_ver3",
+   "off": 245
+  },
+  {
+   "expected": "drop",
+   "hex": "0400000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type0_ver4",
+   "off": 265
+  },
+  {
+   "expected": "drop",
+   "hex": "0500000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type0_ver5",
+   "off": 285
+  },
+  {
+   "expected": "drop",
+   "hex": "0600000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type0_ver6",
+   "off": 305
+  },
+  {
+   "expected": "drop",
+   "hex": "0700000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type0_ver7",
+   "off": 325
+  },
+  {
+   "expected": "drop",
+   "hex": "5100000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type5_ver1",
+   "off": 345
+  },
+  {
+   "expected": "drop",
+   "hex": "6100000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type6_ver1",
+   "off": 365
+  },
+  {
+   "expected": "drop",
+   "hex": "7100000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type7_ver1",
+   "off": 385
+  },
+  {
+   "expected": "drop",
+   "hex": "8100000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type8_ver1",
+   "off": 405
+  },
+  {
+   "expected": "drop",
+   "hex": "9100000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type9_ver1",
+   "off": 425
+  },
+  {
+   "expected": "drop",
+   "hex": "a100000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type10_ver1",
+   "off": 445
+  },
+  {
+   "expected": "drop",
+   "hex": "b100000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type11_ver1",
+   "off": 465
+  },
+  {
+   "expected": "drop",
+   "hex": "c100000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type12_ver1",
+   "off": 485
+  },
+  {
+   "expected": "drop",
+   "hex": "d100000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type13_ver1",
+   "off": 505
+  },
+  {
+   "expected": "drop",
+   "hex": "e100000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type14_ver1",
+   "off": 525
+  },
+  {
+   "expected": "drop",
+   "hex": "f100000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_type15_ver1",
+   "off": 545
+  },
+  {
+   "expected": "drop",
+   "hex": "6100000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_61_type6_ver1",
+   "off": 565
+  },
+  {
+   "expected": "utp",
+   "hex": "0100000000000000000000000000000000000000",
+   "len": 20,
+   "name": "near_01_type0_ver1_ok",
+   "off": 585
+  },
+  {
+   "expected": "drop",
+   "hex": "",
+   "len": 0,
+   "name": "empty",
+   "off": 605
+  },
+  {
+   "expected": "drop",
+   "hex": "80",
+   "len": 1,
+   "name": "one_byte_garbage",
+   "off": 605
+  },
+  {
+   "expected": "drop",
+   "hex": "0000",
+   "len": 2,
+   "name": "two_byte_garbage",
+   "off": 606
+  },
+  {
+   "expected": "utp",
+   "hex": "2100",
+   "len": 2,
+   "name": "two_byte_utp_start",
+   "off": 608
+  }
+ ],
+ "count": 45,
+ "normative": "BEP 29",
+ "task": "p6b-13-demux-classify",
+ "vectors": "demux_classify"
+}

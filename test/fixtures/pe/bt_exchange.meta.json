@@ -1,0 +1,38 @@
+{
+  "date": "2026-09-03",
+  "expected": {
+    "handshake": {
+      "bep10": true,
+      "info_hash": "5a5b5c5d5e5f606162636465666768696a6b6c6d",
+      "peer_id": "-ntx-golden000000001"
+    },
+    "messages": [
+      {
+        "type": "keepalive"
+      },
+      {
+        "type": "interested"
+      },
+      {
+        "nbytes": 3,
+        "pieces": [
+          0,
+          1,
+          3
+        ],
+        "type": "bitfield"
+      },
+      {
+        "type": "choke"
+      },
+      {
+        "index": 7,
+        "padded": true,
+        "type": "have"
+      }
+    ]
+  },
+  "name": "bt_exchange",
+  "scrub_notes": "Privacy-scrubbed synthetic fixture: no real peers, trackers or DHT nodes. All IPv4 addresses from RFC 5737 documentation space 192.0.2.0/24, all IPv6 from 2001:db8::/48. IDs, tokens, counters and ports are fixed synthetic constants. Generated offline by test/scripts/gen_fixtures_announce_dht_pe.py; no clock dependence in output. Peer IDs and info hash are synthetic constants, not real torrents.",
+  "source": "synthesized from docs/protocol.md (handshake 68 B table; BEP3 ids; BEP10 padding bit)"
+}

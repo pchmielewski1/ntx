@@ -1,0 +1,20 @@
+# bep52 fixture manifest
+fixture: single_16k
+kind: single_v2
+piece_len: 16384
+np_total: 3
+addr_end: 40000
+data_size: 40000
+ih_full: 7d1eb831bb31f0ff6bf20b1e393087d6af9e6c94321e09e880df7d0a1d5d3b41
+ih_trunc: 7d1eb831bb31f0ff6bf20b1e393087d6af9e6c94
+ih_sha1: c82cd969658a50f2efca717911fb383de19a549d
+file: idx=0 fp=0 np=3 len=40000 root=2fd228554b0e1dab0a4e3356b2ce532fb8f0394df2219d026fcf635c985689b2 path=single_16k
+layer: idx=0 a3b48dacce3945093240ef9878b5a432d53a77eaf5115393080bc1a5b1c58371f664bfd1cffef8754bc347a9ba689c167145da7497bbec561bd50dc9d8dfb8494c9a62c98aa8be67ac747a07ee7dd9b61c770d386f63c87662cd1dfb853e66a6
+piece: idx=0 v2=a3b48dacce3945093240ef9878b5a432d53a77eaf5115393080bc1a5b1c58371
+piece: idx=1 v2=f664bfd1cffef8754bc347a9ba689c167145da7497bbec561bd50dc9d8dfb849
+piece: idx=2 v2=4c9a62c98aa8be67ac747a07ee7dd9b61c770d386f63c87662cd1dfb853e66a6
+# magnet fixtures (line starts with 'magnet:')
+magnet: single_16k btmh_only
+magnet:?xt=urn:btmh:12207d1eb831bb31f0ff6bf20b1e393087d6af9e6c94321e09e880df7d0a1d5d3b41&dn=bep52+single
+magnet: single_16k dual
+magnet:?xt=urn:btih:7d1eb831bb31f0ff6bf20b1e393087d6af9e6c94&xt=urn:btmh:12207d1eb831bb31f0ff6bf20b1e393087d6af9e6c94321e09e880df7d0a1d5d3b41&dn=bep52+single

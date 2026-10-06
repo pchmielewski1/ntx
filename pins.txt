@@ -1,0 +1,31 @@
+# ntx community pin file — for `./ntx --https-pin-file=pins.txt`
+#
+# Format:  <host> <64-hex SPKI pin>   (SHA-256 of the leaf SubjectPublicKeyInfo DER)
+# Rules:   exact hosts only — NO wildcards (subdomain takeover stays out of the pin).
+# Scope:   HTTPS trackers/webseed. The DoH pool pins live in the binary
+#          (src/proto/ntx_doh_pins.h); these entries double as an audit reference
+#          for that pool and as pins if a DoH host is ever fetched as plain HTTPS.
+#
+# These pins were captured on 2026-09-02 (openssl s_client -> leaf SPKI -> sha256). Servers rotate
+# keys: the pins compiled into the binary are authoritative for DoH, and an entry here that no longer
+# matches simply fails closed.
+#
+# Extend it:  echo | openssl s_client -connect HOST:443 -servername HOST 2>/dev/null \
+#              | openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER \
+#              | sha256sum      (or test/scripts/pin_from_der.py on a leaf DER)
+# Rotation procedure: docs/network.md, section "Pin rotation (DoH pool)".
+
+dns.quad9.net        8b690e6dfcf4a8828218d5adecc8c151e4ab8740f28dbd3fcd620d2266444be2
+doh.opendns.com      a0f536b83cddd1032412ec72e6025c25e44980f7ba41efbafec56e2f6946acd3
+freedns.controld.com 6163787a4c9ecfe9a0a5e9df94b140ad6435359a5f5c822190400ac48ddd72e6
+doh.libredns.gr      574634a6f5a403038f90d48fc43c9977fbc9d9ba38d329400d6245bbfb9b3e53
+# UncensoredDNS serves dual RSA+ECDSA leafs per anycast backend — both keys pinned:
+anycast.uncensoreddns.org d898d98016647e34a3b35d7bbd7f809f229e63324d337f33c2c6b11f04ad5ac8
+anycast.uncensoreddns.org 517b3cc565da8bd6570408c32980e2625fe36c862dc95fdb636c371751454c3b
+unicast.uncensoreddns.org c22904de360003a8d0997613affadb1de10f982efc750c196d0a7a59daec784b
+unicast.uncensoreddns.org 20d499119a43a162a26afa2c576ff1553f0ef37be4fd14704be2d388bf88a47b
+ada.openbld.net      8e91d7302e31f9808685a40b3b93d522a83679e57e1cd4d8eeaf33f5aeb14b58
+doh.pub              e5320c8e0c8c840d2a98f74af8033d2d7eaf348ffd10f072761fd95dd7dc6262
+
+# Add your own tracker/webseed hosts below (exact host, no wildcards):
+# tracker.example  <64-hex pin>

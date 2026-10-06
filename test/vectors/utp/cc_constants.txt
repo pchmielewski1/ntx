@@ -1,0 +1,14 @@
+# uTP P6a CC constants - frozen 2026-09-04
+# Sources: BEP29 (Accepted, 2012-10-20 update: loss factor 0.5, SACK layout)
+#   https://www.bittorrent.org/beps/bep_0029.html
+#   MAX_CWND_INCREASE_PACKETS_PER_RTT: uTP reference implementation value
+#   (modern libtorrent 1.0+ uses the Q16 variant of the same BEP formula,
+#   see src/utp_stream.cpp do_ledbat; dup_ack_limit=3 confirmed)
+CCONTROL_TARGET_US=100000
+MAX_CWND_INCREASE_PACKETS_PER_RTT=3
+CC_HISTORY=120
+MIN_PACKET_SIZE=150
+INIT_TIMEOUT_MS=1000
+MIN_TIMEOUT_MS=500
+DUP_ACK_LIMIT=3
+LOSS_FACTOR=0.5
