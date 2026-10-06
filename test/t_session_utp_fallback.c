@@ -1,3 +1,5 @@
+/* These checks age timestamps by subtracting from the monotonic clock, which counts from boot: offset it so a freshly started host cannot underflow. */
+#define NTX_MONO_BASE_MS 86400000LL
 #include "../src/core/ntx_session.c"
 #include "../src/core/ntx_session_trk.c"
 #include "../src/core/ntx_session_peer.c"
@@ -69,6 +71,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* --utp used to be exclusive: every dial went out as uTP and a peer without a uTP stack (most of them)
@@ -143,6 +146,12 @@ int main(void) {
     check(cs >= 0, "listener_saw_tcp_connect");
 
     /* a TCP attempt that fails is final and is remembered */
+    /* A non-blocking loopback connect can still be in flight: tick until it has completed and started its
+     * handshake clock, otherwise that completion would reset the aged hs_t0 below. */
+    for (int k = 0; tp >= 0 && s->peers[tp].conn_t0 != 0 && k < 400; k++) {
+        ntx_session_peer_hs_tick(s);
+        nanosleep(&(struct timespec){0, 5000000}, NULL);
+    }
     if (tp >= 0) {
         s->peers[tp].conn_t0 = 0;
         s->peers[tp].hs_t0 = ntx_mono_ms() - 600000; /* connected, never handshook */

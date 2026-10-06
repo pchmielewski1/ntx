@@ -1,3 +1,5 @@
+/* These checks age timestamps by subtracting from the monotonic clock, which counts from boot: offset it so a freshly started host cannot underflow. */
+#define NTX_MONO_BASE_MS 86400000LL
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>

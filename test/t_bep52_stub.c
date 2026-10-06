@@ -263,7 +263,7 @@ static int setup_v2_torrent(ntx_session *s, const uint8_t root[32]) {
 
 /* Session + connected peer bound to tts[0]. */
 static ntx_session *mk_session_peer(ntx_netx **n, int sv[2], int *pi_out) {
-    ntx_config cfg;
+    static ntx_config cfg; /* outlives the helper: the session keeps this pointer */
     memset(&cfg, 0, sizeof cfg);
     *n = ntx_netx_init(&cfg);
     ntx_session *s = ntx_session_init(*n, &cfg);

@@ -1,3 +1,5 @@
+/* These checks age timestamps by subtracting from the monotonic clock, which counts from boot: offset it so a freshly started host cannot underflow. */
+#define NTX_MONO_BASE_MS 86400000LL
 #include "../src/core/ntx_peer.c"
 #include "../src/net/ntx_addr.c"
 #include "../src/ui/ntx_diag.c"
