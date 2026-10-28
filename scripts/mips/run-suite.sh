@@ -14,6 +14,16 @@
 #
 # NTX_TEST_TIMEOUT_SCALE is propagated into the qemu environment so guests
 # can scale their internal timing windows (Task 5).
+#
+# Hang guard (Task 5, controller ruling): every qemu invocation is wrapped in
+# a coreutils `timeout` so a hanging test FAILS instead of blocking the suite
+# forever. Budget NTX_TEST_TIMEOUT defaults to 300s per test — the slowest
+# observed test on this host is t_p256_kat at ~77s (soft-float KAT, CPU-bound),
+# so 300s is ~4x headroom and only genuine hangs reach it. Exit 124 (TERM) or
+# 137 (KILL after -k 10) is recorded as a timeout failure.
+#
+# NTX_TEST_GLOB optionally overrides the test file glob (debugging aid; e.g.
+# running a single stub to prove the hang guard).
 set -uo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -28,6 +38,13 @@ CFLAGS="${CFLAGS:--O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -
 LDFLAGS="${LDFLAGS:--Wl,--gc-sections}"
 LDLIBS="${LDLIBS:--lm}"
 export NTX_TEST_TIMEOUT_SCALE="${NTX_TEST_TIMEOUT_SCALE:-1}"
+NTX_TEST_TIMEOUT="${NTX_TEST_TIMEOUT:-300}"
+TEST_GLOB="${NTX_TEST_GLOB:-test/t_*.c}"
+
+if ! command -v timeout >/dev/null 2>&1; then
+    echo "[run-suite] ERROR: coreutils 'timeout' not found on PATH (hang guard requires it)" >&2
+    exit 127
+fi
 
 if [ ! -x "$MIPS_CC" ]; then
     echo "[run-suite] ERROR: MIPS_CC not executable: $MIPS_CC" >&2
@@ -37,7 +54,7 @@ fi
 failures=()
 total=0
 
-for f in test/t_*.c; do
+for f in $TEST_GLOB; do
     base="$(basename "$f" .c)"
     bin="test/.mipsel.${base}.tmp"
     total=$((total + 1))
@@ -51,10 +68,13 @@ for f in test/t_*.c; do
         continue
     fi
 
-    bash scripts/mips/qemu-user-run.sh "$bin"
+    timeout -k 10 "$NTX_TEST_TIMEOUT" bash scripts/mips/qemu-user-run.sh "$bin"
     rc=$?
     rm -f "$bin"
-    if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+        echo "TIMEOUT (exceeded ${NTX_TEST_TIMEOUT}s)"
+        failures+=("$base (timeout ${NTX_TEST_TIMEOUT}s rc=$rc)")
+    elif [ "$rc" -ne 0 ]; then
         echo "RUN FAIL (rc=$rc)"
         failures+=("$base (run rc=$rc)")
     else
