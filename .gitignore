@@ -3,7 +3,9 @@
 *.d
 *.a
 build/
+build-mipsel/
 .test.tmp
+test/.mipsel*.tmp
 
 # Binaries: the main one (ntx) and the tests (test/t_*.c -> test/t_*)
 /ntx
