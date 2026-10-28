@@ -9,6 +9,7 @@ test/.mipsel*.tmp
 
 # Binaries: the main one (ntx) and the tests (test/t_*.c -> test/t_*)
 /ntx
+/ntx-mipsel
 test/t_*
 !test/t_*.c
 
