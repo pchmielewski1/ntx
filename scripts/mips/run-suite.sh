@@ -54,7 +54,18 @@ fi
 failures=()
 total=0
 
-for f in $TEST_GLOB; do
+# Expand the glob up front with nullglob so a zero-match NTX_TEST_GLOB is
+# caught below instead of iterating a literal unmatched pattern (or nothing).
+shopt -s nullglob
+test_files=($TEST_GLOB)
+shopt -u nullglob
+
+if [ "${#test_files[@]}" -eq 0 ]; then
+    echo "[run-suite] ERROR: test glob '$TEST_GLOB' matched zero test files — refusing to report ALL PASS" >&2
+    exit 1
+fi
+
+for f in "${test_files[@]}"; do
     base="$(basename "$f" .c)"
     bin="test/.mipsel.${base}.tmp"
     total=$((total + 1))

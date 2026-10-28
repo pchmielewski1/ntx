@@ -15,8 +15,10 @@ MIPS_CC ?= $(HOME)/toolchains/mipsel-linux-musl/bin/mipsel-linux-musl-gcc
 .PHONY: all test test-net test-mipsel native-check test-cli test-interop test-ipc interop_ipc size static clean probe test-live test-tls13
 
 ntx: $(SRCS) ; $(CC) $(CFLAGS) $(HARDEN_CFLAGS) $(VERSION_DEFINE) -o $@ $(SRCS) $(LDFLAGS) $(HARDEN_LDFLAGS) $(LDLIBS)
-# PIE/RELRO harden flags intentionally omitted for -static musl (mirrors the `static` target precedent).
-mips: $(SRCS) ; $(MIPS_CC) $(CFLAGS) -static $(VERSION_DEFINE) -o ntx-mipsel $(SRCS) $(LDFLAGS) $(LDLIBS)
+# Mirrors the `static` target precedent for -static musl: HARDEN_CFLAGS compile mitigations
+# (-fstack-protector-strong, _FORTIFY_SOURCE=2, -fPIE) are KEPT; only the PIE *link* flag (-pie)
+# is dropped (impossible for a static binary); relro/now/noexecstack link flags are kept.
+mips: $(SRCS) ; $(MIPS_CC) $(CFLAGS) $(HARDEN_CFLAGS) -static $(VERSION_DEFINE) -o ntx-mipsel $(SRCS) $(LDFLAGS) -Wl,-z,relro,-z,now,-z,noexecstack $(LDLIBS)
 all: ntx
 probe: test/trk_http_probe.c src/proto/ntx_http.c src/proto/ntx_tracker.c src/proto/ntx_bencode.c src/net/ntx_sock.c src/net/ntx_addr.c src/net/ntx_proxy.c src/proto/ntx_doh.c src/proto/ntx_h2.c src/net/ntx_tls.c src/net/ntx_tls_rec.c src/ui/ntx_diag.c src/crypto/ntx_sha1.c src/crypto/ntx_sha256.c src/crypto/ntx_hmac.c src/crypto/ntx_aes.c src/crypto/ntx_rng.c src/crypto/ntx_x25519_fe.c src/crypto/ntx_x25519.c src/crypto/ntx_bignum.c src/crypto/ntx_rsa_pkcs1.c src/crypto/ntx_p256.c src/proto/ntx_http_url.c src/proto/ntx_https.c src/proto/ntx_https_pin.c src/crypto/ntx_hkdf.c src/net/ntx_tls13.c
 	$(CC) $(CFLAGS) -I. -o trk_http_probe test/trk_http_probe.c src/proto/ntx_http.c src/proto/ntx_tracker.c src/proto/ntx_bencode.c src/net/ntx_sock.c src/net/ntx_addr.c src/net/ntx_proxy.c src/proto/ntx_doh.c src/proto/ntx_h2.c src/net/ntx_tls.c src/net/ntx_tls_rec.c src/ui/ntx_diag.c src/crypto/ntx_sha1.c src/crypto/ntx_sha256.c src/crypto/ntx_hmac.c src/crypto/ntx_aes.c src/crypto/ntx_rng.c src/crypto/ntx_x25519_fe.c src/crypto/ntx_x25519.c src/crypto/ntx_bignum.c src/crypto/ntx_rsa_pkcs1.c src/crypto/ntx_p256.c src/proto/ntx_http_url.c src/proto/ntx_https.c src/proto/ntx_https_pin.c src/crypto/ntx_hkdf.c src/net/ntx_tls13.c $(LDFLAGS) $(LDLIBS)
