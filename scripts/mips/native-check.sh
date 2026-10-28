@@ -9,9 +9,10 @@
 # src/crypto/ntx_aes.c) did not disturb the native 64-bit build:
 #
 #   1. Compiles ALL src/*.c as ONE program -> test/.agent-work/native-check/ntx-native
-#      with the same flags `make ntx` uses, minus the harden PIE/RELRO sets
-#      (those are irrelevant to codegen regressions and require PIE toolchain
-#      defaults). Must build clean under -Werror.
+#      with the same flags `make ntx` uses, minus only the PIE/RELRO link-time
+#      HARDEN_LDFLAGS (compile-time HARDEN_CFLAGS hardening is kept so the
+#      build matches the shipped binary's codegen). Must build clean under
+#      -Werror.
 #   2. Per-file `-fsyntax-only` pass over every src/*.c (fast sanity).
 #   3. Compiles EVERY test/t_*.c into test/.agent-work/native-check/ and runs
 #      each from the repo root with the same flags `make test` uses. Any
@@ -48,6 +49,10 @@ mkdir -p "$OUT"
 
 # Same as Makefile CFLAGS (make ntx / make test) without HARDEN_CFLAGS.
 CFLAGS_NATIVE="${CFLAGS_NATIVE:--O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -ffunction-sections}"
+# HARDEN_CFLAGS equivalents from `make ntx` (compile-time hardening kept for the
+# whole-program build so it matches the shipped binary's codegen; only the
+# PIE/RELRO link-time HARDEN_LDFLAGS are dropped, per the Task 6 brief).
+HARDEN_CFLAGS_NATIVE="${HARDEN_CFLAGS_NATIVE:--fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -fPIE}"
 # make test links with LDFLAGS/LDLIBS; make ntx additionally hardens (omitted here by design).
 LDFLAGS_NATIVE="${LDFLAGS_NATIVE:--Wl,--gc-sections}"
 LDLIBS_NATIVE="${LDLIBS_NATIVE:--lm}"
@@ -65,8 +70,8 @@ if [ "${#SRCS[@]}" -eq 0 ]; then
 fi
 
 echo "[native-check] == step 1: whole-program build (${#SRCS[@]} src/*.c -> $OUT/ntx-native)"
-# shellcheck disable=SC2086 # CFLAGS/LDFLAGS/LDLIBS are word-split by design
-"$CC_NATIVE" $CFLAGS_NATIVE -o "$OUT/ntx-native" "${SRCS[@]}" $LDFLAGS_NATIVE $LDLIBS_NATIVE
+# shellcheck disable=SC2086 # CFLAGS/HARDEN_CFLAGS/LDFLAGS/LDLIBS are word-split by design
+"$CC_NATIVE" $CFLAGS_NATIVE $HARDEN_CFLAGS_NATIVE -o "$OUT/ntx-native" "${SRCS[@]}" $LDFLAGS_NATIVE $LDLIBS_NATIVE
 echo "[native-check] whole-program build OK (clean under -Werror)"
 "$OUT/ntx-native" --version
 

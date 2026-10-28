@@ -42,6 +42,7 @@ test/t3_store/
 
 # Scratch space for tests and scripts (the real tests are tracked)
 test/.scratch/
+test/.agent-work/
 test/.ntx-size-baseline
 test/wt-*/
 test/scripts/__pycache__/
