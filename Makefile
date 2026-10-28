@@ -12,7 +12,7 @@ SRCS := $(shell find src -name '*.c')
 VERSION_DEFINE := $(if $(NTX_VERSION),-DNTX_VERSION='"$(NTX_VERSION)"')
 MIPS_CC ?= $(HOME)/toolchains/mipsel-linux-musl/bin/mipsel-linux-musl-gcc
 
-.PHONY: all test test-net test-mipsel test-cli test-interop test-ipc interop_ipc size static clean probe test-live test-tls13
+.PHONY: all test test-net test-mipsel native-check test-cli test-interop test-ipc interop_ipc size static clean probe test-live test-tls13
 
 ntx: $(SRCS) ; $(CC) $(CFLAGS) $(HARDEN_CFLAGS) $(VERSION_DEFINE) -o $@ $(SRCS) $(LDFLAGS) $(HARDEN_LDFLAGS) $(LDLIBS)
 # PIE/RELRO harden flags intentionally omitted for -static musl (mirrors the `static` target precedent).
@@ -25,6 +25,7 @@ test: $(wildcard test/t_*.c)
 test-live: test/t_tls_golden.c $(wildcard test/fixtures/tls/*.bin)
 	@$(CC) $(CFLAGS) -o .test-live.tmp test/t_tls_golden.c $(LDLIBS) && ./.test-live.tmp; rc=$$?; rm -f .test-live.tmp; exit $$rc
 test-mipsel: ; @CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" LDLIBS="$(LDLIBS)" MIPS_CC="$(MIPS_CC)" bash scripts/mips/run-suite.sh
+native-check: ; @bash scripts/mips/native-check.sh
 test-net: ntx ; ./test/net_loopback.sh
 test-tls13: ; @rm -f .tls_probe.tmp; ./test/tls13_interop.sh ./.tls_probe.tmp; rc=$$?; rm -f .tls_probe.tmp; [ $$rc -eq 77 ] && exit 0; exit $$rc
 test-cli: ntx ; ./test/cli_errors.sh
