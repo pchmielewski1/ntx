@@ -265,7 +265,9 @@ int ntx_aes128_gcm_seal(const ntx_aes128_gcm *g, const uint8_t nonce[12],
                         const uint8_t *aad, size_t aadn,
                         const uint8_t *pt, size_t n,
                         uint8_t *ct, uint8_t tag[16]) {
+#if defined(__SIZEOF_SIZE_T__) && __SIZEOF_SIZE_T__ >= 8
     if ((uint64_t)n > GCM_MAX_BYTES) return 0;
+#endif
     if (n) gcm_ctr(g, nonce, pt, ct, n);
     gcm_tag(g, nonce, aad, aadn, ct, n, tag);
     return 1;
@@ -275,7 +277,9 @@ int ntx_aes128_gcm_open(const ntx_aes128_gcm *g, const uint8_t nonce[12],
                         const uint8_t *aad, size_t aadn,
                         const uint8_t *ct, size_t n,
                         uint8_t *pt, const uint8_t tag[16]) {
+#if defined(__SIZEOF_SIZE_T__) && __SIZEOF_SIZE_T__ >= 8
     if ((uint64_t)n > GCM_MAX_BYTES) return 0;
+#endif
     /* Authenticate first, decrypt only afterwards: unauthenticated plaintext is never
      * written, and pt == ct (in place) is safe because the tag is computed from ct before
      * ct is overwritten. */

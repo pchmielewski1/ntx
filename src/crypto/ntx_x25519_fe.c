@@ -97,6 +97,8 @@ void ntx_fe_sub(ntx_fe *r, const ntx_fe *a, const ntx_fe *b)
     fe_carry(r);
 }
 
+#if defined(__SIZEOF_INT128__) && !defined(NTX_NO_UINT128)
+
 void ntx_fe_mul(ntx_fe *r, const ntx_fe *a, const ntx_fe *b)
 {
     __uint128_t a0 = a->v[0], a1 = a->v[1], a2 = a->v[2], a3 = a->v[3], a4 = a->v[4];
@@ -122,6 +124,100 @@ void ntx_fe_mul(ntx_fe *r, const ntx_fe *a, const ntx_fe *b)
     r->v[0] += c * 19;
     c = r->v[0] >> 51; r->v[0] &= MASK51; r->v[1] += c;
 }
+
+#else /* Portable fallback: no __uint128_t (e.g. GCC MIPS32, no TImode). */
+
+/* 64x64 -> 128 via 32-bit-half schoolbook; result is the pair (*hi, *lo). */
+static void ntx_mul64(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo)
+{
+    uint64_t a0 = a & 0xFFFFFFFFULL, a1 = a >> 32;
+    uint64_t b0 = b & 0xFFFFFFFFULL, b1 = b >> 32;
+    uint64_t p0 = a0 * b0;
+    uint64_t p1 = a1 * b0;
+    uint64_t p2 = a0 * b1;
+    uint64_t p3 = a1 * b1;
+    uint64_t mid = (p0 >> 32) + (p1 & 0xFFFFFFFFULL) + (p2 & 0xFFFFFFFFULL);
+    *lo = (p0 & 0xFFFFFFFFULL) | (mid << 32);
+    *hi = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
+}
+
+/* (hi,lo) += a*b, with carry propagated from lo into hi. */
+static void ntx_accmul(uint64_t *hi, uint64_t *lo, uint64_t a, uint64_t b)
+{
+    uint64_t ph, pl, old;
+    ntx_mul64(a, b, &ph, &pl);
+    old = *lo;
+    *lo += pl;
+    *hi += ph + (*lo < old);
+}
+
+/* (hi,lo) += c (64-bit), with carry propagated from lo into hi. */
+static void ntx_acc64(uint64_t *hi, uint64_t *lo, uint64_t c)
+{
+    uint64_t old = *lo;
+    *lo += c;
+    *hi += (*lo < old);
+}
+
+/* (uint64_t)(((uint128)hi << 64 | lo) >> 51) without 128-bit arithmetic. */
+static uint64_t ntx_shift51(uint64_t hi, uint64_t lo)
+{
+    return (lo >> 51) | (hi << 13);
+}
+
+void ntx_fe_mul(ntx_fe *r, const ntx_fe *a, const ntx_fe *b)
+{
+    uint64_t b1_19 = b->v[1] * 19, b2_19 = b->v[2] * 19,
+             b3_19 = b->v[3] * 19, b4_19 = b->v[4] * 19;
+
+    uint64_t c0h = 0, c0l = 0, c1h = 0, c1l = 0, c2h = 0, c2l = 0,
+             c3h = 0, c3l = 0, c4h = 0, c4l = 0;
+
+    ntx_accmul(&c0h, &c0l, a->v[0], b->v[0]);
+    ntx_accmul(&c0h, &c0l, a->v[1], b4_19);
+    ntx_accmul(&c0h, &c0l, a->v[2], b3_19);
+    ntx_accmul(&c0h, &c0l, a->v[3], b2_19);
+    ntx_accmul(&c0h, &c0l, a->v[4], b1_19);
+
+    ntx_accmul(&c1h, &c1l, a->v[0], b->v[1]);
+    ntx_accmul(&c1h, &c1l, a->v[1], b->v[0]);
+    ntx_accmul(&c1h, &c1l, a->v[2], b4_19);
+    ntx_accmul(&c1h, &c1l, a->v[3], b3_19);
+    ntx_accmul(&c1h, &c1l, a->v[4], b2_19);
+
+    ntx_accmul(&c2h, &c2l, a->v[0], b->v[2]);
+    ntx_accmul(&c2h, &c2l, a->v[1], b->v[1]);
+    ntx_accmul(&c2h, &c2l, a->v[2], b->v[0]);
+    ntx_accmul(&c2h, &c2l, a->v[3], b4_19);
+    ntx_accmul(&c2h, &c2l, a->v[4], b3_19);
+
+    ntx_accmul(&c3h, &c3l, a->v[0], b->v[3]);
+    ntx_accmul(&c3h, &c3l, a->v[1], b->v[2]);
+    ntx_accmul(&c3h, &c3l, a->v[2], b->v[1]);
+    ntx_accmul(&c3h, &c3l, a->v[3], b->v[0]);
+    ntx_accmul(&c3h, &c3l, a->v[4], b4_19);
+
+    ntx_accmul(&c4h, &c4l, a->v[0], b->v[4]);
+    ntx_accmul(&c4h, &c4l, a->v[1], b->v[3]);
+    ntx_accmul(&c4h, &c4l, a->v[2], b->v[2]);
+    ntx_accmul(&c4h, &c4l, a->v[3], b->v[1]);
+    ntx_accmul(&c4h, &c4l, a->v[4], b->v[0]);
+
+    uint64_t c;
+    r->v[0] = c0l & MASK51; c = ntx_shift51(c0h, c0l);
+    ntx_acc64(&c1h, &c1l, c);
+    r->v[1] = c1l & MASK51; c = ntx_shift51(c1h, c1l);
+    ntx_acc64(&c2h, &c2l, c);
+    r->v[2] = c2l & MASK51; c = ntx_shift51(c2h, c2l);
+    ntx_acc64(&c3h, &c3l, c);
+    r->v[3] = c3l & MASK51; c = ntx_shift51(c3h, c3l);
+    ntx_acc64(&c4h, &c4l, c);
+    r->v[4] = c4l & MASK51; c = ntx_shift51(c4h, c4l);
+    r->v[0] += c * 19;
+    c = r->v[0] >> 51; r->v[0] &= MASK51; r->v[1] += c;
+}
+
+#endif /* __SIZEOF_INT128__ && !NTX_NO_UINT128 */
 
 void ntx_fe_sq(ntx_fe *r, const ntx_fe *a)
 {
