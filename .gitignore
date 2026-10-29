@@ -4,6 +4,7 @@
 *.a
 build/
 build-mipsel/
+dist/
 .test.tmp
 test/.mipsel*.tmp
 
