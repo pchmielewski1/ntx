@@ -15,7 +15,8 @@ welcome.
 | [testing.md](testing.md) | `make` test targets and what each suite covers |
 | [fuzzing.md](fuzzing.md) | libFuzzer harnesses and the crypto-change policy |
 | [module-map.md](module-map.md) | Every source file under `src/` and its responsibility |
-| [releasing.md](releasing.md) | How a release is built and published (binaries, `.deb`) |
+| [releasing.md](releasing.md) | How a release is built and published (binaries, `.deb` / `.rpm`, packaging tarball) |
+| [../packaging/README.md](../packaging/README.md) | Distro recipes: Gentoo, Arch, Alpine, Nix, RPM helpers |
 | [roadmap.md](roadmap.md) | Ideas and known gaps; nothing there is promised |
 | [superpowers/specs/2026-10-28-mipsel-port-design.md](superpowers/specs/2026-10-28-mipsel-port-design.md) | OpenWrt mipsel (`mipsel_24kc`) port design and acceptance gates |
 | [superpowers/plans/2026-10-28-mipsel-port.md](superpowers/plans/2026-10-28-mipsel-port.md) | Implementation plan for the mipsel cross build and qemu suite |

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+	<maintainer type="person">
+		<email>chmielewski811@gmail.com</email>
+		<name>Piotr Chmielewski</name>
+	</maintainer>
+	<upstream>
+		<remote-id type="github">pchmielewski1/ntx</remote-id>
+		<bugs-to>https://github.com/pchmielewski1/ntx/issues</bugs-to>
+	</upstream>
+	<longdescription lang="en">
+		ntx is a BitTorrent client in one small C binary. C11 + POSIX, libc + libm
+		only: no OpenSSL, no vendored libraries. Cryptography, TLS 1.3/1.2 and DoH
+		are implemented in-tree. Downloads magnet links and .torrent files (v1, v2,
+		hybrid), verifies pieces, resumes from disk and seeds after completion.
+	</longdescription>
+</pkgmetadata>

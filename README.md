@@ -62,19 +62,35 @@ No OpenSSL, no libcurl, no cmake: the binary links against `libc` and `libm` onl
 ## Install
 
 Every push to `main` that passes the tests is published on the
-[Releases page](https://github.com/pchmielewski1/ntx/releases) with the next version number. Each release has,
-for x86-64 and arm64 Linux, a plain binary, a `.deb` package and a `SHA256SUMS` file. They are built on
-Ubuntu 22.04 (glibc 2.35), so they also run on older distributions. See [docs/releasing.md](docs/releasing.md).
+[Releases page](https://github.com/pchmielewski1/ntx/releases) with the next version number. Each release
+ships prebuilt packages for **x86_64** and **aarch64**, a stamped **packaging** tarball (Gentoo / Arch /
+Alpine / Nix / RPM recipes for that tag), and `SHA256SUMS`. Binaries are built on Ubuntu 22.04
+(glibc 2.35). See [docs/releasing.md](docs/releasing.md) and [packaging/README.md](packaging/README.md).
 
-**mipsel (OpenWrt):** the same Releases page also ships a ready-made static soft-float binary
-`ntx-<version>-linux-mipsel` (MIPS32r2 / `mipsel_24kc`). GitHub Actions has no mipsel runner, so
-that asset is built and attached by hand with the same `make mips` toolchain as in
-[Platforms](#platforms); check it against `SHA256SUMS` like the other files.
+| Platform | x86_64 | aarch64 | mipsel |
+|----------|--------|---------|--------|
+| Plain binary | `ntx-<ver>-linux-x86_64` | `ntx-<ver>-linux-aarch64` | `ntx-<ver>-linux-mipsel` (manual) |
+| Debian / Ubuntu (`.deb`) | `_amd64.deb` | `_arm64.deb` | — |
+| Fedora / RHEL / openSUSE (`.rpm`) | `.x86_64.rpm` | `.aarch64.rpm` | — |
+| Gentoo / Arch / Alpine / NixOS | build from tag `v<ver>` via `ntx-<ver>-packaging.tar.gz` | same | — |
+
+**mipsel (OpenWrt):** static soft-float musl (`mipsel_24kc`); Actions has no mipsel runner, so that
+asset is attached by hand (`make mips`). Check it against `SHA256SUMS`.
 
 ```sh
-sudo apt install ./ntx_<version>_amd64.deb     # or _arm64.deb; installs /usr/bin/ntx
-# or, any Linux: chmod +x ntx-<version>-linux-x86_64 && ./ntx-<version>-linux-x86_64 <magnet|file.torrent>
-# OpenWrt / mipsel router: chmod +x ntx-<version>-linux-mipsel && ./ntx-<version>-linux-mipsel <magnet|file.torrent>
+# Debian / Ubuntu
+sudo apt install ./ntx_<version>_amd64.deb          # or _arm64.deb
+# Fedora / RHEL / openSUSE
+sudo rpm -Uvh ./ntx-<version>-1.x86_64.rpm          # or .aarch64.rpm
+# Any Linux (glibc binary)
+chmod +x ntx-<version>-linux-x86_64 && ./ntx-<version>-linux-x86_64 <magnet|file.torrent>
+# OpenWrt / mipsel
+chmod +x ntx-<version>-linux-mipsel && ./ntx-<version>-linux-mipsel <magnet|file.torrent>
+# Gentoo (from the packaging tarball / repo overlay tree)
+#   copy packaging/gentoo/net-p2p/ntx into a local overlay, then: emerge net-p2p/ntx
+# Arch:  tar xf ntx-<version>-packaging.tar.gz && cd arch && makepkg -si
+# Alpine: …/alpine && abuild -r
+# NixOS: nix profile install github:pchmielewski1/ntx/v<version>
 ```
 
 Or build from source, as below.

@@ -1,0 +1,38 @@
+# Source RPM recipe (rebuild from the GitHub tag). For a prebuilt binary RPM see
+# packaging/build-rpm.sh, which GitHub Actions attaches to each release.
+Name:           ntx
+Version:        @VERSION@
+Release:        1%{?dist}
+Summary:        Small BitTorrent client with no dependencies
+License:        MIT
+URL:            https://github.com/pchmielewski1/ntx
+Source0:        https://github.com/pchmielewski1/ntx/archive/refs/tags/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
+BuildRequires:  gcc make
+Requires:       glibc
+
+%description
+ntx downloads magnet links and .torrent files (BitTorrent v1, v2 and hybrid),
+verifies every piece, resumes after a restart and seeds afterwards. It supports
+DHT, PEX, uTP, MSE/PE encryption, HTTP/HTTPS/UDP trackers, SOCKS5, and uses its
+own TLS 1.3 client and DNS-over-HTTPS resolver instead of OpenSSL.
+
+%prep
+%autosetup -n %{name}-%{version}
+
+%build
+make ntx NTX_VERSION=%{version}
+
+%install
+install -D -m 0755 ntx %{buildroot}%{_bindir}/ntx
+install -D -m 0644 README.md %{buildroot}%{_pkgdocdir}/README.md
+install -D -m 0644 CHANGELOG.md %{buildroot}%{_pkgdocdir}/CHANGELOG.md
+install -D -m 0644 LICENSE %{buildroot}%{_pkgdocdir}/LICENSE
+
+%files
+%{_bindir}/ntx
+%doc README.md CHANGELOG.md
+%license LICENSE
+
+%changelog
+* Thu Oct 29 2026 Piotr Chmielewski <chmielewski811@gmail.com> - @VERSION@-1
+- Packaging for GitHub Releases (Fedora / RHEL / openSUSE).

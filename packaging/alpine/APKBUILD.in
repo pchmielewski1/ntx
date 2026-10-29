@@ -1,0 +1,25 @@
+# Contributor: Piotr Chmielewski <chmielewski811@gmail.com>
+# Maintainer: Piotr Chmielewski <chmielewski811@gmail.com>
+pkgname=ntx
+pkgver=@VERSION@
+pkgrel=0
+pkgdesc="Small BitTorrent client in one C binary (libc + libm only)"
+url="https://github.com/pchmielewski1/ntx"
+arch="x86_64 aarch64"
+license="MIT"
+depends="musl"
+makedepends="gcc make"
+source="$pkgname-$pkgver.tar.gz::https://github.com/pchmielewski1/ntx/archive/refs/tags/v$pkgver.tar.gz"
+builddir="$srcdir/$pkgname-$pkgver"
+options="!check" # full suite needs the repo test layout as run by make test
+
+build() {
+	make ntx NTX_VERSION="$pkgver"
+}
+
+package() {
+	install -Dm755 ntx "$pkgdir/usr/bin/ntx"
+	install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+	install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
+	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

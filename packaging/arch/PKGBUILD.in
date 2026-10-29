@@ -1,0 +1,25 @@
+# Maintainer: Piotr Chmielewski <chmielewski811@gmail.com>
+pkgname=ntx
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Small BitTorrent client in one C binary (libc + libm only)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/pchmielewski1/ntx"
+license=('MIT')
+depends=('glibc')
+makedepends=('gcc' 'make')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/pchmielewski1/ntx/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  make ntx NTX_VERSION="$pkgver"
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 ntx "$pkgdir/usr/bin/ntx"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

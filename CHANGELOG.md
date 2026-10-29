@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Packaging
+- Release assets now include binary **RPM** (Fedora / RHEL / openSUSE) for x86_64 and aarch64,
+  plus `ntx-<version>-packaging.tar.gz` with stamped **Gentoo** ebuild, Arch `PKGBUILD`, Alpine
+  `APKBUILD`, Nix flake and source RPM `.spec`. Install matrix documented in README and release notes.
+
 ### Platforms
 - OpenWrt **mipsel** (`mipsel_24kc`, MIPS32r2 soft-float, static musl): `make mips` /
   `make test-mipsel`; each GitHub Release ships `ntx-<version>-linux-mipsel` as a **manual**
