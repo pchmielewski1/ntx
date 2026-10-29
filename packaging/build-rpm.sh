@@ -5,7 +5,9 @@
 #
 # e.g. packaging/build-rpm.sh 0.1.2 x86_64 ./ntx dist
 #
-# RPM_ARCH is the RPM architecture name: x86_64 or aarch64.
+# RPM_ARCH is the RPM architecture name: x86_64 or aarch64. It must match the
+# host `rpm --eval '%{_arch}'` (or pass --target); on Ubuntu runners that is
+# typically x86_64 / aarch64.
 set -euo pipefail
 
 if [ $# -ne 4 ]; then
@@ -21,17 +23,23 @@ cd "$(dirname "$0")/.."
 [ -x "$binary" ] || { echo "error: $binary is not an executable file" >&2; exit 1; }
 command -v rpmbuild >/dev/null || { echo "error: rpmbuild not found (install rpm)" >&2; exit 1; }
 
+host_arch=$(rpm --eval '%{_arch}')
+if [ "$host_arch" != "$arch" ]; then
+  echo "error: RPM_ARCH=$arch but host rpm arch is $host_arch" >&2
+  exit 1
+fi
+
 # RPM sorts "0.1.0-rc1" after "0.1.0"; use ~ for pre-releases like the .deb helper.
 rpm_version=${version/-/\~}
 
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
-mkdir -p "$root"/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT}
+mkdir -p "$root"/{BUILD,RPMS,SOURCES,SPECS,SRPMS,payload/usr/bin,payload/usr/share/doc/ntx}
 
-install -d "$root/BUILDROOT/usr/bin" "$root/BUILDROOT/usr/share/doc/ntx"
-install -m 0755 "$binary" "$root/BUILDROOT/usr/bin/ntx"
-strip --strip-unneeded "$root/BUILDROOT/usr/bin/ntx" 2>/dev/null || true
-install -m 0644 README.md LICENSE CHANGELOG.md "$root/BUILDROOT/usr/share/doc/ntx/"
+# Payload lives outside rpmbuild's %{buildroot} (which is under BUILDROOT/<name>/).
+install -m 0755 "$binary" "$root/payload/usr/bin/ntx"
+strip --strip-unneeded "$root/payload/usr/bin/ntx" 2>/dev/null || true
+install -m 0644 README.md LICENSE CHANGELOG.md "$root/payload/usr/share/doc/ntx/"
 
 cat > "$root/SPECS/ntx.spec" <<EOF
 Name:           ntx
@@ -51,7 +59,9 @@ DHT, PEX, uTP, MSE/PE encryption, HTTP/HTTPS/UDP trackers, SOCKS5, and uses its
 own TLS 1.3 client and DNS-over-HTTPS resolver instead of OpenSSL.
 
 %install
-cp -a $root/BUILDROOT/* %{buildroot}/
+rm -rf %{buildroot}
+mkdir -p %{buildroot}
+cp -a $root/payload/. %{buildroot}/
 
 %files
 /usr/bin/ntx
