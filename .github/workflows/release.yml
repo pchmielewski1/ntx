@@ -73,7 +73,8 @@ jobs:
     needs: version
     if: needs.version.outputs.build == 'true'
     strategy:
-      fail-fast: true
+      # Keep the other arch running so a single flake does not hide its signal.
+      fail-fast: false
       matrix:
         include:
           # Ubuntu 22.04 (glibc 2.35) so the binaries also run on older distributions.
@@ -81,35 +82,39 @@ jobs:
           - { runner: ubuntu-22.04-arm, arch: aarch64, deb_arch: arm64, rpm_arch: aarch64 }
     runs-on: ${{ matrix.runner }}
     env:
-      VERSION: ${{ needs.version.outputs.version }}
+      # Prefer NTX_* over VERSION — GNU make imports env vars as make variables.
+      NTX_RELEASE_VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install rpmbuild
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq rpm
-
       - name: Build
-        run: make ntx NTX_VERSION="$VERSION"
+        run: make ntx NTX_VERSION="$NTX_RELEASE_VERSION"
 
       - name: Size gate (< 1 MiB)
         run: make size
 
-      - name: Tests
-        run: |
-          ./ntx --version
-          make test
-          make test-cli
-          make test-net
-          make test-ipc
-          make test-tls13
+      # Same split as ci.yml so a failure names the suite in the Actions UI.
+      - name: Unit tests
+        run: make test
+      - name: CLI validation tests
+        run: make test-cli
+      - name: Loopback smoke test
+        run: make test-net
+      - name: JSON control API (NDJSON) e2e
+        run: make test-ipc
+      - name: TLS 1.3 interop (openssl s_server)
+        run: make test-tls13
 
       - name: Package
         run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rpm
           mkdir dist
-          cp ntx "dist/ntx-${VERSION}-linux-${{ matrix.arch }}"
-          strip --strip-unneeded "dist/ntx-${VERSION}-linux-${{ matrix.arch }}"
-          packaging/build-deb.sh "$VERSION" "${{ matrix.deb_arch }}" ./ntx dist
-          packaging/build-rpm.sh "$VERSION" "${{ matrix.rpm_arch }}" ./ntx dist
+          cp ntx "dist/ntx-${NTX_RELEASE_VERSION}-linux-${{ matrix.arch }}"
+          strip --strip-unneeded "dist/ntx-${NTX_RELEASE_VERSION}-linux-${{ matrix.arch }}"
+          packaging/build-deb.sh "$NTX_RELEASE_VERSION" "${{ matrix.deb_arch }}" ./ntx dist
+          packaging/build-rpm.sh "$NTX_RELEASE_VERSION" "${{ matrix.rpm_arch }}" ./ntx dist
           ls -l dist
 
       - uses: actions/upload-artifact@v4
@@ -126,7 +131,7 @@ jobs:
     permissions:
       contents: write
     env:
-      VERSION: ${{ needs.version.outputs.version }}
+      NTX_RELEASE_VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -138,7 +143,7 @@ jobs:
 
       - name: Stage source packaging recipes
         run: |
-          packaging/stage-recipes.sh "$VERSION" dist
+          packaging/stage-recipes.sh "$NTX_RELEASE_VERSION" dist
           ls -l dist
 
       - name: Checksums
@@ -149,6 +154,7 @@ jobs:
 
       - name: Release notes
         run: |
+          VERSION="$NTX_RELEASE_VERSION"
           # The CHANGELOG.md section for this version, if there is one ("## <version> ..." up to the next "## ").
           awk -v v="${VERSION%%-*}" '
             /^## / { if (found) exit; if (index($0, "## " v " ") == 1 || $0 == "## " v) found = 1; next }
@@ -189,12 +195,13 @@ jobs:
 
           Check downloads against `SHA256SUMS`.
           EOF
-          sed -i "s/@VERSION@/$VERSION/g" notes.md
+          sed -i "s/@VERSION@/$NTX_RELEASE_VERSION/g" notes.md
 
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          VERSION="$NTX_RELEASE_VERSION"
           flags=""
           case "$VERSION" in *-*) flags="--prerelease" ;; esac
           # --generate-notes appends the list of commits since the previous release to the notes above.
