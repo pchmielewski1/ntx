@@ -14,16 +14,20 @@ has to stay under the 1 MiB gate of `make size`.
 ### Portability beyond Linux
 - **Today:** the event loop is `epoll` (`src/net/ntx_netx.c`); everything else is plain POSIX
   (non-blocking sockets via `fcntl`, `pread`/`pwrite`, `clock_gettime`, `/dev/urandom`).
-  CI builds and tests x86_64 and aarch64 Linux only. The `Makefile` assumes GNU Make and
-  GNU `stat`.
+  CI builds and tests x86_64 and aarch64 Linux; mipsel is an optional cross target
+  (`make mips`). The `Makefile` assumes GNU Make and GNU `stat`.
 - **Needed:** a small poll abstraction with a `kqueue` backend would cover macOS/BSD; a Windows
   port would additionally need a socket/file/time layer and a different build.
 - **Trade-offs:** `kqueue` is a contained change. Windows touches almost every file and the
   maintenance cost is high for a client this small.
 
 ### Other CPU architectures
-- **Today:** only x86_64 and aarch64 are built in CI. Nothing in the code is architecture
-  specific, but other targets (e.g. riscv64) have not been tried.
+- **Today:** CI builds and tests x86_64 and aarch64. A static mipsel (MIPS32r2 soft-float,
+  OpenWrt `mipsel_24kc`) port is available via `make mips` / `make test-mipsel` (qemu user-mode);
+  it is not a CI job or a release artifact. Other targets (e.g. riscv64, big-endian MIPS) have
+  not been tried.
+- **Needed for mipsel in releases:** an optional CI job with the OpenWrt SDK + qemu-mipsel, and
+  a decision on whether to ship `ntx-mipsel` alongside the glibc x86_64/arm64 packages.
 
 ## User interface
 

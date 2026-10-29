@@ -8,6 +8,8 @@ Size budget: the binary must stay below 1 MiB (1048576 bytes). `make size` enfor
 
 The program is single-threaded. Almost all I/O is non-blocking and driven by one epoll loop, but a few operations block the loop for the duration of one request: DoH lookups, HTTP(S) tracker announces, HTTP(S) webseed range requests, and the final `event=stopped` announces on exit (bounded to about 3 seconds in total).
 
+**CPU portability.** Wire and crypto code is endian-safe (byte-wise parses, no unaligned `u32*` casts). CI covers x86_64 and aarch64. A static mipsel build (`make mips` → `ntx-mipsel`) uses a soft-float musl toolchain; X25519 field multiplication falls back when `__uint128_t` is unavailable, and AES-GCM length checks avoid 64-bit-only assumptions. See [testing.md](testing.md) for `test-mipsel` / `native-check`.
+
 ## Layers
 
 ```

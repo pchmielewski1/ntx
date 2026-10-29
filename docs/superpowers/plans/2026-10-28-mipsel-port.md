@@ -1,5 +1,7 @@
 # ntx mipsel Port Implementation Plan
 
+> **Status (2026-10-29):** Tasks 1–6 **DONE** on branch `mips` — OpenWrt SDK toolchain (not Bootlin), `make mips` → `ntx-mipsel`, `make test-mipsel` 3× green under qemu-mipsel (`NTX_TEST_TIMEOUT_SCALE=1`), `make native-check`, crypto 32-bit fallbacks. Task 7 (malta e2e) remains **best-effort / not shipped** (not an acceptance gate). Product docs: README Platforms, `docs/testing.md`, `docs/architecture.md`, `docs/roadmap.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Przenieś `ntx` na mipsel (OpenWrt `mipsel_24kc`-kompatybilnie): statyczna binarka `ntx-mipsel` w katalogu głównym repo + pełna suita unit zielona pod `qemu-mipsel`.

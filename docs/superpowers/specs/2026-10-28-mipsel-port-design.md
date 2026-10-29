@@ -1,6 +1,6 @@
 # ntx — port na mipsel (OpenWrt) — design
 
-Data: 2026-10-28 · Branch: `mips` (z `publish`) · Status: zatwierdzony przez partnera do planowania
+Data: 2026-10-28 · Branch: `mips` (z `publish`) · Status: **zaimplementowany** (bramy unit: `make mips` + 3× `make test-mipsel`; malta e2e best-effort poza zakresem ship)
 
 ## Intent i dlaczego
 

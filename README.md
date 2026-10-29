@@ -51,9 +51,11 @@ SPKI pins instead of system DNS and a CA store) is small enough to audit yoursel
 
 ## Requirements
 
-- **Linux** (x86_64 or aarch64; the event loop uses `epoll`)
+- **Linux** (x86_64 or aarch64 for the usual host build; the event loop uses `epoll`)
 - A C11 compiler (`cc` / gcc / clang) and **GNU Make**
 - Optional: `musl-gcc` for `make static`
+- Optional (OpenWrt / mipsel): a mipsel musl soft-float cross toolchain and `qemu-mipsel`
+  for `make mips` / `make test-mipsel` — see [Platforms](#platforms)
 
 No OpenSSL, no libcurl, no cmake: the binary links against `libc` and `libm` only.
 
@@ -202,7 +204,9 @@ TLS 1.3 scope and the test matrix: the "TLS client" section of [docs/network.md]
 Some of these are deliberate non-goals; the rest are gaps listed in
 [docs/roadmap.md](docs/roadmap.md) (nothing there is promised).
 
-- Linux only (no Windows or macOS builds); only x86_64 and aarch64 are built and tested.
+- Linux only (no Windows or macOS builds). CI builds and tests x86_64 and aarch64; mipsel
+  (OpenWrt `mipsel_24kc`, soft-float, static musl) is supported via `make mips` and verified
+  under `qemu-mipsel` (`make test-mipsel`), but is not a CI or release artifact.
 - No GUI and no config file. One torrent can be given on the command line; more can be added
   at run time through the `--stats-json` control channel.
 - Not implemented: selective file download and priorities, sequential mode, torrent creation,
@@ -255,6 +259,9 @@ make test-ipc     # --stats-json command channel end to end
 make test-tls13   # TLS 1.3 client vs. `openssl s_server` on loopback (needs the openssl CLI)
 make probe        # optional tracker/DoH probe binary
 make static       # musl static build (optional)
+make mips         # static OpenWrt mipsel binary ./ntx-mipsel (needs cross toolchain)
+make test-mipsel  # cross-compile every test/t_*.c and run under qemu-mipsel
+make native-check # out-of-tree host regression after mipsel portability edits
 ```
 
 Suites cover crypto vectors (including independently generated ones), wire/MSE/PE,
@@ -270,10 +277,24 @@ See [docs/testing.md](docs/testing.md) for the suite map.
 |--------------|--------|
 | Linux x86_64 | built and tested in CI (`make test` and the other targets above) |
 | Linux aarch64 (ARM64) | built and tested in CI |
+| Linux mipsel (MIPS32r2, soft-float, musl static) | `make mips` → `./ntx-mipsel`; unit suite under `qemu-mipsel` via `make test-mipsel`. Aimed at OpenWrt `mipsel_24kc` (e.g. MediaTek MT7621). Not in CI or GitHub Releases. |
+
+Cross build (on an x86_64 host with space for the SDK):
+
+```sh
+bash scripts/mips/provision-toolchain.sh   # OpenWrt SDK → ~/toolchains/mipsel-linux-musl/
+make mips                                  # ./ntx-mipsel (static, soft-float)
+make test-mipsel                           # full test/t_*.c under qemu-mipsel
+```
+
+`scripts/mips/qemu-user-run.sh` finds `qemu-mipsel` from a sudo-less deb extract under
+`~/toolchains/qemu/`, the system PATH, or a docker fallback. Design and acceptance notes:
+[docs/superpowers/specs/2026-10-28-mipsel-port-design.md](docs/superpowers/specs/2026-10-28-mipsel-port-design.md).
 
 Flags: `-O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -ffunction-sections`,
 linked with `-Wl,--gc-sections`, plus hardening flags (stack protector, `_FORTIFY_SOURCE=2`,
-PIE, full RELRO, non-executable stack).
+PIE, full RELRO, non-executable stack). The `mips` target keeps the compile-time hardeners and
+drops only `-pie` (same precedent as `make static`).
 
 ## Privacy notes
 

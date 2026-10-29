@@ -17,6 +17,8 @@ welcome.
 | [module-map.md](module-map.md) | Every source file under `src/` and its responsibility |
 | [releasing.md](releasing.md) | How a release is built and published (binaries, `.deb`) |
 | [roadmap.md](roadmap.md) | Ideas and known gaps; nothing there is promised |
+| [superpowers/specs/2026-10-28-mipsel-port-design.md](superpowers/specs/2026-10-28-mipsel-port-design.md) | OpenWrt mipsel (`mipsel_24kc`) port design and acceptance gates |
+| [superpowers/plans/2026-10-28-mipsel-port.md](superpowers/plans/2026-10-28-mipsel-port.md) | Implementation plan for the mipsel cross build and qemu suite |
 
 Outside this directory:
 

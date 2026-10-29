@@ -30,10 +30,22 @@ Replace `t_sha1` with any file name from the table below. (`test/t_*` binaries a
 | `make test-interop` | Docker-based interop test against `transmission-daemon` (`test/interop/Dockerfile`, `test/interop/interop.sh`). Builds an image from a copy of `Makefile`, `src/` and `test/interop/`, compiles `ntx` inside the container, downloads a 1 MiB seeded file and checks handshake, MSE/PE, piece download and tracker announce. Needs Docker and network access for the image build. Scratch files go to `test/.scratch/`. |
 | `make size` | Builds `ntx`, prints `size ntx` and `ls -l ntx`, and fails if the binary is 1 MiB (1048576 bytes) or larger. |
 | `make static` | Builds a static binary with `musl-gcc` (needs musl installed). |
+| `make mips` | Cross-compiles a static soft-float mipsel binary `./ntx-mipsel` with `MIPS_CC` (default: `~/toolchains/mipsel-linux-musl/bin/mipsel-linux-musl-gcc` from `scripts/mips/provision-toolchain.sh`). Does not overwrite `./ntx` or native objects. |
+| `make test-mipsel` | Cross-compiles every `test/t_*.c` to `test/.mipsel.<name>.tmp` and runs each under `qemu-mipsel` via `scripts/mips/run-suite.sh`. Propagates `NTX_TEST_TIMEOUT_SCALE` for TCG timing; timing-sensitive suites use `test/tscale.h`. |
+| `make native-check` | Out-of-tree host compile+run of all `src/` and `test/t_*.c` into `test/.agent-work/native-check/` (`scripts/mips/native-check.sh`). Used to prove mipsel portability edits did not regress the native build; never writes root `.test.tmp` / `ntx`. |
 | `make probe` | Builds `./trk_http_probe` from `test/trk_http_probe.c`. It is a manual tool, not a test: it announces a fixed info hash to a few public HTTP trackers and prints `<url> rc=<status> np=<peers>` for each. It needs internet access, and exits 0 if at least one tracker returned peers. |
-| `make clean` | Removes `ntx`, `trk_http_probe` and the temporary test binaries. |
+| `make clean` | Removes `ntx`, `ntx-mipsel`, `trk_http_probe` and the temporary test binaries. |
 
 There is no Make target for fuzzing; see [fuzzing.md](fuzzing.md).
+
+### mipsel (OpenWrt) cross suite
+
+The mipsel port targets MIPS32r2 little-endian soft-float musl (`mipsel_24kc`), matching common
+OpenWrt ramips boards. Host builds stay on x86_64/aarch64; cross artifacts use separate names
+(`ntx-mipsel`, `build-mipsel/`, `test/.mipsel*.tmp`). Acceptance for the port is a green
+`make test-mipsel` run (documented as three consecutive passes under qemu user-mode). Full-system
+OpenWrt malta e2e remains best-effort and is not required. Design:
+[superpowers/specs/2026-10-28-mipsel-port-design.md](superpowers/specs/2026-10-28-mipsel-port-design.md).
 
 ## Continuous integration
 
