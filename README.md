@@ -66,9 +66,15 @@ Every push to `main` that passes the tests is published on the
 for x86-64 and arm64 Linux, a plain binary, a `.deb` package and a `SHA256SUMS` file. They are built on
 Ubuntu 22.04 (glibc 2.35), so they also run on older distributions. See [docs/releasing.md](docs/releasing.md).
 
+**mipsel (OpenWrt):** the same Releases page also ships a ready-made static soft-float binary
+`ntx-<version>-linux-mipsel` (MIPS32r2 / `mipsel_24kc`). GitHub Actions has no mipsel runner, so
+that asset is built and attached by hand with the same `make mips` toolchain as in
+[Platforms](#platforms); check it against `SHA256SUMS` like the other files.
+
 ```sh
 sudo apt install ./ntx_<version>_amd64.deb     # or _arm64.deb; installs /usr/bin/ntx
 # or, any Linux: chmod +x ntx-<version>-linux-x86_64 && ./ntx-<version>-linux-x86_64 <magnet|file.torrent>
+# OpenWrt / mipsel router: chmod +x ntx-<version>-linux-mipsel && ./ntx-<version>-linux-mipsel <magnet|file.torrent>
 ```
 
 Or build from source, as below.
@@ -204,9 +210,10 @@ TLS 1.3 scope and the test matrix: the "TLS client" section of [docs/network.md]
 Some of these are deliberate non-goals; the rest are gaps listed in
 [docs/roadmap.md](docs/roadmap.md) (nothing there is promised).
 
-- Linux only (no Windows or macOS builds). CI builds and tests x86_64 and aarch64; mipsel
-  (OpenWrt `mipsel_24kc`, soft-float, static musl) is supported via `make mips` and verified
-  under `qemu-mipsel` (`make test-mipsel`), but is not a CI or release artifact.
+- Linux only (no Windows or macOS builds). CI builds and tests x86_64 and aarch64. mipsel
+  (OpenWrt `mipsel_24kc`, soft-float, static musl) is built with `make mips`, verified under
+  `qemu-mipsel` (`make test-mipsel`), and published on Releases as `ntx-<version>-linux-mipsel`
+  (manual asset — Actions does not cross-build mipsel).
 - No GUI and no config file. One torrent can be given on the command line; more can be added
   at run time through the `--stats-json` control channel.
 - Not implemented: selective file download and priorities, sequential mode, torrent creation,
@@ -277,7 +284,7 @@ See [docs/testing.md](docs/testing.md) for the suite map.
 |--------------|--------|
 | Linux x86_64 | built and tested in CI (`make test` and the other targets above) |
 | Linux aarch64 (ARM64) | built and tested in CI |
-| Linux mipsel (MIPS32r2, soft-float, musl static) | `make mips` → `./ntx-mipsel`; unit suite under `qemu-mipsel` via `make test-mipsel`. Aimed at OpenWrt `mipsel_24kc` (e.g. MediaTek MT7621). Not in CI or GitHub Releases. |
+| Linux mipsel (MIPS32r2, soft-float, musl static) | Pre-built on [Releases](https://github.com/pchmielewski1/ntx/releases) as `ntx-<version>-linux-mipsel` (attached manually). Local: `make mips` → `./ntx-mipsel`; `make test-mipsel` under `qemu-mipsel`. OpenWrt `mipsel_24kc` (e.g. MediaTek MT7621). Not built in CI. |
 
 Cross build (on an x86_64 host with space for the SDK):
 

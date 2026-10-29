@@ -32,14 +32,29 @@ Each release contains:
 
 | File | Contents |
 |------|----------|
-| `ntx-<version>-linux-x86_64`, `ntx-<version>-linux-aarch64` | The stripped binary |
+| `ntx-<version>-linux-x86_64`, `ntx-<version>-linux-aarch64` | The stripped binary (from Actions) |
 | `ntx_<version>_amd64.deb`, `ntx_<version>_arm64.deb` | The binary in `/usr/bin`, plus README, licence and changelog under `/usr/share/doc/ntx` |
-| `SHA256SUMS` | Checksums of all of the above |
+| `ntx-<version>-linux-mipsel` | Static musl soft-float OpenWrt binary (attached **manually** after the Actions release; see below) |
+| `SHA256SUMS` | Checksums of all of the above (re-uploaded after the mipsel asset is added) |
 
 The `.deb` is built by [`packaging/build-deb.sh`](../packaging/build-deb.sh). It depends only on `libc6`, with the
 minimum version taken from the glibc of the build machine. For a pre-release the package version uses `~`
-(`0.1.0~rc1`) so that it sorts before `0.1.0`. The binaries are dynamically linked against glibc; there is no
-static (musl) release build.
+(`0.1.0~rc1`) so that it sorts before `0.1.0`. The x86_64/aarch64 binaries are dynamically linked against
+glibc. The mipsel asset is a static musl build (`make mips`).
+
+## Manual mipsel asset (no Actions runner)
+
+GitHub-hosted runners cannot produce mipsel. After Actions has published `vX.Y.Z`:
+
+```sh
+make mips NTX_VERSION=X.Y.Z          # ./ntx-mipsel
+# optional: mipsel-*-strip --strip-unneeded ntx-mipsel
+cp ntx-mipsel dist/ntx-X.Y.Z-linux-mipsel
+gh release upload "vX.Y.Z" dist/ntx-X.Y.Z-linux-mipsel
+# refresh SHA256SUMS: download the existing file, append the new line, delete+re-upload the asset
+```
+
+Keep the local `./ntx-mipsel` out of git (it is gitignored); only the Releases page carries the download.
 
 ## Building a package by hand
 

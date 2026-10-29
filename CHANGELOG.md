@@ -3,9 +3,10 @@
 ## Unreleased
 
 ### Platforms
-- OpenWrt **mipsel** (`mipsel_24kc`, MIPS32r2 soft-float, static musl): `make mips` builds
-  `./ntx-mipsel`; `make test-mipsel` runs the unit suite under `qemu-mipsel`. Crypto portability
-  for 32-bit targets without `__uint128_t`. Not a CI or GitHub Releases artifact.
+- OpenWrt **mipsel** (`mipsel_24kc`, MIPS32r2 soft-float, static musl): `make mips` /
+  `make test-mipsel`; each GitHub Release ships `ntx-<version>-linux-mipsel` as a **manual**
+  asset (Actions builds only x86_64 and arm64). Crypto portability for 32-bit targets without
+  `__uint128_t`.
 
 ## 0.1.0 - 2026-10-06
 

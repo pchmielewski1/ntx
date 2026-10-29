@@ -23,11 +23,11 @@ has to stay under the 1 MiB gate of `make size`.
 
 ### Other CPU architectures
 - **Today:** CI builds and tests x86_64 and aarch64. A static mipsel (MIPS32r2 soft-float,
-  OpenWrt `mipsel_24kc`) port is available via `make mips` / `make test-mipsel` (qemu user-mode);
-  it is not a CI job or a release artifact. Other targets (e.g. riscv64, big-endian MIPS) have
-  not been tried.
-- **Needed for mipsel in releases:** an optional CI job with the OpenWrt SDK + qemu-mipsel, and
-  a decision on whether to ship `ntx-mipsel` alongside the glibc x86_64/arm64 packages.
+  OpenWrt `mipsel_24kc`) port is available via `make mips` / `make test-mipsel`, and each GitHub
+  Release can include `ntx-<version>-linux-mipsel` attached by hand (Actions has no mipsel
+  runner). Other targets (e.g. riscv64, big-endian MIPS) have not been tried.
+- **Needed for automated mipsel releases:** a self-hosted or container job with the OpenWrt SDK
+  (+ qemu-mipsel for tests) so the asset is no longer a manual post-publish step.
 
 ## User interface
 
