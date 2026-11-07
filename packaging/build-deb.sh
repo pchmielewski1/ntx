@@ -7,6 +7,10 @@
 #
 # The package depends only on libc6; the minimum version is taken from the glibc of the machine that built the
 # binary (build on the oldest distribution you want to support).
+#
+# Cross builds set NTX_STRIP to the target's strip (e.g. riscv64-linux-gnu-strip) and
+# NTX_DEB_LIBC_MIN to the glibc the binary was linked against (e.g. the libc6-riscv64-cross
+# version), because the host's strip and glibc say nothing about the target.
 set -euo pipefail
 
 if [ $# -ne 4 ]; then
@@ -21,7 +25,8 @@ outdir=$4
 cd "$(dirname "$0")/.."
 [ -x "$binary" ] || { echo "error: $binary is not an executable file" >&2; exit 1; }
 
-glibc=$(getconf GNU_LIBC_VERSION | grep -Eo '[0-9]+\.[0-9]+$')
+glibc=${NTX_DEB_LIBC_MIN:-$(getconf GNU_LIBC_VERSION | grep -Eo '[0-9]+\.[0-9]+$')}
+printf '%s' "$glibc" | grep -Eq '^[0-9]+\.[0-9]+$' || { echo "error: bad glibc version '$glibc' (want MAJOR.MINOR)" >&2; exit 1; }
 [ -n "$glibc" ] || { echo "error: cannot detect the glibc version" >&2; exit 1; }
 
 # Debian sorts "0.1.0-rc1" after "0.1.0"; "~" sorts before, which is what a pre-release needs.
@@ -32,7 +37,7 @@ trap 'rm -rf "$root"' EXIT
 
 install -d "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/doc/ntx"
 install -m 0755 "$binary" "$root/usr/bin/ntx"
-strip --strip-unneeded "$root/usr/bin/ntx"
+"${NTX_STRIP:-strip}" --strip-unneeded "$root/usr/bin/ntx"
 install -m 0644 README.md "$root/usr/share/doc/ntx/README.md"
 install -m 0644 LICENSE "$root/usr/share/doc/ntx/copyright"
 gzip -9n -c CHANGELOG.md > "$root/usr/share/doc/ntx/changelog.gz"
