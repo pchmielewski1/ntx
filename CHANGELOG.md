@@ -10,7 +10,7 @@
 ### Platforms
 - OpenWrt **mipsel** (`mipsel_24kc`, MIPS32r2 soft-float, static musl): `make mips` /
   `make test-mipsel`; each GitHub Release ships `ntx-<version>-linux-mipsel` as a **manual**
-  asset (Actions builds only x86_64 and arm64). Crypto portability for 32-bit targets without
+  asset (Actions builds x86_64, aarch64 and riscv64). Crypto portability for 32-bit targets without
   `__uint128_t`.
 - **riscv64** (RV64GC, lp64d, glibc 2.35+): `make riscv` / `make test-riscv` /
   `make test-riscv-shell`; cross-built and tested under `qemu-riscv64` in Actions, and every
