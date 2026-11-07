@@ -20,6 +20,9 @@ welcome.
 | [roadmap.md](roadmap.md) | Ideas and known gaps; nothing there is promised |
 | [superpowers/specs/2026-10-28-mipsel-port-design.md](superpowers/specs/2026-10-28-mipsel-port-design.md) | OpenWrt mipsel (`mipsel_24kc`) port design and acceptance gates |
 | [superpowers/plans/2026-10-28-mipsel-port.md](superpowers/plans/2026-10-28-mipsel-port.md) | Implementation plan for the mipsel cross build and qemu suite |
+| [superpowers/specs/2026-11-07-riscv64-port-design.md](superpowers/specs/2026-11-07-riscv64-port-design.md) | riscv64 (glibc, RV64GC) port design: automated cross build + qemu-user tests in Actions |
+| [superpowers/plans/2026-11-07-riscv64-port.md](superpowers/plans/2026-11-07-riscv64-port.md) | Implementation plan for the riscv64 port, split into subagent tasks |
+| [superpowers/2026-11-07-riscv64-local-env.md](superpowers/2026-11-07-riscv64-local-env.md) | Local riscv64 build/test environment (apt or Docker) |
 
 Outside this directory:
 
