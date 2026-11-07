@@ -7,10 +7,12 @@ build-mipsel/
 dist/
 .test.tmp
 test/.mipsel*.tmp
+test/.riscv64*.tmp
 
 # Binaries: the main one (ntx) and the tests (test/t_*.c -> test/t_*)
 /ntx
 /ntx-mipsel
+/ntx-riscv64
 test/t_*
 !test/t_*.c
 
