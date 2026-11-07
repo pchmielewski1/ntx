@@ -31,10 +31,14 @@ Replace `t_sha1` with any file name from the table below. (`test/t_*` binaries a
 | `make size` | Builds `ntx`, prints `size ntx` and `ls -l ntx`, and fails if the binary is 1 MiB (1048576 bytes) or larger. |
 | `make static` | Builds a static binary with `musl-gcc` (needs musl installed). |
 | `make mips` | Cross-compiles a static soft-float mipsel binary `./ntx-mipsel` with `MIPS_CC` (default: `~/toolchains/mipsel-linux-musl/bin/mipsel-linux-musl-gcc` from `scripts/mips/provision-toolchain.sh`). Does not overwrite `./ntx` or native objects. |
+| `make riscv` | Cross-compiles a dynamic glibc riscv64 binary `./ntx-riscv64` (RV64GC, lp64d) with `RISCV_CC` (default `riscv64-linux-gnu-gcc`) and the same hardening flags as `ntx`. Writes its own file; never rebuilds or overwrites `./ntx` or native objects. |
+| `make size-riscv` | Prints `ls -l ntx-riscv64` and fails if it is 1 MiB (1048576 bytes) or larger. Does not rebuild `ntx-riscv64`; it must exist already (`make riscv` first). |
+| `make test-riscv` | Cross-compiles every `test/t_*.c` to `test/.riscv64.<name>.tmp` and runs each under `qemu-riscv64` via `scripts/riscv/run-suite.sh`. Propagates `NTX_TEST_TIMEOUT_SCALE` for TCG timing; each test is bounded by `NTX_TEST_TIMEOUT` (default 300 s). Does not rebuild `./ntx`. |
+| `make test-riscv-shell` | Runs the shell gates (`test-cli`, `test-net`, `test-ipc`, `test-tls13`) against `./ntx-riscv64` under `qemu-riscv64` via `scripts/riscv/run-shell-suites.sh`. Reads the existing `ntx-riscv64`, does not rebuild it, and never touches the native `./ntx`. |
 | `make test-mipsel` | Cross-compiles every `test/t_*.c` to `test/.mipsel.<name>.tmp` and runs each under `qemu-mipsel` via `scripts/mips/run-suite.sh`. Propagates `NTX_TEST_TIMEOUT_SCALE` for TCG timing; timing-sensitive suites use `test/tscale.h`. |
 | `make native-check` | Out-of-tree host compile+run of all `src/` and `test/t_*.c` into `test/.agent-work/native-check/` (`scripts/mips/native-check.sh`). Used to prove mipsel portability edits did not regress the native build; never writes root `.test.tmp` / `ntx`. |
 | `make probe` | Builds `./trk_http_probe` from `test/trk_http_probe.c`. It is a manual tool, not a test: it announces a fixed info hash to a few public HTTP trackers and prints `<url> rc=<status> np=<peers>` for each. It needs internet access, and exits 0 if at least one tracker returned peers. |
-| `make clean` | Removes `ntx`, `ntx-mipsel`, `trk_http_probe` and the temporary test binaries. |
+| `make clean` | Removes `ntx`, `ntx-mipsel`, `ntx-riscv64`, `trk_http_probe` and the temporary test binaries. |
 
 There is no Make target for fuzzing; see [fuzzing.md](fuzzing.md).
 
@@ -47,11 +51,28 @@ OpenWrt ramips boards. Host builds stay on x86_64/aarch64; cross artifacts use s
 OpenWrt malta e2e remains best-effort and is not required. Design:
 [superpowers/specs/2026-10-28-mipsel-port-design.md](superpowers/specs/2026-10-28-mipsel-port-design.md).
 
+### riscv64 cross suite
+
+The riscv64 port targets RV64GC (`lp64d`) against glibc, so the binary is dynamic like the
+x86_64/aarch64 builds and keeps every hardening flag. The toolchain is the Debian/Ubuntu cross
+gcc `riscv64-linux-gnu-gcc` (`RISCV_CC`) with the sysroot `/usr/riscv64-linux-gnu` from
+`libc6-dev-riscv64-cross`; tests and binaries run through `scripts/riscv/qemu-user-run.sh`, which
+launches `qemu-riscv64` with that sysroot. `make test-riscv` cross-compiles every `test/t_*.c`
+and runs them all; `make test-riscv-shell` runs the shell gates against `./ntx-riscv64` from a
+scratch root `test/.scratch/riscv64-shell/` holding copies of the gate scripts and an executable
+`./ntx` wrapper, so the native `./ntx` is never read or built. Like the mipsel suites, both
+propagate `NTX_TEST_TIMEOUT_SCALE` for TCG timing. The whole riscv64 suite takes about 200 s on
+a fast aarch64 host and a few minutes on an Actions runner. For a sudo-less environment
+`scripts/riscv/docker-run.sh` runs any of these targets in the pinned Ubuntu 22.04 image
+`ntx-riscv64-env:22.04` (same packages as CI), e.g.
+`scripts/riscv/docker-run.sh make riscv test-riscv test-riscv-shell`.
+
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs on pushes to `main`/`master` and on pull requests.
 
 - Job `build-test`, on `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm` (aarch64): `make ntx`, `make size`, `make test`, `make test-cli`, `make test-net`, `make test-ipc`, `make test-tls13`.
+- Job `riscv64`, on `ubuntu-22.04`: `make riscv`, `make size-riscv`, `make test-riscv`, `make test-riscv-shell` (after apt-installing `gcc-riscv64-linux-gnu`, `libc6-dev-riscv64-cross` and `qemu-user`).
 - Job `sanitizers`, on `ubuntu-latest`: `make test` with `CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -std=c11 -D_POSIX_C_SOURCE=200809L"` and `ASAN_OPTIONS=detect_leaks=0`. (Overriding `CFLAGS` drops `-Werror`.)
 
 `make test-live`, `make test-interop`, the other interop scripts and `make probe` are not run in CI.

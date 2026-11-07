@@ -26,15 +26,18 @@ previous release. Versions without a changelog section get only the commit list.
 ## What the workflow does
 
 On Ubuntu 22.04 runners, one for x86-64 and one for arm64, it builds, runs `make size`, `make test`,
-`make test-cli`, `make test-net`, `make test-ipc` and `make test-tls13`, and only then packages. Nothing is
-published unless both architectures pass.
+`make test-cli`, `make test-net`, `make test-ipc` and `make test-tls13`, and only then packages. A third
+(x86-64) cross-builds riscv64 and runs `make size-riscv`, `make test-riscv` and `make test-riscv-shell`
+under qemu-user. Nothing is published unless all three pass.
 
 Each release contains:
 
 | File | Contents |
 |------|----------|
 | `ntx-<version>-linux-x86_64`, `ntx-<version>-linux-aarch64` | Stripped glibc binary (Actions) |
+| `ntx-<version>-linux-riscv64` | Stripped glibc binary, cross-built (Actions) |
 | `ntx_<version>_amd64.deb`, `ntx_<version>_arm64.deb` | Debian/Ubuntu package |
+| `ntx_<version>_riscv64.deb` | Debian/Ubuntu package, cross-built (Actions) |
 | `ntx-<version>-1.x86_64.rpm`, `ntx-<version>-1.aarch64.rpm` | Fedora / RHEL / openSUSE binary RPM |
 | `ntx-<version>-packaging.tar.gz` | Stamped source recipes: Gentoo ebuild, Arch `PKGBUILD`, Alpine `APKBUILD`, Nix flake, RPM `.spec` |
 | `ntx-<version>-linux-mipsel` | Static musl soft-float OpenWrt binary (**manual** after Actions; see below) |
@@ -46,6 +49,7 @@ Each release contains:
 |------|-------------------------------|-------|
 | x86_64 / amd64 | yes (Actions) | glibc 2.35+ |
 | aarch64 / arm64 | yes (Actions) | glibc 2.35+ |
+| riscv64 | binary + .deb (Actions, cross + qemu-user) | glibc 2.35+, RV64GC lp64d; no .rpm |
 | mipsel | binary only (manual) | OpenWrt `mipsel_24kc`, static musl soft-float |
 
 Gentoo, Arch, Alpine and NixOS install by building from the GitHub **tag** (any Linux arch with `epoll`;
@@ -75,4 +79,9 @@ make ntx NTX_VERSION=0.2.0
 packaging/build-deb.sh 0.2.0 amd64 ./ntx dist
 packaging/build-rpm.sh 0.2.0 x86_64 ./ntx dist
 packaging/stage-recipes.sh 0.2.0 dist
+
+# riscv64 (needs gcc-riscv64-linux-gnu; NTX_STRIP / NTX_DEB_LIBC_MIN for the cross .deb)
+make riscv NTX_VERSION=0.2.0
+NTX_STRIP=riscv64-linux-gnu-strip NTX_DEB_LIBC_MIN=2.35 \
+  packaging/build-deb.sh 0.2.0 riscv64 ./ntx-riscv64 dist
 ```

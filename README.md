@@ -63,27 +63,28 @@ No OpenSSL, no libcurl, no cmake: the binary links against `libc` and `libm` onl
 
 Every push to `main` that passes the tests is published on the
 [Releases page](https://github.com/pchmielewski1/ntx/releases) with the next version number. Each release
-ships prebuilt packages for **x86_64** and **aarch64**, a stamped **packaging** tarball (Gentoo / Arch /
+ships prebuilt packages for **x86_64**, **aarch64** and **riscv64**, a stamped **packaging** tarball (Gentoo / Arch /
 Alpine / Nix / RPM recipes for that tag), and `SHA256SUMS`. Binaries are built on Ubuntu 22.04
 (glibc 2.35). See [docs/releasing.md](docs/releasing.md) and [packaging/README.md](packaging/README.md).
 
-| Platform | x86_64 | aarch64 | mipsel |
-|----------|--------|---------|--------|
-| Plain binary | `ntx-<ver>-linux-x86_64` | `ntx-<ver>-linux-aarch64` | `ntx-<ver>-linux-mipsel` (manual) |
-| Debian / Ubuntu (`.deb`) | `_amd64.deb` | `_arm64.deb` | — |
-| Fedora / RHEL / openSUSE (`.rpm`) | `.x86_64.rpm` | `.aarch64.rpm` | — |
-| Gentoo / Arch / Alpine / NixOS | build from tag `v<ver>` via `ntx-<ver>-packaging.tar.gz` | same | — |
+| Platform | x86_64 | aarch64 | riscv64 | mipsel |
+|----------|--------|---------|---------|--------|
+| Plain binary | `ntx-<ver>-linux-x86_64` | `ntx-<ver>-linux-aarch64` | `ntx-<ver>-linux-riscv64` | `ntx-<ver>-linux-mipsel` (manual) |
+| Debian / Ubuntu (`.deb`) | `_amd64.deb` | `_arm64.deb` | `_riscv64.deb` | — |
+| Fedora / RHEL / openSUSE (`.rpm`) | `.x86_64.rpm` | `.aarch64.rpm` | — | — |
+| Gentoo / Arch / Alpine / NixOS | build from tag `v<ver>` via `ntx-<ver>-packaging.tar.gz` | same | same | — |
 
 **mipsel (OpenWrt):** static soft-float musl (`mipsel_24kc`); Actions has no mipsel runner, so that
 asset is attached by hand (`make mips`). Check it against `SHA256SUMS`.
 
 ```sh
 # Debian / Ubuntu
-sudo apt install ./ntx_<version>_amd64.deb          # or _arm64.deb
+sudo apt install ./ntx_<version>_amd64.deb          # or _arm64.deb / _riscv64.deb
 # Fedora / RHEL / openSUSE
 sudo rpm -Uvh ./ntx-<version>-1.x86_64.rpm          # or .aarch64.rpm
 # Any Linux (glibc binary)
 chmod +x ntx-<version>-linux-x86_64 && ./ntx-<version>-linux-x86_64 <magnet|file.torrent>
+chmod +x ntx-<version>-linux-riscv64 && ./ntx-<version>-linux-riscv64 <magnet|file.torrent>
 # OpenWrt / mipsel
 chmod +x ntx-<version>-linux-mipsel && ./ntx-<version>-linux-mipsel <magnet|file.torrent>
 # Gentoo (from the packaging tarball / repo overlay tree)
@@ -226,7 +227,8 @@ TLS 1.3 scope and the test matrix: the "TLS client" section of [docs/network.md]
 Some of these are deliberate non-goals; the rest are gaps listed in
 [docs/roadmap.md](docs/roadmap.md) (nothing there is promised).
 
-- Linux only (no Windows or macOS builds). CI builds and tests x86_64 and aarch64. mipsel
+- Linux only (no Windows or macOS builds). CI builds and tests x86_64 and aarch64 natively and
+  riscv64 under qemu-user. mipsel
   (OpenWrt `mipsel_24kc`, soft-float, static musl) is built with `make mips`, verified under
   `qemu-mipsel` (`make test-mipsel`), and published on Releases as `ntx-<version>-linux-mipsel`
   (manual asset — Actions does not cross-build mipsel).
@@ -300,7 +302,13 @@ See [docs/testing.md](docs/testing.md) for the suite map.
 |--------------|--------|
 | Linux x86_64 | built and tested in CI (`make test` and the other targets above) |
 | Linux aarch64 (ARM64) | built and tested in CI |
+| Linux riscv64 (RV64GC, lp64d, glibc) | built in CI (cross) and tested under `qemu-riscv64`; binary and `.deb` on every release. Local: `make riscv` → `./ntx-riscv64`, `make test-riscv`, `make test-riscv-shell`. Not tested on real hardware in CI. |
 | Linux mipsel (MIPS32r2, soft-float, musl static) | Pre-built on [Releases](https://github.com/pchmielewski1/ntx/releases) as `ntx-<version>-linux-mipsel` (attached manually). Local: `make mips` → `./ntx-mipsel`; `make test-mipsel` under `qemu-mipsel`. OpenWrt `mipsel_24kc` (e.g. MediaTek MT7621). Not built in CI. |
+
+**riscv64 locally:** either install the cross toolchain and emulator yourself
+(`sudo apt-get install gcc-riscv64-linux-gnu libc6-dev-riscv64-cross qemu-user`) and run
+`make riscv`, `make test-riscv`, `make test-riscv-shell`, or run them in the pinned Ubuntu 22.04
+container without sudo: `scripts/riscv/docker-run.sh make riscv test-riscv test-riscv-shell`.
 
 Cross build (on an x86_64 host with space for the SDK):
 

@@ -8,7 +8,7 @@ an already-built `./ntx`.
 
 | Path | Role |
 |------|------|
-| `build-deb.sh` | Binary `.deb` (amd64 / arm64) — used by Actions |
+| `build-deb.sh` | Binary `.deb` (amd64 / arm64 / riscv64; `NTX_STRIP` and `NTX_DEB_LIBC_MIN` for cross builds) — used by Actions |
 | `build-rpm.sh` | Binary `.rpm` (x86_64 / aarch64) — used by Actions |
 | `stage-recipes.sh` | Stamp Gentoo / Arch / Alpine / Nix / RPM source recipes → `ntx-VERSION-packaging.tar.gz` |
 | `gentoo/net-p2p/ntx/` | Gentoo ebuild template + `metadata.xml` |
@@ -17,6 +17,7 @@ an already-built `./ntx`.
 | `rpm/ntx.spec.in` | Source RPM spec (rebuild from the GitHub tag) |
 | `nix/` | `default.nix` + `flake.nix` |
 
-Architectures shipped as **prebuilt** assets: `x86_64` / `amd64`, `aarch64` / `arm64`, and
+Architectures shipped as **prebuilt** assets: `x86_64` / `amd64`, `aarch64` / `arm64`, `riscv64`
+(binary + `.deb`, cross-built by Actions) and
 `mipsel` (static musl, attached manually). Gentoo / Arch / Alpine / Nix build from the release
 **tag** on the machine’s native arch (Linux + `epoll` only).

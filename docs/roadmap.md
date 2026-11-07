@@ -14,20 +14,27 @@ has to stay under the 1 MiB gate of `make size`.
 ### Portability beyond Linux
 - **Today:** the event loop is `epoll` (`src/net/ntx_netx.c`); everything else is plain POSIX
   (non-blocking sockets via `fcntl`, `pread`/`pwrite`, `clock_gettime`, `/dev/urandom`).
-  CI builds and tests x86_64 and aarch64 Linux; mipsel is an optional cross target
-  (`make mips`). The `Makefile` assumes GNU Make and GNU `stat`.
+  CI builds and tests x86_64 and aarch64 Linux natively, riscv64 is cross-built and tested under
+  qemu-user, and mipsel is an optional cross target (`make mips`). The `Makefile` assumes GNU Make
+  and GNU `stat`.
 - **Needed:** a small poll abstraction with a `kqueue` backend would cover macOS/BSD; a Windows
   port would additionally need a socket/file/time layer and a different build.
 - **Trade-offs:** `kqueue` is a contained change. Windows touches almost every file and the
   maintenance cost is high for a client this small.
 
 ### Other CPU architectures
-- **Today:** CI builds and tests x86_64 and aarch64. A static mipsel (MIPS32r2 soft-float,
-  OpenWrt `mipsel_24kc`) port is available via `make mips` / `make test-mipsel`, and each GitHub
-  Release can include `ntx-<version>-linux-mipsel` attached by hand (Actions has no mipsel
-  runner). Other targets (e.g. riscv64, big-endian MIPS) have not been tried.
+- **Today:** CI builds and tests x86_64 and aarch64 natively and riscv64 under qemu-user. riscv64
+  (RV64GC, lp64d, dynamic glibc) is cross-built and tested in Actions (`make riscv` /
+  `make test-riscv` / `make test-riscv-shell`), and every release ships
+  `ntx-<version>-linux-riscv64` and `ntx_<version>_riscv64.deb` automatically. A static mipsel
+  (MIPS32r2 soft-float, OpenWrt `mipsel_24kc`) port is available via `make mips` /
+  `make test-mipsel`, and each GitHub Release can include `ntx-<version>-linux-mipsel` attached
+  by hand (Actions has no mipsel runner). Other targets (e.g. big-endian MIPS, riscv32) have not
+  been tried.
 - **Needed for automated mipsel releases:** a self-hosted or container job with the OpenWrt SDK
   (+ qemu-mipsel for tests) so the asset is no longer a manual post-publish step.
+- **Needed for a riscv64 RPM:** cross support in `packaging/build-rpm.sh` (`rpmbuild --target
+  riscv64` plus a cross strip), or a native riscv64 runner.
 
 ## User interface
 

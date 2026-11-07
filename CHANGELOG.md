@@ -12,6 +12,10 @@
   `make test-mipsel`; each GitHub Release ships `ntx-<version>-linux-mipsel` as a **manual**
   asset (Actions builds only x86_64 and arm64). Crypto portability for 32-bit targets without
   `__uint128_t`.
+- **riscv64** (RV64GC, lp64d, glibc 2.35+): `make riscv` / `make test-riscv` /
+  `make test-riscv-shell`; cross-built and tested under `qemu-riscv64` in Actions, and every
+  release ships `ntx-<version>-linux-riscv64` and `ntx_<version>_riscv64.deb` automatically.
+  Source recipes (Alpine, Arch, Gentoo `~riscv`, Nix) accept riscv64.
 
 ## 0.1.0 - 2026-10-06
 
