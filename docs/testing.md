@@ -60,8 +60,8 @@ gcc `riscv64-linux-gnu-gcc` (`RISCV_CC`) with the sysroot `/usr/riscv64-linux-gn
 launches `qemu-riscv64` with that sysroot. `make test-riscv` cross-compiles every `test/t_*.c`
 and runs them all; `make test-riscv-shell` runs the shell gates against `./ntx-riscv64` from a
 scratch root `test/.scratch/riscv64-shell/` holding copies of the gate scripts and an executable
-`./ntx` wrapper, so the native `./ntx` is never read or built. Like the mipsel suites, both
-propagate `NTX_TEST_TIMEOUT_SCALE` for TCG timing. The whole riscv64 suite takes about 200 s on
+`./ntx` wrapper, so the native `./ntx` is never read or built. Like the mipsel suite,
+`make test-riscv` propagates `NTX_TEST_TIMEOUT_SCALE` for TCG timing. The whole riscv64 suite takes about 200 s on
 a fast aarch64 host and a few minutes on an Actions runner. For a sudo-less environment
 `scripts/riscv/docker-run.sh` runs any of these targets in the pinned Ubuntu 22.04 image
 `ntx-riscv64-env:22.04` (same packages as CI), e.g.

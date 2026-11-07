@@ -43,8 +43,8 @@ cp test/cli_errors.sh test/net_loopback.sh test/tls13_interop.sh "$W/test/"
 cp test/interop/ipc/interop_ipc.sh test/interop/ipc/assert_ipc.py "$W/test/interop/ipc/"
 
 wrap() { # wrap <wrapper-path> <riscv64-binary>
-    printf '#!/bin/sh\nexec bash "%s/scripts/riscv/qemu-user-run.sh" "%s" "$@"\n' "$REPO" "$2" > "$1"
-    chmod +x "$1"
+    printf '#!/bin/sh\nexec bash "%s/scripts/riscv/qemu-user-run.sh" "%s" "$@"\n' "$REPO" "$2" > "$1" || exit 2
+    chmod +x "$1" || exit 2
 }
 wrap "$W/ntx" "$BIN"
 
@@ -59,6 +59,12 @@ if ! "$RISCV_CC" -O2 -std=c11 -Wall -Wextra -D_POSIX_C_SOURCE=200809L -D_DEFAULT
         -o "$W/tls_probe-riscv64" test/tls_probe.c $TLS_SRC -lm; then
     echo "[riscv-shell] ERROR: tls_probe cross-compile failed" >&2
     exit 1
+fi
+# A non-RISC-V probe would let test/tls13_interop.sh silently fall back to a
+# native gcc build; fail hard instead of gating a release on unemulated TLS.
+if [ "$(od -An -tx1 -j18 -N2 "$W/tls_probe-riscv64" | tr -d ' \n')" != "f300" ]; then
+    echo "[riscv-shell] ERROR: $W/tls_probe-riscv64 is not a RISC-V ELF binary" >&2
+    exit 2
 fi
 wrap "$W/tls_probe" "$W/tls_probe-riscv64"
 
