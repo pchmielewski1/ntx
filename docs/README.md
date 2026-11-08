@@ -23,6 +23,8 @@ welcome.
 | [superpowers/specs/2026-11-07-riscv64-port-design.md](superpowers/specs/2026-11-07-riscv64-port-design.md) | riscv64 (glibc, RV64GC) port design: automated cross build + qemu-user tests in Actions |
 | [superpowers/plans/2026-11-07-riscv64-port.md](superpowers/plans/2026-11-07-riscv64-port.md) | Implementation plan for the riscv64 port, split into subagent tasks |
 | [superpowers/2026-11-07-riscv64-local-env.md](superpowers/2026-11-07-riscv64-local-env.md) | Local riscv64 build/test environment (apt or Docker) |
+| [superpowers/specs/2026-11-08-private-share-design.md](superpowers/specs/2026-11-08-private-share-design.md) | Private file sharing (`--share`): BEP 27, pinned HTTPS trackers, strict MSE, NAT-PMP/PCP |
+| [superpowers/plans/2026-11-08-private-share.md](superpowers/plans/2026-11-08-private-share.md) | Implementation plan for private share, split into three parallel subagent streams |
 
 Outside this directory:
 
