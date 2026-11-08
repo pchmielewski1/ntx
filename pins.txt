@@ -27,5 +27,15 @@ unicast.uncensoreddns.org 20d499119a43a162a26afa2c576ff1553f0ef37be4fd14704be2d3
 ada.openbld.net      8e91d7302e31f9808685a40b3b93d522a83679e57e1cd4d8eeaf33f5aeb14b58
 doh.pub              e5320c8e0c8c840d2a98f74af8033d2d7eaf348ffd10f072761fd95dd7dc6262
 
+# Share trackers (ntx --share), surveyed 2026-11-08 per docs/network.md
+# "Share tracker survey (2026-11)". Cloudflare-fronted: the leaf is an edge key
+# rotated roughly every 90 days, so re-run the survey command above before each
+# release and keep the old key while the new one is being rolled out.
+tracker.pmman.tech     2f7626b32aeffb4442ce9253fd9fffbe037408da90e6f2bbc7d89a77b16cc5f2
+tracker.nekomi.cn      ea5a2911ef5dec9974a4ec7827a53e0e6f7271e52eec9d6c813b54f4cad3951c
+004430.xyz             28a92d93877090215d4fd55236f2a35f01137adb3fa5e4ec5f45701df94473d3
+tracker.7471.top       c9c26afbf190405d98a328c6fb758ddb92d0e6697f4b3ca6aed8c9a6a13478ef
+tracker.zhuqiy.com     1e96051cb0cb3bdd8486d18997e2336d06b58235dc2b341c82384bceaa85c079
+
 # Add your own tracker/webseed hosts below (exact host, no wildcards):
 # tracker.example  <64-hex pin>

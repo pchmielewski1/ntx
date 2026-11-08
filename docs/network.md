@@ -228,6 +228,65 @@ The same code path is used by `ntx_http.c` for `https://` URLs (web seeds and HT
 - Only status `200` and `206` are accepted; **redirects are not followed**. The body is read by
   `Content-Length` or `Transfer-Encoding: chunked` (malformed chunk framing is an error).
 
+## Share tracker survey (2026-11)
+
+`ntx --share` may announce only over HTTPS trackers whose leaf SPKI is compiled in (design
+§6, §6.3). Task 0 probed every HTTPS candidate published by
+[`ngosang/trackerslist`](https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all_https.txt)
+and the `https://` entries of [`newtrackon.com/api/stable`](https://newtrackon.com/api/stable)
+— 12 distinct hosts after de-duplication (below the 25-host budget). Criteria (§6.3):
+**C1** the announce works with `ntx`'s own TLS client, **C2** full WebPKI verification
+(`openssl s_client -verify_return_error -verify_hostname`), **C3** an unregistered info-hash is
+accepted and the second announce gets the first peer back, **C4** `/scrape` without `info_hash`
+gives an error or an empty answer, not the full peer list.
+
+| Host | URL | Pin (SHA-256 SPKI) | C1 ntx client | C2 WebPKI | C3 peers for hash | C4 no scrape | Decision |
+|------|-----|--------------------|---------------|-----------|-------------------|--------------|----------|
+| `tracker.pmman.tech` | `https://tracker.pmman.tech:443/announce` | `2f7626b3…b16cc5f2` | pass | pass (0) | pass (2) | pass (404) | **accepted** |
+| `ht.therarbg.to` | `https://ht.therarbg.to:443/announce` | `9e58973a…c5fa8606` | fail: `/announce` answers `302` | pass (0) | not reached | fail (`302` page) | rejected |
+| `tracker.nekomi.cn` | `https://tracker.nekomi.cn:443/announce` | `ea5a2911…cad3951c` | pass | pass (0) | pass (2) | pass (400 `Invalid Request`) | **accepted** |
+| `004430.xyz` | `https://004430.xyz:443/announce` | `28a92d93…f94473d3` | pass | pass (0) | pass (2) | pass (400 `Invalid Request`) | **accepted** |
+| `tracker.7471.top` | `https://tracker.7471.top:443/announce` | `c9c26afb…a13478ef` | pass | pass (0) | pass (1) | pass (`failure reason: missing required parameter: info_hash`) | **accepted** |
+| `tr.nyacat.pw` | `https://tr.nyacat.pw:443/announce` | `b9275fb5…c1dc2996` | fail: body ends `…e\r\n`, `ntx_be_parse` rejects the trailing bytes | pass (0) | not reached | pass (`failure reason: no query string`) | rejected |
+| `open.ftorrent.com` | `https://open.ftorrent.com:443/announce` | `7fd5ed0a…d11f0965` | fail: body ends `…e\r\n` (same as above) | pass (0) | not reached | fail (`/scrape` times out, 10 s) | rejected |
+| `tracker.zhuqiy.com` | `https://tracker.zhuqiy.com:443/announce` | `1e96051c…aa85c079` | pass | pass (0) | pass (2) | pass (HTTP 200 is the HTML landing page, not a scrape dict) | **accepted** |
+| `tracker.foreverpirates.co` | `https://tracker.foreverpirates.co:443/announce` | `b2d2e457…9f3b4f10` | fail: body ends `…e\r\n` | pass (0) | not reached | pass (announce-style dict) | rejected |
+| `t.213891.xyz` | `https://t.213891.xyz:443/announce` | `7281a83f…7433f492` | pass | pass (0) | fail: `peers0:e`, the seeder is never listed | fail: `/scrape` returns a `files` dict | rejected |
+| `1.tracker.eu.org` | `https://1.tracker.eu.org:443/announce` | `02fd0f20…cb4b53cf` | pass | pass (0) | fail: `peers0:e` in both announces | pass (`peers0:e`) | rejected |
+| `tracker.qingwapt.org` | `https://tracker.qingwapt.org:443/announce` | `4812d7a5…cbe45d30` | pass | pass (0) | fail: `peers0:e` in both announces | pass (`peersle:e` + `warning message`) | rejected |
+
+Five hosts are accepted, so the §6.4 minimum (2) is met and `--share` may ship. `tracker.zhuqiy.com`
+is a judgement call on C4: `/scrape` answers `200` with a cached HTML landing page instead of an
+error, which leaks nothing (`content-type: text/html`, no `files` dict) but is not literally "an
+error or an empty answer"; dropping it would still leave four hosts, above the minimum.
+Their pins are in
+[`../pins.txt`](../pins.txt) in the pin-file format; the compiled-in table (Task 1) is the
+authoritative copy and this file is the audit reference. All five are fronted by Cloudflare, so
+every pin is an edge key issued 6–8 weeks earlier (Google Trust Services / Let's Encrypt /
+SSL Corporation, expiring 2026-12-12 … 2027-01-04): expect rotation roughly every 90 days and run
+`make pins-check` before each release (§6.2).
+
+Two findings from these probes affect the client, not the list, and are recorded here because
+they explain the C1 results:
+
+- **AAAA-first resolution.** `ntx_sock_resolve` tries `AAAA` and only falls back to `A` when the
+  `AAAA` query has no answer; every candidate publishes an `AAAA` record. On a host without an
+  IPv6 route the TCP connect therefore fails for *all* of them and `./trk_http_probe <https url>`
+  reports `http/tls failure` for each. The C1 column above comes from the same production path
+  (`ntx_http_get` → `ntx_https_handshake_fd`) run with the `AAAA` lookup stubbed out, which is
+  also how a dual-stack machine would reach them. See also `ntx_sock_resolve4` above, which has
+  no such problem and is what UDP trackers use.
+- **Bencode bodies terminated with `CRLF`.** opentracker-style servers end the announce
+  dictionary with `e\r\n`. `ntx_be_parse` requires the input to be consumed exactly
+  (`p.pos != n` → error), so `ntx_tracker_http_parse` answers "unrecognized response" and the
+  announce counts as a failure — the three `…e\r\n` rejections above. Peers behind such trackers
+  are unreachable for `ntx` even though the announce itself was accepted.
+
+Unpinned HTTPS is **not** refused today: TOFU is on by default, so the survey run stored a new
+pin for every host contacted (`ntx: TOFU new pin: <host> (spki=…)` on stderr). Share mode must
+take its pins from the built-in pool with TOFU disabled (§6.1), which is Task 1 work — until then
+`--share` must not ship.
+
 ## Shared UDP socket and demultiplexing
 
 `ntx_netx` owns one UDP socket per address family on the same port number as the TCP listener
