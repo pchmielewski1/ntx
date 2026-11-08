@@ -4,7 +4,6 @@
 #include "../src/crypto/ntx_rng.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -23,14 +22,14 @@ static void mk_peer_id(uint8_t out[20], char slot) {
 typedef struct {
     uint8_t ips4[256];
     uint16_t ports4[64];
-    uint8_t ips6[64][16];
-    uint16_t ports6[64];
 } peer_list;
 
 /* One HTTP(S) announce. Returns peer count (>=0) or -1 with a reason in err.
  * left/uploaded select the role: a seeder (left=0) is what the tracker must remember
- * and hand back to the second announce. peers6 is parsed too — a Cloudflare-fronted
- * tracker may list the peer only in the IPv6 block. */
+ * and hand back to the second announce. Only the IPv4 peer list is parsed: that is
+ * the view the shipped client gets, since `ntx_tracker_http_parse` is v4-only
+ * (src/proto/ntx_tracker.c), so the probe cannot accept a host the client gains
+ * nothing from. */
 static int announce(const char *base, const uint8_t hash[20], const uint8_t pid[20],
                     uint16_t port, uint64_t uploaded, uint64_t left, int event,
                     peer_list *pl, char *err, size_t errcap) {
@@ -55,7 +54,7 @@ static int announce(const char *base, const uint8_t hash[20], const uint8_t pid[
     }
     np = ntx_tracker_http_parse_ex(body, bn, &tid, &iv, &s, &l,
                                    pl->ips4, pl->ports4, 64,
-                                   pl->ips6, pl->ports6, 64, err, errcap);
+                                   NULL, NULL, 0, err, errcap);
     if (np < 0) {
         if (err[0] == '\0')
             snprintf(err, errcap, "bad response");
@@ -90,8 +89,9 @@ static int probe_url(const char *base) {
         printf("FAIL %s announce2: %s\n", base, err[0] ? err : "error");
         return 1;
     }
-    for (int i = 0; i < 64; i++)
-        if (pl.ports4[i] == 40001 || pl.ports6[i] == 40001) {
+    /* Scan only the peers the v4 parse actually returned (np), not all 64 slots. */
+    for (int i = 0; i < np; i++)
+        if (pl.ports4[i] == 40001) {
             printf("OK %s peers_for_hash=%d\n", base, np);
             return 0;
         }
@@ -102,8 +102,16 @@ static int probe_url(const char *base) {
 int main(int argc, char **argv) {
     if (argc > 1) {
         int fail = 0;
-        for (int i = 1; i < argc; i++)
+        for (int i = 1; i < argc; i++) {
+            /* An empty or flag-like argument is not a URL; reject it explicitly
+             * instead of printing a FAIL line with a blank host. */
+            if (argv[i][0] == '\0' || argv[i][0] == '-') {
+                printf("FAIL argv[%d] is not a URL (empty or starts with '-')\n", i);
+                fail = 1;
+                continue;
+            }
             if (probe_url(argv[i]) != 0) fail = 1;
+        }
         return fail;
     }
 

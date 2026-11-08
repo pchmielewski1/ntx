@@ -10,9 +10,14 @@
 # keys: the pins compiled into the binary are authoritative for DoH, and an entry here that no longer
 # matches simply fails closed.
 #
-# Extend it:  echo | openssl s_client -connect HOST:443 -servername HOST 2>/dev/null \
-#              | openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER \
-#              | sha256sum      (or test/scripts/pin_from_der.py on a leaf DER)
+# Extend it (VERIFY before pinning — §6.2 forbids pinning an unverified key; the
+# -verify_return_error/-verify_hostname flags make openssl abort on a bad chain or
+# a wrong name, so a key you cannot verify is a key you must not pin):
+#   echo | openssl s_client -connect HOST:443 -servername HOST \
+#              -verify_return_error -verify_hostname HOST 2>/dev/null \
+#     | openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER \
+#     | sha256sum      (or test/scripts/pin_from_der.py on a leaf DER)
+# Check the printed "Verify return code: 0" before accepting the hash.
 # Rotation procedure: docs/network.md, section "Pin rotation (DoH pool)".
 
 dns.quad9.net        8b690e6dfcf4a8828218d5adecc8c151e4ab8740f28dbd3fcd620d2266444be2
@@ -28,14 +33,29 @@ ada.openbld.net      8e91d7302e31f9808685a40b3b93d522a83679e57e1cd4d8eeaf33f5aeb
 doh.pub              e5320c8e0c8c840d2a98f74af8033d2d7eaf348ffd10f072761fd95dd7dc6262
 
 # Share trackers (ntx --share), surveyed 2026-11-08 per docs/network.md
-# "Share tracker survey (2026-11)". Cloudflare-fronted: the leaf is an edge key
-# rotated roughly every 90 days, so re-run the survey command above before each
-# release and keep the old key while the new one is being rolled out.
+# "Share tracker survey (2026-11)". SINGLE OPERATOR: all seven leaves below are
+# Cloudflare edge keys, so one Cloudflare rotation disables every share tracker at
+# once — §6.4's intent (one rotation must not disable sharing) is NOT met; see the
+# C5 column in docs/network.md before relying on this block.
+# Cloudflare-fronted: the leaf is an edge key rotated roughly every 90 days, so
+# re-run the *verifying* command above (with -verify_return_error
+# -verify_hostname, never the bare s_client recipe) before each release, confirm
+# "Verify return code: 0", and keep the old key while the new one is being rolled
+# out. `make pins-check` is the automated gate (§6.2).
+# C1 caveat: the survey host has no IPv6 route, so the announce pass was measured
+# with the AAAA lookup stubbed off — re-verify on a dual-stack host.
+# Loader limit: src/proto/ntx_https_pin.c keeps only the first NTX_PIN_FILE_MAX
+# (16) "<host> <pin>" lines of a --https-pin-file, silently. This file has 17 valid
+# lines because the DoH entries above double as the audit reference; if you load it
+# whole, the last line (tracker.yume-hatsuyuki.moe) is dropped. Delete the DoH lines
+# (they are compiled in anyway) before relying on the share block over the full file.
 tracker.pmman.tech     2f7626b32aeffb4442ce9253fd9fffbe037408da90e6f2bbc7d89a77b16cc5f2
 tracker.nekomi.cn      ea5a2911ef5dec9974a4ec7827a53e0e6f7271e52eec9d6c813b54f4cad3951c
 004430.xyz             28a92d93877090215d4fd55236f2a35f01137adb3fa5e4ec5f45701df94473d3
 tracker.7471.top       c9c26afbf190405d98a328c6fb758ddb92d0e6697f4b3ca6aed8c9a6a13478ef
 tracker.zhuqiy.com     1e96051cb0cb3bdd8486d18997e2336d06b58235dc2b341c82384bceaa85c079
+1337.abcvg.info        e1e5e48f542eee53816db2bba6c398c867d9e755ff615956763fa7dc8b8bf332
+tracker.yume-hatsuyuki.moe 8c30b82302fe1b70a8007ae1ed5cbb0b256e5ae4185880d22ecd78466c67b956
 
 # Add your own tracker/webseed hosts below (exact host, no wildcards):
 # tracker.example  <64-hex pin>

@@ -234,37 +234,113 @@ The same code path is used by `ntx_http.c` for `https://` URLs (web seeds and HT
 §6, §6.3). Task 0 probed every HTTPS candidate published by
 [`ngosang/trackerslist`](https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all_https.txt)
 and the `https://` entries of [`newtrackon.com/api/stable`](https://newtrackon.com/api/stable)
-— 12 distinct hosts after de-duplication (below the 25-host budget). Criteria (§6.3):
+— 12 distinct hosts after de-duplication. A second pass on 2026-11-08 added 15 further
+`https://` hosts from [`newtrackon.com/api/all`](https://newtrackon.com/api/all) (a wider list
+than `/api/stable`), looking in particular for any qualified host **not** behind Cloudflare.
+Criteria (§6.3, plus C5 from the §6.4 intent):
 **C1** the announce works with `ntx`'s own TLS client, **C2** full WebPKI verification
 (`openssl s_client -verify_return_error -verify_hostname`), **C3** an unregistered info-hash is
 accepted and the second announce gets the first peer back, **C4** `/scrape` without `info_hash`
-gives an error or an empty answer, not the full peer list.
+gives an error or an empty answer, not the full peer list, **C5** the pool's pins are not all keys
+of a single operator, so that one key rotation cannot disable sharing.
 
-| Host | URL | Pin (SHA-256 SPKI) | C1 ntx client | C2 WebPKI | C3 peers for hash | C4 no scrape | Decision |
-|------|-----|--------------------|---------------|-----------|-------------------|--------------|----------|
-| `tracker.pmman.tech` | `https://tracker.pmman.tech:443/announce` | `2f7626b3…b16cc5f2` | pass | pass (0) | pass (2) | pass (404) | **accepted** |
-| `ht.therarbg.to` | `https://ht.therarbg.to:443/announce` | `9e58973a…c5fa8606` | fail: `/announce` answers `302` | pass (0) | not reached | fail (`302` page) | rejected |
-| `tracker.nekomi.cn` | `https://tracker.nekomi.cn:443/announce` | `ea5a2911…cad3951c` | pass | pass (0) | pass (2) | pass (400 `Invalid Request`) | **accepted** |
-| `004430.xyz` | `https://004430.xyz:443/announce` | `28a92d93…f94473d3` | pass | pass (0) | pass (2) | pass (400 `Invalid Request`) | **accepted** |
-| `tracker.7471.top` | `https://tracker.7471.top:443/announce` | `c9c26afb…a13478ef` | pass | pass (0) | pass (1) | pass (`failure reason: missing required parameter: info_hash`) | **accepted** |
-| `tr.nyacat.pw` | `https://tr.nyacat.pw:443/announce` | `b9275fb5…c1dc2996` | fail: body ends `…e\r\n`, `ntx_be_parse` rejects the trailing bytes | pass (0) | not reached | pass (`failure reason: no query string`) | rejected |
-| `open.ftorrent.com` | `https://open.ftorrent.com:443/announce` | `7fd5ed0a…d11f0965` | fail: body ends `…e\r\n` (same as above) | pass (0) | not reached | fail (`/scrape` times out, 10 s) | rejected |
-| `tracker.zhuqiy.com` | `https://tracker.zhuqiy.com:443/announce` | `1e96051c…aa85c079` | pass | pass (0) | pass (2) | pass (HTTP 200 is the HTML landing page, not a scrape dict) | **accepted** |
-| `tracker.foreverpirates.co` | `https://tracker.foreverpirates.co:443/announce` | `b2d2e457…9f3b4f10` | fail: body ends `…e\r\n` | pass (0) | not reached | pass (announce-style dict) | rejected |
-| `t.213891.xyz` | `https://t.213891.xyz:443/announce` | `7281a83f…7433f492` | pass | pass (0) | fail: `peers0:e`, the seeder is never listed | fail: `/scrape` returns a `files` dict | rejected |
-| `1.tracker.eu.org` | `https://1.tracker.eu.org:443/announce` | `02fd0f20…cb4b53cf` | pass | pass (0) | fail: `peers0:e` in both announces | pass (`peers0:e`) | rejected |
-| `tracker.qingwapt.org` | `https://tracker.qingwapt.org:443/announce` | `4812d7a5…cbe45d30` | pass | pass (0) | fail: `peers0:e` in both announces | pass (`peersle:e` + `warning message`) | rejected |
+**C1 caveat — it applies to every cell in the C1 column below, on both tables.** This survey box
+has no IPv6 route (`ip -6 route` → *Network is unreachable*) and every candidate publishes an
+`AAAA` record, while `ntx_sock_resolve` is AAAA-first with no fallback to `A` after a failed
+connect (finding 1 below). With the binary as shipped, `./trk_http_probe <https url>` answers
+`http/tls failure` for **every** HTTPS host listed here. C1 has therefore **not** been measured
+with ntx's own binary; each `pass (AAAA stubbed — IPv4-only host)` means the same production path
+(`ntx_http_get` → `ntx_https_handshake_fd` → `ntx_tracker_http_parse_ex`) run with
+`ntx_doh_lookup_aaaa` overridden to return -1 (`test/.scratch/announce4`, linked
+`--allow-multiple-definition`), i.e. an IPv4-only stand-in for what a dual-stack machine does.
+Nothing in `src/` was modified. C1 must be re-measured on a dual-stack host before it is trusted.
 
-Five hosts are accepted, so the §6.4 minimum (2) is met and `--share` may ship. `tracker.zhuqiy.com`
-is a judgement call on C4: `/scrape` answers `200` with a cached HTML landing page instead of an
-error, which leaks nothing (`content-type: text/html`, no `files` dict) but is not literally "an
-error or an empty answer"; dropping it would still leave four hosts, above the minimum.
-Their pins are in
-[`../pins.txt`](../pins.txt) in the pin-file format; the compiled-in table (Task 1) is the
-authoritative copy and this file is the audit reference. All five are fronted by Cloudflare, so
-every pin is an edge key issued 6–8 weeks earlier (Google Trust Services / Let's Encrypt /
-SSL Corporation, expiring 2026-12-12 … 2027-01-04): expect rotation roughly every 90 days and run
-`make pins-check` before each release (§6.2).
+C5 is stated per accepted host as the operator of the pinned key. It is not a per-host property —
+it is a property of the pool — but it is recorded per row so no accepted host can be read without it.
+
+| Host | URL | Pin (SHA-256 SPKI) | C1 ntx client | C2 WebPKI | C3 peers for hash | C4 no scrape | C5 pin operator | Decision | Decision / rejection reason |
+|------|-----|--------------------|---------------|-----------|-------------------|--------------|-----------------|----------|------------------------------|
+| `tracker.pmman.tech` | `https://tracker.pmman.tech:443/announce` | `2f7626b3…b16cc5f2` | pass (AAAA stubbed — IPv4-only host) | pass (0) | pass (2) | pass (404) | Cloudflare edge key (GTS WE1) | **accepted** | all five criteria met on 5/5 repeat runs; C1 unverified on the shipped binary, C5 one-operator risk |
+| `ht.therarbg.to` | `https://ht.therarbg.to:443/announce` | `9e58973a…c5fa8606` | fail (AAAA stubbed — IPv4-only host): `/announce` answers `302` | pass (0) | not reached | fail (`302` page) | Cloudflare edge key (GTS WE1) | rejected | rejected for C1+C4: `/announce` redirects and ntx does not follow redirects |
+| `tracker.nekomi.cn` | `https://tracker.nekomi.cn:443/announce` | `ea5a2911…cad3951c` | pass (AAAA stubbed — IPv4-only host) | pass (0) | pass (2) | pass (400 `Invalid Request`) | Cloudflare edge key (Cloudflare TLS Issuing ECC CA 4) | **accepted** | all five criteria met on 5/5 repeat runs; C1 unverified on the shipped binary, C5 one-operator risk |
+| `004430.xyz` | `https://004430.xyz:443/announce` | `28a92d93…f94473d3` | pass (AAAA stubbed — IPv4-only host) | pass (0) | pass (2) | pass (400 `Invalid Request`) | Cloudflare edge key (LE YE1) | **accepted** | all five criteria met on 5/5 repeat runs; C1 unverified on the shipped binary, C5 one-operator risk |
+| `tracker.7471.top` | `https://tracker.7471.top:443/announce` | `c9c26afb…a13478ef` | pass (AAAA stubbed — IPv4-only host) | pass (0) | pass (1) | pass (`failure reason: missing required parameter: info_hash`) | Cloudflare edge key (GTS WE1) | **accepted** | all five criteria met on 5/5 repeat runs; C1 unverified on the shipped binary, C5 one-operator risk |
+| `tr.nyacat.pw` | `https://tr.nyacat.pw:443/announce` | `b9275fb5…c1dc2996` | fail (AAAA stubbed — IPv4-only host): body ends `…e\r\n`, `ntx_be_parse` rejects the trailing bytes | pass (0) | not reached | pass (`failure reason: no query string`) | Cloudflare edge key (GTS WE1) | rejected | rejected for C1: trailing `CRLF` in the announce body is rejected by `ntx_be_parse` (client finding 2) |
+| `open.ftorrent.com` | `https://open.ftorrent.com:443/announce` | `7fd5ed0a…d11f0965` | fail (AAAA stubbed — IPv4-only host): body ends `…e\r\n` (same as above) | pass (0) | not reached | fail (`/scrape` times out, 10 s) | not Cloudflare (LE YE1, unpinned) | rejected | rejected for C1+C4: trailing `CRLF` and `/scrape` never answers (10 s timeout) |
+| `tracker.zhuqiy.com` | `https://tracker.zhuqiy.com:443/announce` | `1e96051c…aa85c079` | pass (AAAA stubbed — IPv4-only host) | pass (0) | pass (2) | pass (bare `/scrape` = CDN-cached `200 text/html` landing page, `cf-cache-status: HIT`, `age: 8882`; `/scrape?<any query>` reaches the origin and returns `400 Invalid Request`, `cf-cache-status: BYPASS` — no `files` dict either way) | Cloudflare edge key (Cloudflare TLS Issuing ECC CA 4) | **accepted** | accepted, C4 is a judgement call: the bare answer is a cached landing page (leaks nothing), the origin itself rejects `/scrape` with `400`; see the zhuqiy paragraph below |
+| `tracker.foreverpirates.co` | `https://tracker.foreverpirates.co:443/announce` | `b2d2e457…9f3b4f10` | fail (AAAA stubbed — IPv4-only host): body ends `…e\r\n` | pass (0) | not reached | pass (announce-style dict) | Cloudflare edge key (GTS WE1) | rejected | rejected for C1: trailing `CRLF` in the announce body (client finding 2) |
+| `t.213891.xyz` | `https://t.213891.xyz:443/announce` | `7281a83f…7433f492` | pass (AAAA stubbed — IPv4-only host) | pass (0) | fail: `peers0:e`, the seeder is never listed | fail: `/scrape` returns a **non-empty** `files` dict | Cloudflare edge key (GTS WE1) | rejected | rejected for C3+C4: never registers the seeder, and `/scrape` leaks the full peer list |
+| `1.tracker.eu.org` | `https://1.tracker.eu.org:443/announce` | `02fd0f20…cb4b53cf` | pass (AAAA stubbed — IPv4-only host) | pass (0) | fail: `peers0:e` in both announces | pass (`peers0:e`) | Cloudflare edge key (GTS WE1) | rejected | rejected for C3: the seeder is never listed in either announce |
+| `tracker.qingwapt.org` | `https://tracker.qingwapt.org:443/announce` | `4812d7a5…cbe45d30` | pass (AAAA stubbed — IPv4-only host) | pass (0) | fail: `peers0:e` in both announces | pass (`peersle:e` + `warning message`) | Cloudflare edge key (GTS WE1) | rejected | rejected for C3: the seeder is never listed in either announce |
+
+**Gate: the §6.4 host-count minimum is met, its intent is not.** Seven hosts are accepted (five
+above, two in the second pass below), so the "at least 2 hosts" minimum is satisfied numerically.
+But **all seven pins are Cloudflare edge keys, so the whole pool is one operator**: §6.4's intent
+— a single key rotation must not disable sharing — is **NOT met**. One Cloudflare edge-key rotation
+or one Cloudflare outage takes every share tracker down at once, and `--share` degrades to no
+trackers at all, not to a reduced set. `make pins-check` will demand a re-pin roughly monthly
+(`notAfter` 2026-12-12 … 2027-01-04 as measured 2026-11-08). A maintainer should read this table as
+"one CDN, seven hostnames", not as diversity. The two-pass survey over 27 candidate hosts found no
+qualified host outside Cloudflare (see the second table), so removing the risk needs either a
+non-CDN candidate from outside these two public lists or an explicit decision to accept it.
+**Therefore `--share` must not ship yet** — three things are outstanding: TOFU must be bypassed for
+share hosts (§6.1, Task 1), C1 must be re-measured with the unmodified binary on a dual-stack host,
+and the C5 single-operator risk must be fixed or explicitly accepted.
+
+`tracker.zhuqiy.com` is the one judgement call on C4. Only "leaks nothing" was recorded in the
+first pass, which is not defensible on its own, so it was re-measured with headers and bytes
+(`test/.scratch/zhuqiy-evidence.txt`): `/scrape` returns `HTTP/2 200`, `content-type: text/html`,
+`cf-cache-status: HIT`, `age: 8882`, `cache-control: public, max-age=2592000` — i.e. Cloudflare is
+serving a 30-day-cached HTML landing page, not the tracker. The same endpoint with any query string
+(`/scrape?ntx_cache_bust=…`) is `HTTP/2 400` with `<title>Invalid Request</title>` and
+`cf-cache-status: BYPASS` (`DYNAMIC` in the first-pass capture; either way not `HIT`, so the request
+reached the origin), and its body has no `files` dict either. So the criterion's protection holds for two independent reasons (cached landing page, and
+origin rejects `/scrape` outright), and dropping zhuqiy would still leave six hosts, above the
+minimum. Two consequences: the acceptance depends on CDN cache state, and a future `pins.py`
+FULL-SCRAPE classifier **must send a cache-busting query parameter**, or Cloudflare will hide the
+tracker's real answer behind a cached page and a leaking tracker could be scored clean (or vice
+versa).
+
+**Repeat-run evidence.** The first report claimed three clean re-probes per accepted host while
+only one row per host existed; the runs have now actually been made and kept. Every host above was
+re-probed with the same criteria driver, once per row for the table plus repeated spaced announce
+runs (`test/.scratch/accepted-3x.tsv` = 3 runs of the original five, `accepted-repeats.tsv` = 5 more
+spaced runs, `new-hosts.tsv` = 5 runs for the new two, `fix3-announce.tsv`, `zhuqiy-evidence.txt`).
+OK counts over all spaced AAAA-stub runs, failures included — not smoothed:
+`tracker.pmman.tech` 8/8, `tracker.nekomi.cn` 8/8, `004430.xyz` 8/8, `tracker.7471.top` 8/8,
+`1337.abcvg.info` 6/6, `tracker.yume-hatsuyuki.moe` 14/14, `tracker.zhuqiy.com` 16/17, and
+`tracker.cangku.moe` **8/14** (rejected, see below). The single zhuqiy failure coincided with
+Cloudflare answering `429` / `error code: 1015` (rate limit from back-to-back probes); the 14 runs
+after it were OK, so the acceptance stands. `tracker.cangku.moe` failed with `http/tls failure` on
+`announce1` in 6 of 14 spaced runs with no HTTP status at all, which is why it is rejected for C1
+despite passing C2–C5 when it does connect. Every run needed the AAAA stub on this box.
+
+### Second survey pass — 15 further HTTPS candidates, hunting a non-Cloudflare host
+
+Same criteria, same drivers, `https://` hosts from `newtrackon.com/api/all` not in the first table
+(`test/.scratch/extras-results.tsv`, `test/.scratch/new-hosts.tsv`, operator data for all hosts in
+`test/.scratch/cdn-operator.tsv`).
+
+| Host | C1 ntx client | C2 WebPKI | C3 peers for hash | C4 no scrape | C5 pin operator | Decision | Decision / rejection reason |
+|------|---------------|-----------|-------------------|--------------|-----------------|----------|------------------------------|
+| `1337.abcvg.info` | pass (AAAA stubbed — IPv4-only host), 5/5 | pass (0) | pass (2) | pass (`200`, `d5:filesde…eee` = empty `files` dict, same with a cache-busting query) | Cloudflare edge key (GTS WE1) | **accepted** | all five criteria met; C1 unverified on the shipped binary, C5 one-operator risk |
+| `tracker.yume-hatsuyuki.moe` | pass (AAAA stubbed — IPv4-only host), 5/5 | pass (0) | pass (2) | pass (400 `Invalid Request`, `cf-cache-status: DYNAMIC` bare and busted) | Cloudflare edge key (GTS WE1) | **accepted** | all five criteria met; C1 unverified on the shipped binary, C5 one-operator risk |
+| `tracker.cangku.moe` | flaky (AAAA stubbed — IPv4-only host): got past `announce1` in only 8 of 14 spaced runs, the rest `http/tls failure` with no HTTP status | pass (0) | pass (2) when it connects | pass (404 nginx page, bare and busted) | Cloudflare edge key (GTS WE1) | rejected | rejected for C1 instability: TLS connect fails on ~40% of runs — too flaky to pin a release on |
+| `orgtgju.org` | fail (AAAA stubbed — IPv4-only host): `http/tls failure` | pass (0) | not reached | pass (`403`, Cloudflare challenge page) | Cloudflare edge key (GTS WE1) | rejected | rejected for C1: `/announce` never completes through the ntx client |
+| `021912.xyz` | fail (AAAA stubbed — IPv4-only host): timeout | pass (0) | not reached | fail (`/scrape` times out, 10 s) | Cloudflare (NS `leland`/`eleanor.ns.cloudflare.com`) | rejected | rejected for C1+C4: host does not answer (TLS and `/scrape` both time out) |
+| `tr.zukizuki.org` | fail (AAAA stubbed — IPv4-only host): timeout | pass (0) | not reached | fail (`/scrape` times out, 10 s) | Cloudflare edge key (GTS WE1) | rejected | rejected for C1+C4: no answer on 443 within 10 s |
+| `api.ipv4online.uk` | fail (AAAA stubbed — IPv4-only host): `http/tls failure` | fail (no certificate returned) | not reached | fail (`Connection reset by peer`) | not Cloudflare — `A 34.8.196.142`/`34.8.38.57` (Google Cloud) | rejected | rejected for C1+C2+C4: the only non-Cloudflare candidate that resolved, and its TLS connection is reset with no certificate |
+| `tracker.tamersunion.org`, `tracker.moeking.me`, `tracker.bjut.jp`, `t1.hloli.org`, `tracker.expli.top`, `tracker.moeblog.cn`, `tracker.puvvadi.net`, `pybittrack.retiolus.net` | not reached | not reached | not reached | not reached | none — no DNS | rejected | rejected before C1: NXDOMAIN (`dig +short A/AAAA/NS` all empty, `curl: (6) Could not resolve host`) — listed as HTTPS but dead |
+
+**No qualified host is outside Cloudflare.** Of the 15 extra candidates, 8 do not resolve at all,
+2 time out, 1 is a Cloudflare challenge page, 1 is rejected for TLS flakiness, and the single
+non-Cloudflare host that resolved (`api.ipv4online.uk`, Google Cloud) fails C1, C2 and C4. All
+qualified hosts share one CDN operator: **seven accepted hosts, seven Cloudflare edge keys, one
+key rotation away from zero share trackers.** The two new acceptances (`1337.abcvg.info`,
+`tracker.yume-hatsuyuki.moe`) are pinned in [`../pins.txt`](../pins.txt) alongside the first five
+and are still Cloudflare, so they add hostnames, not operator diversity. As before, `pins.txt` is
+the audit reference in pin-file format and the compiled-in table (Task 1) is the authoritative
+copy that `make pins-check` compares against (§6.2).
 
 Two findings from these probes affect the client, not the list, and are recorded here because
 they explain the C1 results:
@@ -272,10 +348,10 @@ they explain the C1 results:
 - **AAAA-first resolution.** `ntx_sock_resolve` tries `AAAA` and only falls back to `A` when the
   `AAAA` query has no answer; every candidate publishes an `AAAA` record. On a host without an
   IPv6 route the TCP connect therefore fails for *all* of them and `./trk_http_probe <https url>`
-  reports `http/tls failure` for each. The C1 column above comes from the same production path
-  (`ntx_http_get` → `ntx_https_handshake_fd`) run with the `AAAA` lookup stubbed out, which is
-  also how a dual-stack machine would reach them. See also `ntx_sock_resolve4` above, which has
-  no such problem and is what UDP trackers use.
+  reports `http/tls failure` for each — which is why no C1 cell above is a measurement of the
+  shipped binary (see the C1 caveat at the head of this section). The workaround used for the C1
+  column does not fix the client. See also `ntx_sock_resolve4` above, which has no such problem
+  and is what UDP trackers use.
 - **Bencode bodies terminated with `CRLF`.** opentracker-style servers end the announce
   dictionary with `e\r\n`. `ntx_be_parse` requires the input to be consumed exactly
   (`p.pos != n` → error), so `ntx_tracker_http_parse` answers "unrecognized response" and the
@@ -284,8 +360,9 @@ they explain the C1 results:
 
 Unpinned HTTPS is **not** refused today: TOFU is on by default, so the survey run stored a new
 pin for every host contacted (`ntx: TOFU new pin: <host> (spki=…)` on stderr). Share mode must
-take its pins from the built-in pool with TOFU disabled (§6.1), which is Task 1 work — until then
-`--share` must not ship.
+take its pins from the built-in pool with TOFU disabled (§6.1), which is Task 1 work. That is the
+first of the three outstanding items listed in the gate paragraph above — the ship verdict is
+stated there once, and it is **do not ship `--share` yet**.
 
 ## Shared UDP socket and demultiplexing
 
