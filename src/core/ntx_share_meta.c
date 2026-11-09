@@ -30,6 +30,7 @@ struct ntx_share_hasher {
     uint32_t leaf_n;     /* leaves finished in the piece in flight */
     uint32_t piece_i;    /* pieces finished */
     int root_ok;
+    int failed;          /* a fold failed; the hasher is dead, never report done */
     ntx_sha1_ctx sha1;   /* piece in flight */
     ntx_sha256_ctx leaf; /* leaf in flight */
     uint8_t *sha1list;   /* np*20 */
@@ -38,8 +39,12 @@ struct ntx_share_hasher {
     uint8_t root[32];
 };
 
+/* Both ceils below add ps - 1, so a size within one max piece of UINT64_MAX
+ * would wrap to a small count and be accepted (A5 hands the fstat size in
+ * unchecked). Rejected up front: every p used below is in [MIN, MAX]. */
 int smeta_piece_len(uint64_t size, uint32_t *ps) {
     if (!ps || size == 0) return -1;
+    if (size > UINT64_MAX - NTX_SHARE_PIECE_MAX) return -1;
     uint64_t p = NTX_SHARE_PIECE_MIN;
     while (p < NTX_SHARE_PIECE_MAX && (size + p - 1) / p > 2048) p <<= 1;
     if ((size + p - 1) / p > NTX_SHARE_MAX_PIECES) return -1;
@@ -50,6 +55,7 @@ int smeta_piece_len(uint64_t size, uint32_t *ps) {
 ntx_share_hasher *ntx_share_hasher_new(uint64_t size, uint32_t ps) {
     if (!size || ps < NTX_SHARE_PIECE_MIN || ps > NTX_SHARE_PIECE_MAX) return NULL;
     if ((ps & (ps - 1)) != 0) return NULL;
+    if (size > UINT64_MAX - ps) return NULL; /* ceil would wrap */
     if ((size + ps - 1) / ps > NTX_SHARE_MAX_PIECES) return NULL;
     ntx_share_hasher *h = calloc(1, sizeof *h);
     if (!h) return NULL;
@@ -94,8 +100,9 @@ static void smeta_fold(uint8_t *lev, size_t p) {
  * leaves. Multi-piece files store the fold as the piece-layer entry; a
  * single-piece file has no piece-layer level, so the same fold over its leaf
  * list (zero-filled to a power of two, BEP 52) *is* the pieces root and has to
- * be taken here, while leaf_n still describes the file. */
-static int smeta_piece_end(ntx_share_hasher *h, int partial) {
+ * be taken here, while leaf_n still describes the file. Nothing here allocates,
+ * so the call cannot half-complete and poison the state. */
+static void smeta_piece_end(ntx_share_hasher *h, int partial) {
     ntx_sha1_final(&h->sha1, h->sha1list + (size_t)h->piece_i * 20);
     ntx_sha1_init(&h->sha1);
     if (partial && h->leaf_fill) {
@@ -108,35 +115,37 @@ static int smeta_piece_end(ntx_share_hasher *h, int partial) {
         smeta_fold(h->leaves, h->T);
         memcpy(h->layer + (size_t)h->piece_i * 32, h->leaves, 32);
     } else {
+        /* np == 1 implies size <= ps, so leaf_n <= T and the next power of two
+         * fits the leaf array: fold in place over it, which no later piece needs. */
         size_t p = 1;
         while (p < h->leaf_n) p <<= 1;
-        uint8_t *lev = malloc(p * 32);
-        if (!lev) return -1;
-        memcpy(lev, h->leaves, (size_t)h->leaf_n * 32);
-        for (size_t i = h->leaf_n; i < p; i++) memset(lev + i * 32, 0, 32);
-        smeta_fold(lev, p);
-        memcpy(h->root, lev, 32);
-        free(lev);
+        for (size_t i = h->leaf_n; i < p; i++) memset(h->leaves + i * 32, 0, 32);
+        smeta_fold(h->leaves, p);
+        memcpy(h->root, h->leaves, 32);
     }
     h->piece_i++;
     h->piece_fill = 0;
     h->leaf_n = 0;
     ntx_sha256_init(&h->leaf);
-    return 0;
 }
 
-/* All bytes fed: close the last piece, then fold the piece layer up to the root. */
+/* All bytes fed: close the last piece, then fold the piece layer up to the root.
+ * The only allocation left on this path is inside ntx_merkle_root_from_layer; if
+ * it fails the hasher is dead — latching keeps `done` from ever reporting 1 on a
+ * half-folded state, which a caller retrying after -1 would otherwise get. */
 static int smeta_finish(ntx_share_hasher *h) {
-    if (h->piece_i < h->np && smeta_piece_end(h, 1) != 0) return -1;
+    if (h->piece_i < h->np) smeta_piece_end(h, 1);
     if (h->np > 1 &&
-        ntx_merkle_root_from_layer(h->layer, (size_t)h->np * 32, h->ps, h->size, h->root) != 0)
+        ntx_merkle_root_from_layer(h->layer, (size_t)h->np * 32, h->ps, h->size, h->root) != 0) {
+        h->failed = 1;
         return -1;
+    }
     h->root_ok = 1;
     return 0;
 }
 
 int ntx_share_hasher_feed(ntx_share_hasher *h, const uint8_t *buf, size_t n) {
-    if (!h || (n && !buf)) return -1;
+    if (!h || !buf || h->failed) return -1; /* NULL buf, also at n == 0, is never valid */
     if (h->fed + n > h->size) return -1; /* file grew, or fed twice */
     while (n > 0) {
         size_t room = SMETA_LEAF - h->leaf_fill;
@@ -156,14 +165,14 @@ int ntx_share_hasher_feed(ntx_share_hasher *h, const uint8_t *buf, size_t n) {
             h->leaf_fill = 0;
             ntx_sha256_init(&h->leaf);
         }
-        if (h->piece_fill == h->ps && smeta_piece_end(h, 0) != 0) return -1;
+        if (h->piece_fill == h->ps) smeta_piece_end(h, 0);
     }
     if (h->fed == h->size && !h->root_ok) return smeta_finish(h);
     return 0;
 }
 
 int ntx_share_hasher_done(const ntx_share_hasher *h) {
-    return h && h->fed == h->size && h->piece_i == h->np && h->root_ok;
+    return h && !h->failed && h->fed == h->size && h->piece_i == h->np && h->root_ok;
 }
 
 const uint8_t *ntx_share_hasher_sha1(const ntx_share_hasher *h) {

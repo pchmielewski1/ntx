@@ -21,10 +21,12 @@ int smeta_piece_len(uint64_t size, uint32_t *ps);
 typedef struct ntx_share_hasher ntx_share_hasher; /* opaque, heap */
 
 /* ps must be a power of two in [NTX_SHARE_PIECE_MIN, NTX_SHARE_PIECE_MAX],
- * size > 0 and ceil(size/ps) <= NTX_SHARE_MAX_PIECES. NULL on bad args/OOM. */
+ * size > 0, ceil(size/ps) <= NTX_SHARE_MAX_PIECES and size small enough that the
+ * ceil cannot overflow. NULL on bad args/OOM. */
 ntx_share_hasher *ntx_share_hasher_new(uint64_t size, uint32_t ps);
-/* Sequential file bytes; may be called with any chunk size. -1 once the total
- * exceeds size, after completion, or on OOM. */
+/* Sequential file bytes; may be called with any chunk size. buf must be non-NULL.
+ * -1 when n == 0 with NULL buf, once the total exceeds size, after completion, or
+ * once a fold has failed — a failed hasher stays failed, so never retry a -1. */
 int ntx_share_hasher_feed(ntx_share_hasher *h, const uint8_t *buf, size_t n);
 /* 1 when every byte was fed (hashes are then final), else 0. */
 int ntx_share_hasher_done(const ntx_share_hasher *h);

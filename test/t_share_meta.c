@@ -24,6 +24,8 @@
 
 #define FXDIR "test/vectors/share"
 #define CHUNK 7919 /* deliberately not a divisor of the piece length */
+/* Fixtures hold at most 4 pieces; 8 leaves room for a hand-written manifest
+ * without letting a manifest line grow past the arrays below. */
 #define MAXN 8
 #define MAXHEX 1200
 
@@ -60,7 +62,6 @@ static int find_sub(const uint8_t *hay, size_t hn, const uint8_t *needy, size_t 
 }
 
 static int hex_to_bytes(const char *hex, uint8_t *out, size_t n) {
-    if (strlen(hex) != n * 2) return -1;
     if (strlen(hex) != n * 2) return -1;
     for (size_t i = 0; i < n; i++) {
         unsigned v;
@@ -133,10 +134,19 @@ static int parse_manifest(const char *fx, manifest *m) {
         } else if (sscanf(line, "root: %511s", hex) == 1) {
             if (hex_to_bytes(hex, m->root, 32) != 0) { free(buf); return -1; }
         } else if (sscanf(line, "pieces_sha1: %1199s", hex) == 1) {
-            if (hex_to_bytes(hex, m->pieces, (size_t)m->np * 20) != 0) { free(buf); return -1; }
+            /* the count comes from the manifest, the destination is fixed: bound it */
+            size_t pn = (size_t)m->np * 20;
+            if (pn > sizeof m->pieces || hex_to_bytes(hex, m->pieces, pn) != 0) {
+                free(buf);
+                return -1;
+            }
         } else if (sscanf(line, "layer: %1199s", hex) == 1) {
-            m->layer_n = (int)(strlen(hex) / 2);
-            if (hex_to_bytes(hex, m->layer, (size_t)m->layer_n) != 0) { free(buf); return -1; }
+            size_t ln = strlen(hex) / 2;
+            if (ln > sizeof m->layer || hex_to_bytes(hex, m->layer, ln) != 0) {
+                free(buf);
+                return -1;
+            }
+            m->layer_n = (int)ln;
         }
         if (!nl) break;
         line = nl + 1;
@@ -192,9 +202,23 @@ static void test_piece_len(void) {
         ps = 0;
         char nm[96];
         snprintf(nm, sizeof nm, "piece_len_pow2_e%d", e);
-        check(smeta_piece_len(size, &ps) == 0 && ps == (uint32_t)1 << (e < 14 ? 14 : e), nm);
+        check(smeta_piece_len(size, &ps) == 0 && ps == (uint32_t)1 << e, nm);
     }
     check(smeta_piece_len(0, &ps) == -1, "piece_len_zero_rejected");
+    /* size + ps - 1 would wrap at the top of the range: the ceil must not be
+     * allowed to land on a small piece count (ps is only written on success). */
+    {
+        const uint64_t tops[] = { UINT64_MAX, UINT64_MAX - 1, UINT64_MAX - NTX_SHARE_PIECE_MIN + 1,
+                                  UINT64_MAX - NTX_SHARE_PIECE_MAX };
+        for (size_t i = 0; i < sizeof tops / sizeof tops[0]; i++) {
+            ps = 0xBADF1E;
+            char nm[96];
+            snprintf(nm, sizeof nm, "piece_len_overflow_%zu", i);
+            check(smeta_piece_len(tops[i], &ps) == -1 && ps == 0xBADF1E, nm);
+            snprintf(nm, sizeof nm, "hasher_new_overflow_%zu", i);
+            check(ntx_share_hasher_new(tops[i], NTX_SHARE_PIECE_MIN) == NULL, nm);
+        }
+    }
 }
 
 /* Feed the fixture in CHUNK-sized pieces and compare every produced byte. */
@@ -252,6 +276,27 @@ static void test_fixture(const char *fx) {
         uint8_t extra = 0;
         snprintf(nm, sizeof nm, "%s: feed-overflow-rejected", fx);
         check(ntx_share_hasher_feed(h, &extra, 1) == -1 && ntx_share_hasher_done(h) == 1, nm);
+    }
+
+    /* NULL buf is refused even at n == 0 (must not count as completion) */
+    {
+        ntx_share_hasher *p = ntx_share_hasher_new(1, m.ps);
+        snprintf(nm, sizeof nm, "%s: feed-null-buf-rejected", fx);
+        check(p && ntx_share_hasher_feed(p, NULL, 0) == -1 && ntx_share_hasher_done(p) == 0, nm);
+        ntx_share_hasher_free(p);
+    }
+
+    /* The single-piece root fold allocates nothing, so it cannot half-fail and
+     * leave a retry to report done with SHA-1("") bytes; a byte-equal root below
+     * proves the in-place fold, the valgrind/ASan run shows no malloc there. */
+    if (m.np == 1) {
+        ntx_share_hasher *p = ntx_share_hasher_new(m.size, m.ps);
+        int prc = p ? ntx_share_hasher_feed(p, data, data_n) : -1;
+        snprintf(nm, sizeof nm, "%s: single-piece-inplace-fold", fx);
+        check(prc == 0 && ntx_share_hasher_done(p) == 1 &&
+              ntx_share_hasher_root(p) && memcmp(ntx_share_hasher_root(p), m.root, 32) == 0 &&
+              memcmp(ntx_share_hasher_sha1(p), m.pieces, 20) == 0, nm);
+        ntx_share_hasher_free(p);
     }
 
     size_t ln = 0;
