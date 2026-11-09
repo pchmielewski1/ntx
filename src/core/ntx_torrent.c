@@ -149,7 +149,15 @@ static void tt_free(ntx_torrent *t) {
     ntx_store_close(&t->store);
 }
 
-static int tt_set_metainfo_v1(ntx_torrent *t, const uint8_t *info_dict, size_t info_len, const char *store_dir) {
+/* BEP 27: any non-zero integer in `private` means private (BEP 27 defines only
+ * 1, so a dubious value errs towards the DHT). A missing key or a non-integer
+ * is public. */
+static int tt_info_is_private(const ntx_be *info) {
+    const ntx_be *pv = ntx_be_dict_get(info, "private");
+    return (pv && pv->t == NTX_BE_INT && pv->i != 0) ? 1 : 0;
+}
+
+static int tt_validate_v1(ntx_torrent *t, const uint8_t *info_dict, size_t info_len) {
     uint8_t h[20];
     ntx_sha1(info_dict, info_len, h);
     if (memcmp(h, t->info_hash, 20) != 0) return -1;
@@ -214,10 +222,27 @@ static int tt_set_metainfo_v1(ntx_torrent *t, const uint8_t *info_dict, size_t i
     t->size = size;
     t->have_n = 0;
     t->verified_B = 0;
+    t->priv = (uint8_t)tt_info_is_private(&be);
+
+    ntx_be_free(&be);
+    return 0;
+}
+
+/* Write half of the v1 path: mkdir + open the store the validated layout
+ * describes. Runs only after tt_validate_v1 filled the fields it reads. */
+static int tt_open_store_v1(ntx_torrent *t, const char *store_dir) {
+    ntx_be be;
+    size_t consumed = 0;
+    if (ntx_be_parse(t->info_raw, t->info_raw_n, &be, &consumed, 32, (size_t)(1u << 24)) != 0) return -1;
+    if (be.t != NTX_BE_DICT) {
+        ntx_be_free(&be);
+        return -1;
+    }
 
     const char *dir = (store_dir && store_dir[0]) ? store_dir : "downloads";
     mkdir(dir, 0755);
 
+    const ntx_be *name = ntx_be_dict_get(&be, "name");
     const ntx_be *files = ntx_be_dict_get(&be, "files");
     int open_rc = -1;
     if (files && files->t == NTX_BE_LIST && files->ne > 0) {
@@ -228,7 +253,6 @@ static int tt_set_metainfo_v1(ntx_torrent *t, const uint8_t *info_dict, size_t i
             free(specs);
             free(paths);
             ntx_be_free(&be);
-            tt_free(t);
             return -1;
         }
         uint64_t off = 0;
@@ -256,8 +280,8 @@ static int tt_set_metainfo_v1(ntx_torrent *t, const uint8_t *info_dict, size_t i
             specs[i].len = (uint64_t)flen->i;
             off += (uint64_t)flen->i;
         }
-        if (ok && off == size)
-            open_rc = ntx_store_open_parts(&t->store, specs, (int)files->ne, size, ps);
+        if (ok && off == t->size)
+            open_rc = ntx_store_open_parts(&t->store, specs, (int)files->ne, t->size, t->ps);
         /* Display name: prefer first file basename when single payload file. */
         if (open_rc == 0 && files->ne == 1) {
             const char *base = strrchr(paths[0], '/');
@@ -273,14 +297,11 @@ static int tt_set_metainfo_v1(ntx_torrent *t, const uint8_t *info_dict, size_t i
         snprintf(path, sizeof(path), "%s/%s", dir, t->name[0] ? t->name : "untitled");
         for (char *p = path + dirlen + 1; *p; p++)
             if (*p == '/') *p = '_';
-        open_rc = ntx_store_open(&t->store, path, size, ps);
+        open_rc = ntx_store_open(&t->store, path, t->size, t->ps);
     }
     ntx_be_free(&be);
 
-    if (open_rc != 0) {
-        tt_free(t);
-        return -1;
-    }
+    if (open_rc != 0) return -1;
 
     t->state = t->store.existed ? NTX_TTS_VERIFY : NTX_TTS_DL;
     t->have_meta = 1;
@@ -428,8 +449,10 @@ static int tt_apply_v2_fields(ntx_torrent *t, const ntx_v2_file *files, uint32_t
     return 0;
 }
 
-static int tt_set_metainfo_v2(ntx_torrent *t, const uint8_t *info_dict, size_t info_len,
-                              const char *store_dir, const ntx_be *piece_layers) {
+/* Validation half of the BEP52 path: fields only, no mkdir/open. The pure-v2
+ * store layout is re-derived from info_raw by tt_open_store_v2. */
+static int tt_validate_v2(ntx_torrent *t, const uint8_t *info_dict, size_t info_len,
+                          const ntx_be *piece_layers) {
     ntx_be be;
     size_t consumed = 0;
     if (ntx_be_parse(info_dict, info_len, &be, &consumed, 32, (size_t)(1u << 20)) != 0) return -1;
@@ -488,9 +511,9 @@ static int tt_set_metainfo_v2(ntx_torrent *t, const uint8_t *info_dict, size_t i
             ntx_be_free(&be);
             return -1;
         }
-        /* v1 layout + store: reuse the untouched v1 path (its sha1 gate passes
+        /* v1 layout: reuse the untouched v1 validation (its sha1 gate passes
          * for a valid hybrid because info_hash is the v1 sha1). */
-        if (tt_set_metainfo_v1(t, info_dict, info_len, store_dir) != 0) {
+        if (tt_validate_v1(t, info_dict, info_len) != 0) {
             free(layer_out);
             ntx_be_free(&be);
             return -1;
@@ -507,36 +530,7 @@ static int tt_set_metainfo_v2(ntx_torrent *t, const uint8_t *info_dict, size_t i
         return 0;
     }
 
-    /* pure v2: open the store from the v2 file table. */
-    const char *dir = (store_dir && store_dir[0]) ? store_dir : "downloads";
-    ntx_store_part_spec *specs = calloc((size_t)nfiles, sizeof *specs);
-    char (*paths)[768] = calloc((size_t)nfiles, sizeof *paths);
-    if (!specs || !paths) {
-        free(specs); free(paths);
-        free(layer_out);
-        ntx_be_free(&be);
-        return -1;
-    }
-    for (uint32_t i = 0; i < nfiles; i++) {
-        if ((size_t)snprintf(paths[i], sizeof paths[i], "%s/%s", dir, files[i].path) >= sizeof paths[i]) {
-            free(specs); free(paths);
-            free(layer_out);
-            ntx_be_free(&be);
-            return -1;
-        }
-        specs[i].path = paths[i];
-        specs[i].start = (uint64_t)files[i].first_piece * ps;
-        specs[i].len = files[i].len;
-    }
-    int open_rc = ntx_store_open_parts(&t->store, specs, (int)nfiles, addr_end, ps);
-    free(specs);
-    free(paths);
-    if (open_rc != 0) {
-        free(layer_out);
-        ntx_be_free(&be);
-        return -1;
-    }
-
+    /* pure v2: fields only; tt_open_store_v2 opens the store from the file table. */
     t->have = calloc(np_total, 1);
     t->rarity = calloc(np_total, sizeof(int));
     t->info_raw = malloc(info_len);
@@ -555,6 +549,7 @@ static int tt_set_metainfo_v2(ntx_torrent *t, const uint8_t *info_dict, size_t i
     t->phash = NULL;
     t->have_n = 0;
     t->verified_B = 0;
+    t->priv = (uint8_t)tt_info_is_private(&be);
 
     memset(t->name, 0, sizeof(t->name));
     const char *base = strrchr(files[0].path, '/');
@@ -571,10 +566,67 @@ static int tt_set_metainfo_v2(ntx_torrent *t, const uint8_t *info_dict, size_t i
         return -1;
     }
 
-    t->state = t->store.existed ? NTX_TTS_VERIFY : NTX_TTS_DL;
-    t->have_meta = 1;
     free(layer_out);
     ntx_be_free(&be);
+    return 0;
+}
+
+/* Write half of the pure-v2 path: re-derive the file table from info_raw and
+ * open the store it describes (the v1 half re-reads "files" the same way).
+ * The re-parse repeats checks validate already made; any failure here frees
+ * the validated fields, as the v1 open half does. */
+static int tt_open_store_v2(ntx_torrent *t, const char *store_dir) {
+    ntx_be be;
+    size_t consumed = 0;
+    if (ntx_be_parse(t->info_raw, t->info_raw_n, &be, &consumed, 32, (size_t)(1u << 20)) != 0) return -1;
+    if (be.t != NTX_BE_DICT) { ntx_be_free(&be); return -1; }
+
+    const ntx_be *psbe = ntx_be_dict_get(&be, "piece length");
+    if (!psbe || psbe->t != NTX_BE_INT || psbe->i < 16384) { ntx_be_free(&be); return -1; }
+    uint64_t ps64 = (uint64_t)psbe->i;
+    if ((ps64 & (ps64 - 1)) != 0) { ntx_be_free(&be); return -1; }
+    if (ps64 > NTX_TORRENT_MAX_PIECE_LEN) { ntx_be_free(&be); return -1; }
+    uint32_t ps = (uint32_t)ps64;
+
+    const ntx_be *tree = ntx_be_dict_get(&be, "file tree");
+    if (!tree || tree->t != NTX_BE_DICT) { ntx_be_free(&be); return -1; }
+
+    ntx_v2_file files[NTX_TORRENT_MAX_FILES_V2];
+    uint32_t nfiles = 0;
+    uint64_t data_size = 0, addr_end = 0;
+    if (ntx_torrent_v2_tree_walk(tree, ps, files, NTX_TORRENT_MAX_FILES_V2,
+                                 &nfiles, &data_size, &addr_end) != 0) {
+        ntx_be_free(&be);
+        return -1;
+    }
+    if (nfiles == 0) { ntx_be_free(&be); return -1; }
+
+    const char *dir = (store_dir && store_dir[0]) ? store_dir : "downloads";
+    ntx_store_part_spec *specs = calloc((size_t)nfiles, sizeof *specs);
+    char (*paths)[768] = calloc((size_t)nfiles, sizeof *paths);
+    if (!specs || !paths) {
+        free(specs); free(paths);
+        ntx_be_free(&be);
+        return -1;
+    }
+    for (uint32_t i = 0; i < nfiles; i++) {
+        if ((size_t)snprintf(paths[i], sizeof paths[i], "%s/%s", dir, files[i].path) >= sizeof paths[i]) {
+            free(specs); free(paths);
+            ntx_be_free(&be);
+            return -1;
+        }
+        specs[i].path = paths[i];
+        specs[i].start = (uint64_t)files[i].first_piece * ps;
+        specs[i].len = files[i].len;
+    }
+    int open_rc = ntx_store_open_parts(&t->store, specs, (int)nfiles, addr_end, ps);
+    free(specs);
+    free(paths);
+    ntx_be_free(&be);
+    if (open_rc != 0) return -1;
+
+    t->state = t->store.existed ? NTX_TTS_VERIFY : NTX_TTS_DL;
+    t->have_meta = 1;
     return 0;
 }
 
@@ -594,13 +646,58 @@ static int tt_hash_gate_ok(ntx_torrent *t, const uint8_t *info_dict, size_t info
     return memcmp(h, t->info_hash, 20) == 0;
 }
 
+/* Field-only half of set_metainfo: hash gate, parse, allocate and fill every
+ * torrent field (phash, name, ps, np, size, priv, v2 table, piece layers) with
+ * no mkdir and no open. On failure the fields it allocated are freed and the
+ * torrent is back to the init_meta state, so the caller only has to react to
+ * the return code. A store opened over a previous validate() is not
+ * meaningful: call open_store on a torrent that has none. */
+int ntx_torrent_validate_metainfo(ntx_torrent *t, const uint8_t *info, size_t info_n,
+                                  const uint8_t *layers, size_t layers_n) {
+    if (!tt_hash_gate_ok(t, info, info_n)) return -1;
+    int mv = ntx_torrent_metainfo_version(info, info_n);
+    if (mv < 0) return -1;
+    if (mv == 0) return tt_validate_v1(t, info, info_n);
+    ntx_be lbe;
+    size_t consumed = 0;
+    const ntx_be *lptr = NULL;
+    memset(&lbe, 0, sizeof lbe);
+    if (layers && layers_n > 0) {
+        if (ntx_be_parse(layers, layers_n, &lbe, &consumed, 32, (size_t)(1u << 20)) != 0) return -1;
+        if (lbe.t != NTX_BE_DICT) { ntx_be_free(&lbe); return -1; }
+        lptr = &lbe;
+    }
+    int rc = tt_validate_v2(t, info, info_n, lptr);
+    if (lptr) ntx_be_free(&lbe);
+    return rc;
+}
+
+/* Write half: the today-path that creates <store_dir>/<name>. Validated fields
+ * must be in place (set_metainfo or ntx_torrent_validate_metainfo). On failure
+ * the validated fields are freed, the same cleanup set_metainfo always did. */
+int ntx_torrent_open_store(ntx_torrent *t, const char *store_dir) {
+    if (!t || !t->info_raw) return -1;
+    /* ponytail: opening twice would leak the previous fds/pmap. Ceiling: every
+     * caller opens once on a fresh slot, as set_metainfo always did. Upgrade:
+     * ntx_store_close() first here if a re-open case ever appears. */
+    if (t->store.pmap != NULL) return -1;
+    int rc = t->hybrid || t->meta_version == 0 ? tt_open_store_v1(t, store_dir)
+                                               : tt_open_store_v2(t, store_dir);
+    if (rc != 0) tt_free(t);
+    return rc;
+}
+
 int ntx_torrent_set_metainfo(ntx_torrent *t, const uint8_t *info_dict, size_t info_len, const char *store_dir,
                              const ntx_be *piece_layers) {
     if (!tt_hash_gate_ok(t, info_dict, info_len)) return -1;
     int mv = ntx_torrent_metainfo_version(info_dict, info_len);
     if (mv < 0) return -1;
-    if (mv == 0) return tt_set_metainfo_v1(t, info_dict, info_len, store_dir);
-    return tt_set_metainfo_v2(t, info_dict, info_len, store_dir, piece_layers);
+    if (mv == 0) {
+        if (tt_validate_v1(t, info_dict, info_len) != 0) return -1;
+    } else if (tt_validate_v2(t, info_dict, info_len, piece_layers) != 0) {
+        return -1;
+    }
+    return ntx_torrent_open_store(t, store_dir);
 }
 
 int ntx_torrent_piece_complete_from(ntx_torrent *t, uint32_t i, ntx_peer *src, uint64_t now_ms) {

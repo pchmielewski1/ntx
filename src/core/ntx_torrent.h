@@ -81,6 +81,17 @@ int ntx_torrent_metainfo_hash(const uint8_t *info, size_t n, uint8_t out20[20],
  * ut_metadata flow). A NULL is accepted for pure v2 too:
  * hybrid keeps the v1 SHA-1 verify, pure v2 enters the hash-exchange path
  * (ntx_torrent_layers_pending) instead of being rejected into a meta loop. */
+/* Field-only validation (design §5.2): hash gate + parse + fill phash/name/
+ * ps/np/size/priv and the BEP52 v2 fields from the info substring and the raw
+ * bencoded top-level "piece layers" dict (NULL/0 = unavailable, same
+ * semantics as the parsed ntx_be argument below). Creates and touches NOTHING
+ * on disk. On failure the torrent is back to its init_meta state. */
+int ntx_torrent_validate_metainfo(ntx_torrent *t, const uint8_t *info, size_t info_n,
+                                  const uint8_t *layers, size_t layers_n);
+/* Write half: mkdir + open the store an already-validated torrent describes.
+ * On failure the validated fields are freed. */
+int ntx_torrent_open_store(ntx_torrent *t, const char *store_dir);
+/* = validate + open_store, signature and behaviour unchanged. */
 int ntx_torrent_set_metainfo(ntx_torrent *t, const uint8_t *info_dict, size_t info_len, const char *store_dir,
                              const ntx_be *piece_layers);
 int ntx_torrent_piece_complete(ntx_torrent *t, uint32_t i);
