@@ -8,6 +8,10 @@
 
 #define NTX_PEX_INTERVAL_MS 60000ull
 
+/* ponytail: declared here (ntx_session.c) because internal.h is Task 1-owned.
+ * Upgrade: hoist the prototype next to ntx_session_add_peer_from_tracker. */
+int ntx_session_add_peer_src(struct ntx_session *s, int ti, const ntx_addr *a, uint16_t port, uint8_t src);
+
 void ntx_session_data_on_pex(struct ntx_session *s, int pi, const uint8_t *payload, size_t plen) {
     if (pi < 0 || pi >= NTX_SESSION_MAX_PEERS) return;
     int i = s->peer_tts[pi];
@@ -24,13 +28,13 @@ void ntx_session_data_on_pex(struct ntx_session *s, int pi, const uint8_t *paylo
         if (!aip[k] || !aport[k]) continue;
         ntx_addr a;
         ntx_addr_set_v4(&a, aip[k]);
-        ntx_session_add_peer_from_tracker(s, i, &a, aport[k]);
+        ntx_session_add_peer_src(s, i, &a, aport[k], NTX_PSRC_PEX);
     }
     for (int k = 0; k < na6; k++) {
         ntx_addr a;
         ntx_addr_set_v6(&a, a6ip[k]);
         if (ntx_addr_is_zero(&a) || !a6port[k]) continue;
-        ntx_session_add_peer_from_tracker(s, i, &a, a6port[k]);
+        ntx_session_add_peer_src(s, i, &a, a6port[k], NTX_PSRC_PEX);
     }
 }
 
@@ -41,6 +45,9 @@ void ntx_session_data_pex_tick(struct ntx_session *s) {
         if (s->peer_phase[pi] != PH_OK || !s->peer_pex_id[pi]) continue;
         int ti = s->peer_tts[pi];
         if (ti < 0 || ti >= s->n_tts) continue;
+        /* BEP 27 §4.2: nothing is advertised for a private torrent, not even to a
+         * peer that negotiated ut_pex before the magnet's info dict arrived. */
+        if (!sp_ext_allowed(s, ti, NTX_EXT_LOCAL_PEX)) continue;
         if (s->peer_pex_last_ms[pi] && now - s->peer_pex_last_ms[pi] < NTX_PEX_INTERVAL_MS)
             continue;
 

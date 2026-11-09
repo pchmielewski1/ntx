@@ -70,6 +70,32 @@ static int meta_hash_gate(const ntx_torrent *t, const uint8_t *buf, size_t n) {
     return memcmp(h, t->info_hash, 20) == 0 ? 0 : -1;
 }
 
+/* BEP 27 §4.5: a magnet whose info dict turns out to be private must stop using
+ * the addresses it dialled while the privacy was still unknown. Only outbound
+ * slots go — inbound accepts stay (BEP 27 restricts initiation only), and so do
+ * tracker slots, which are the one source §4.4 allows.
+ *
+ * Deliberately not sp_drop: that path records a dial back-off and re-dials a uTP
+ * miss over TCP, which would put a DHT/PEX address straight back on the wire. */
+static void meta_drop_non_tracker_peers(struct ntx_session *s, int i) {
+    if (!s->tts[i].priv) return;
+    for (int pi = 0; pi < NTX_SESSION_MAX_PEERS; pi++) {
+        if (s->peer_tts[pi] != i || s->peers[pi].fd == -1) continue;
+        if (!s->peer_outbound[pi] || s->peer_src[pi] == NTX_PSRC_TRACKER) continue;
+        if (s->peer_phase[pi] == PH_OK) {
+            ntx_torrent_on_peer_lost(&s->tts[i], &s->peers[pi]);
+            ntx_peer_clear_requests(&s->peers[pi]);
+        }
+        if (s->cfg && s->cfg->verbose)
+            ntx_diag("ntx: priv drop pi=%d ti=%d src=%u\n", pi, i, (unsigned)s->peer_src[pi]);
+        ntx_session_peer_free(s, pi);
+    }
+}
+
+/* BEP 27 §4: body in ntx_session_priv.c. Declared here because internal.h is
+ * Task 1-owned. Upgrade: hoist the prototype there. */
+int priv_info_is_private(const ntx_be *info);
+
 void meta_assemble(struct ntx_session *s, int i) {
     ntx_torrent *t = &s->tts[i];
     ntx_be be;
@@ -79,6 +105,9 @@ void meta_assemble(struct ntx_session *s, int i) {
         meta_retry_all(s, i);
         return;
     }
+    /* BEP 27 §4: read `private` before the metainfo is applied, so the magnet →
+     * private transition below can already act on it. */
+    int priv = priv_info_is_private(&be);
     ntx_be_free(&be);
     if (meta_hash_gate(t, meta_buf[i], meta_total[i]) != 0) {
         ntx_diag( "ntx: meta hash mismatch ti=%d bytes=%u\n", i, meta_total[i]);
@@ -90,7 +119,12 @@ void meta_assemble(struct ntx_session *s, int i) {
     if (ntx_torrent_set_metainfo(t, meta_buf[i], meta_total[i],
                                   s->cfg && s->cfg->store_dir ? s->cfg->store_dir : "downloads",
                                   NULL) == 0) {
+        /* ponytail: the flag is also read by ntx_torrent_validate_metainfo (Task
+         * A2, stream A). Assigning it here keeps §4.5 correct before that lands.
+         * Upgrade: drop the read above and this line once A2 is merged. */
+        t->priv = (uint8_t)priv;
         dl_t0[i] = ntx_mono_ms();
+        meta_drop_non_tracker_peers(s, i);
         ntx_session_on_metainfo(s, i);
     }
     meta_reset(i);

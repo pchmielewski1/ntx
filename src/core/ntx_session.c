@@ -20,6 +20,11 @@
 static struct ntx_session *sess_g_s;
 static char dht_state_path[512];
 
+/* ponytail: declared here (below in this file) because internal.h is Task 1-owned.
+ * Upgrade: hoist the prototype next to ntx_session_add_peer_from_tracker. */
+int ntx_session_add_peer_src(struct ntx_session *s, int ti, const ntx_addr *a, uint16_t port, uint8_t src);
+int priv_info_is_private(const ntx_be *info); /* body in ntx_session_priv.c */
+
 static void tick_wrapper(void *arg) {
     ntx_session *s = (ntx_session *)arg;
     ntx_session_tick(s);
@@ -121,8 +126,13 @@ static void dht_peers_cb(const uint8_t hash[20], const ntx_dht_peer *peers, int 
     if (!s) return;
     for (int i = 0; i < s->n_tts; i++) {
         if (memcmp(s->tts[i].info_hash, hash, 20) != 0) continue;
+        /* BEP 27 §4.5: a magnet whose info dict arrived while the DHT lookup was
+         * in flight may have turned private — every result for such a slot is
+         * dropped here. (ntx_dht has no per-lookup cancel; the pending lookup
+         * simply costs a few datagrams and returns nothing.) */
+        if (!sp_dial_allowed(s, i, NTX_PSRC_DHT)) break;
         for (int j = 0; j < n; j++)
-            ntx_session_add_peer_from_tracker(s, i, &peers[j].addr, peers[j].port);
+            ntx_session_add_peer_src(s, i, &peers[j].addr, peers[j].port, NTX_PSRC_DHT);
         break;
     }
 }
@@ -267,6 +277,18 @@ int ntx_session_add_torrent_file(ntx_session *s, const char *path) {
                         rc = -1;
                     } else {
                         if (i >= s->n_tts) s->n_tts = i + 1;
+                        /* BEP 27 §4: the flag has to be on the slot before the
+                         * first announce below, or a private .torrent would reach
+                         * the DHT and accept PEX. ponytail: the parse is repeated
+                         * here because ntx_torrent.c (Task A2) will own the field
+                         * once ntx_torrent_validate_metainfo lands; upgrade: drop
+                         * these lines then. */
+                        ntx_be pbe;
+                        size_t pc = 0;
+                        if (ntx_be_parse(info_sub, info_n, &pbe, &pc, 32, (size_t)(1u << 20)) == 0) {
+                            t->priv = (uint8_t)priv_info_is_private(&pbe);
+                            ntx_be_free(&pbe);
+                        }
                         session_load_torrent_trackers(s, i, &root);
                         if (t->state != NTX_TTS_VERIFY)
                             ntx_session_trk_announce(s, i, NTX_TRACKER_EVENT_STARTED);
@@ -413,6 +435,7 @@ int ntx_session_peer_alloc(struct ntx_session *s, int fd, const ntx_addr *addr, 
     s->peer_phase[pi] = PH_PE;
     s->peer_outbound[pi] = 0;
     s->peer_tcp_fb[pi] = 0;
+    s->peer_src[pi] = NTX_PSRC_NONE;
     s->peer_meta_id[pi] = 0;
     s->peer_pex_id[pi] = 0;
     s->peer_holepunch_id[pi] = 0;
@@ -482,8 +505,12 @@ int ntx_session_add_peer_dial(struct ntx_session *s, int tts_idx, const ntx_addr
     return ntx_session_add_peer_dial_ex(s, tts_idx, addr, port, 0);
 }
 
-static int dial_impl(struct ntx_session *s, int tts_idx, const ntx_addr *addr, uint16_t port, int force, int tcp) {
+static int dial_impl(struct ntx_session *s, int tts_idx, const ntx_addr *addr, uint16_t port, int force, int tcp,
+                     uint8_t src) {
     if (!addr || ntx_addr_is_zero(addr) || port == 0) return 0;
+    /* BEP 27 §4.4: a private torrent is only ever dialled by tracker-sourced
+     * addresses, so refuse before a slot or a socket is touched. */
+    if (!sp_dial_allowed(s, tts_idx, src)) return 0;
     /* Peer addresses come from trackers, PEX, DHT and holepunch messages: all steerable by third
      * parties.  Never let them point us at this host or at link-local/metadata/multicast space. */
     if (ntx_addr_is_special(addr) && !(s->cfg && s->cfg->allow_local_peers)) return 0;
@@ -512,6 +539,7 @@ static int dial_impl(struct ntx_session *s, int tts_idx, const ntx_addr *addr, u
     int pi = ntx_session_peer_alloc(s, -1, addr, port, tts_idx);
     if (pi < 0) return 0;
     s->peer_outbound[pi] = 1;
+    s->peer_src[pi] = src;
     s->peer_tcp_fb[pi] = (uint8_t)tcp;
     char ip[48];
     if (ntx_addr_ntop(addr, ip, sizeof ip) != 0) snprintf(ip, sizeof ip, "?");
@@ -546,16 +574,29 @@ static int dial_impl(struct ntx_session *s, int tts_idx, const ntx_addr *addr, u
 }
 
 int ntx_session_add_peer_dial_ex(struct ntx_session *s, int tts_idx, const ntx_addr *addr, uint16_t port, int force) {
-    return dial_impl(s, tts_idx, addr, port, force, 0);
+    return dial_impl(s, tts_idx, addr, port, force, 0, NTX_PSRC_TRACKER);
 }
 
-/* TCP retry of an address whose uTP dial got no answer (never held back by the redial back-off). */
+/* TCP retry of an address whose uTP dial got no answer (never held back by the redial back-off).
+ * The retry keeps the origin of the slot it replaces — an address only earns a
+ * retry because it was allowed to be dialled in the first place. */
+int ntx_session_add_peer_dial_tcp_src(struct ntx_session *s, int tts_idx, const ntx_addr *addr, uint16_t port,
+                                      uint8_t src) {
+    return dial_impl(s, tts_idx, addr, port, 1, 1, src);
+}
+
 int ntx_session_add_peer_dial_tcp(struct ntx_session *s, int tts_idx, const ntx_addr *addr, uint16_t port) {
-    return dial_impl(s, tts_idx, addr, port, 1, 1);
+    return ntx_session_add_peer_dial_tcp_src(s, tts_idx, addr, port, NTX_PSRC_TRACKER);
+}
+
+/* The single dial entry for every peer source. src is recorded on the slot for
+ * BEP 27 (ntx_session_priv.c) and gates the dial itself. */
+int ntx_session_add_peer_src(struct ntx_session *s, int ti, const ntx_addr *a, uint16_t port, uint8_t src) {
+    return dial_impl(s, ti, a, port, 0, 0, src);
 }
 
 void ntx_session_add_peer_from_tracker(struct ntx_session *s, int tts_idx, const ntx_addr *addr, uint16_t port) {
-    (void)ntx_session_add_peer_dial(s, tts_idx, addr, port);
+    (void)ntx_session_add_peer_src(s, tts_idx, addr, port, NTX_PSRC_TRACKER);
 }
 
 static void sess_ready_apply(struct ntx_session *s, int tts_idx) {

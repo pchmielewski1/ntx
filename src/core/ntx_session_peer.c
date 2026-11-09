@@ -28,6 +28,11 @@ void sp_process_msgs(struct ntx_session *s, int pi);
 
 void ntx_session_hash_tick(struct ntx_session *s);
 
+/* ponytail: declared here (ntx_session.c) because internal.h is Task 1-owned.
+ * Upgrade: hoist the prototype next to ntx_session_add_peer_dial_tcp. */
+int ntx_session_add_peer_dial_tcp_src(struct ntx_session *s, int tts_idx, const ntx_addr *addr, uint16_t port,
+                                      uint8_t src);
+
 void sp_peer_ok_hello(struct ntx_session *s, int pi);
 
 void sp_peer_ok_poll(struct ntx_session *s, int pi);
@@ -116,6 +121,7 @@ void sp_drop(struct ntx_session *s, int pi, const char *why) {
                    s->peers[pi].fd <= -NTX_UTP_VIRT_BASE && s->cfg && s->cfg->utp && !s->cfg->tunnel;
     ntx_addr miss_addr = s->peers[pi].addr;
     uint16_t miss_port = s->peers[pi].port;
+    uint8_t miss_src = s->peer_src[pi];
     if (s->peer_outbound[pi] && !utp_miss) { /* redial back-off: remember dead addresses, forget good ones */
         if (was_ok) ntx_dial_bo_ok(&s->dial_bo, &s->peers[pi].addr, s->peers[pi].port);
         else ntx_dial_bo_fail(&s->dial_bo, &s->peers[pi].addr, s->peers[pi].port, ntx_mono_ms());
@@ -128,7 +134,7 @@ void sp_drop(struct ntx_session *s, int pi, const char *why) {
             snprintf(x, sizeof x, "port=%u", (unsigned)miss_port);
             sp_vlog_peer(s, pi, "utp_miss_tcp_retry", x);
         }
-        (void)ntx_session_add_peer_dial_tcp(s, tts, &miss_addr, miss_port);
+        (void)ntx_session_add_peer_dial_tcp_src(s, tts, &miss_addr, miss_port, miss_src);
     }
     if (was_unchoke && tts >= 0 && tts < s->n_tts) {
         int un = 0;
@@ -209,6 +215,9 @@ void ntx_session_peer_on_accept(struct ntx_session *s, ntx_netx *n, int peer_fd,
         }
     }
     if (pi < 0) return;
+    /* BEP 27 §4.4: an accepted connection is never the initiating side, so it is
+     * recorded as inbound — the origin a private torrent is still allowed to keep. */
+    s->peer_src[pi] = NTX_PSRC_INBOUND;
     s->peers[pi].conn_t0 = 0;
     s->peers[pi].hs_t0 = ntx_mono_ms();
     ntx_pe_init(&s->pe[pi], NTX_PE_RESPONDER, peer_fd);
@@ -1346,9 +1355,17 @@ void ntx_session_peer_send_ext_handshake(struct ntx_session *s, int pi) {
      * so advertise it only when uTP is enabled — never claim a capability the
      * stack would not honour (a connect arriving with cfg.utp==0 is ignored). */
     int utp_on = (s->cfg && s->cfg->utp) ? 1 : 0;
+    /* BEP 27 §4.2/§4.3: never offer ut_pex or ut_holepunch on a private torrent.
+     * ut_metadata stays — §4.5 requires the info dict to be obtainable, and a
+     * magnet is only known to be private after it has been. */
+    int pex_on = sp_ext_allowed(s, s->peer_tts[pi], NTX_EXT_LOCAL_PEX) ? 1 : 0;
+    int hp_on = utp_on && sp_ext_allowed(s, s->peer_tts[pi], NTX_EXT_LOCAL_HOLEPUNCH);
     const char *names[3] = {NTX_EXT_NAME_UT_METADATA, NTX_EXT_NAME_UT_PEX, NTX_EXT_NAME_UT_HOLEPUNCH};
     uint8_t ids[3] = {NTX_EXT_LOCAL_METADATA, NTX_EXT_LOCAL_PEX, NTX_EXT_LOCAL_HOLEPUNCH};
-    int n_ext = utp_on ? 3 : 2;
+    /* The array is the offer prefix: ut_metadata, then ut_pex, then ut_holepunch. */
+    int n_ext = 1;
+    if (pex_on) n_ext++;
+    if (hp_on) n_ext++;
     int meta_size = t->have_meta ? (int)t->info_raw_n : 0;
     uint8_t hs[256];
     size_t hsn = 0;
