@@ -122,10 +122,36 @@ fail:
     return -1;
 }
 
+/* Read-only store over one part on a caller-owned fd: no open, no ftruncate, no
+ * mkdir. The fd belongs to the caller (the share keeps it) and is never closed here. */
+int ntx_store_open_ro_fd(ntx_store *st, int fd, uint64_t size, uint32_t ps) {
+    memset(st, 0, sizeof *st);
+    st->fd = -1;
+    if (fd < 0 || size == 0 || ps == 0) return -1;
+    st->size = size;
+    st->ps = ps;
+    st->np = (uint32_t)((size + ps - 1) / ps);
+    st->pmap = calloc(st->np, 1);
+    if (!st->pmap) return -1;
+    st->parts = calloc(1, sizeof *st->parts);
+    if (!st->parts) {
+        free(st->pmap);
+        st->pmap = NULL;
+        return -1;
+    }
+    st->ro = 1;
+    st->nparts = 1;
+    st->fd = fd;
+    st->parts[0].fd = fd;
+    st->parts[0].start = 0;
+    st->parts[0].len = size;
+    return 0;
+}
+
 void ntx_store_close(ntx_store *st) {
     if (st->parts) {
         for (int i = 0; i < st->nparts; i++) {
-            if (st->parts[i].fd >= 0) {
+            if (st->parts[i].fd >= 0 && !st->ro) {
                 /* Avoid double-close when fd aliases parts[0]. */
                 int dup = 0;
                 for (int j = 0; j < i; j++)
@@ -182,6 +208,7 @@ static int store_io(const ntx_store *st, int do_write, uint64_t abs, const void 
 }
 
 int ntx_store_write(ntx_store *st, uint32_t i, uint32_t off, const void *buf, size_t len) {
+    if (st->ro) return -1;
     uint64_t abs = (uint64_t)i * st->ps + off;
     if (abs + len > st->size) return -1;
     if (store_io(st, 1, abs, buf, NULL, len) != 0) return -1;

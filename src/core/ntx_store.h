@@ -27,11 +27,13 @@ typedef struct ntx_store {
     ntx_store_part *parts;
     int nparts;
     uint8_t existed;
+    uint8_t ro; /* read-only store over a caller-owned fd; close() must not close it */
 } ntx_store;
 
 int ntx_store_open(ntx_store *st, const char *path, uint64_t size, uint32_t ps);
 int ntx_store_open_parts(ntx_store *st, const ntx_store_part_spec *specs, int nspecs, uint64_t size,
                          uint32_t ps);
+int ntx_store_open_ro_fd(ntx_store *st, int fd, uint64_t size, uint32_t ps);
 void ntx_store_close(ntx_store *st);
 uint32_t ntx_store_pl(const ntx_store *st, uint32_t i);
 int ntx_store_write(ntx_store *st, uint32_t i, uint32_t off, const void *buf, size_t len);
