@@ -74,6 +74,14 @@
 #include "../src/proto/ntx_utmeta.c"
 #include "../src/proto/ntx_pe_vc.c"
 
+#include "../src/core/ntx_share.c"
+#include "../src/core/ntx_share_meta.c"
+#include "../src/core/ntx_share_out.c"
+#include "../src/core/ntx_session_priv.c"
+#include "../src/core/ntx_session_portmap.c"
+#include "../src/proto/ntx_share_trackers.c"
+#include "../src/proto/ntx_pcp.c"
+
 /* A2 — slow-loris: per-request timeout/cancel with many REQUESTs in-flight.
  *
  * The peer is a non-blocking AF_UNIX socketpair: the session's CANCEL/REQUEST

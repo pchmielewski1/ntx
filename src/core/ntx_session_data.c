@@ -398,7 +398,7 @@ static void data_check_torrent_done(struct ntx_session *s, int tts_idx) {
         ntx_diag( "ntx: download complete ti=%d\n", tts_idx);
     if (!t->pre_complete)
         ntx_session_trk_announce(s, tts_idx, NTX_TRACKER_EVENT_COMPLETED);
-    if (s->cfg && s->cfg->dht)
+    if (sp_dht_allowed(s, tts_idx))
         ntx_dht_announce(t->info_hash, ntx_netx_port(s->netx));
     for (int pi = 0; pi < NTX_SESSION_MAX_PEERS; pi++) {
         if (s->peer_phase[pi] != PH_OK || s->peer_tts[pi] != tts_idx || s->peers[pi].fd == -1) continue;
@@ -616,10 +616,11 @@ void ntx_session_data_on_ext(struct ntx_session *s, int pi, int ext_id, const ui
     /* BEP10: TX uses peer's ext IDs; RX uses our local IDs (peer sends with our advertised IDs). */
     if (!ext_is_metadata(s, pi, ext_id)) {
         if (ext_is_holepunch(s, pi, ext_id)) {
-            ntx_session_holepunch_on_rx(s, pi, payload, plen);
+            if (sp_ext_allowed(s, s->peer_tts[pi], NTX_EXT_LOCAL_HOLEPUNCH))
+                ntx_session_holepunch_on_rx(s, pi, payload, plen);
             return;
         }
-        if (ext_is_pex(s, pi, ext_id))
+        if (ext_is_pex(s, pi, ext_id) && sp_ext_allowed(s, s->peer_tts[pi], NTX_EXT_LOCAL_PEX))
             ntx_session_data_on_pex(s, pi, payload, plen);
         return;
     }

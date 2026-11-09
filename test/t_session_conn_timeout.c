@@ -73,6 +73,14 @@
 #include "../src/proto/ntx_utmeta.c"
 #include "../src/proto/ntx_pe_vc.c"
 
+#include "../src/core/ntx_share.c"
+#include "../src/core/ntx_share_meta.c"
+#include "../src/core/ntx_share_out.c"
+#include "../src/core/ntx_session_priv.c"
+#include "../src/core/ntx_session_portmap.c"
+#include "../src/proto/ntx_share_trackers.c"
+#include "../src/proto/ntx_pcp.c"
+
 #include <netinet/in.h>
 
 /* A SYN that gets no answer within a couple of seconds almost never will (in a live swarm ~99% of dials time

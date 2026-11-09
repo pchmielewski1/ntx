@@ -25,14 +25,21 @@ static uint32_t stats_smooth5(uint32_t cur, const uint32_t ring[5]) {
 
 static void stats_fill_phase(struct ntx_session *s, int i, ntx_tts_stat *tt, uint32_t td) {
     ntx_torrent *t = &s->tts[i];
+    ntx_share_state sh = ntx_session_share_state(s, i);
     tt->state = (uint8_t)t->state;
     tt->phase[0] = 0;
+    tt->priv = t->priv;
+    tt->enc_strict = s->tts_enc_strict[i];
+    tt->in_ok = s->tts_in_ok[i];
+    tt->share = (uint8_t)(sh == NTX_SHARE_NONE ? 0 : (sh == NTX_SHARE_FAILED ? 2 : 1));
 
     tt->trk_total = (uint16_t)s->trk_n[i];
     tt->trk_pend = (uint16_t)stats_trk_pending(s, i);
     tt->trk_udp_ok = 0;
     tt->trk_dead = 0;
+    tt->trk_pin_fail = 0;
     for (int j = 0; j < s->trk_n[i] && j < NTX_SESSION_MAX_TRK; j++) {
+        if (s->trk_pin_fail[i][j]) tt->trk_pin_fail++;
         if (s->trk_fail[i][j] >= NTX_TRK_MAX_FAIL) {
             tt->trk_dead++;
             continue;
@@ -126,6 +133,10 @@ static void stats_fill_phase(struct ntx_session *s, int i, ntx_tts_stat *tt, uin
             phase = "stall";
         break;
     }
+    if (sh == NTX_SHARE_HASHING) { /* --share: hashing replaces the download phase (design §5.3) */
+        phase = "hash";
+        tt->pct = ntx_session_share_pct(s, i);
+    }
     snprintf(tt->phase, sizeof tt->phase, "%s", phase);
 }
 
@@ -166,6 +177,8 @@ void ntx_session_stats_refresh(struct ntx_session *s, int rotate_ring) {
     ntx_netx_demux_stats(s->netx, &st->demux_dht, &st->demux_utp, &st->demux_drop);
     st->punch_ok = s->hp_dial_ok;
     st->punch_fail = s->hp_dial_fail;
+    st->port_map = (uint8_t)ntx_session_portmap_state(s);
+    st->ext_port = (st->port_map == NTX_PM_ACTIVE) ? ntx_session_adv_port(s) : 0;
     int total_peers = 0, conn_peers = 0;
     for (int pi = 0; pi < NTX_SESSION_MAX_PEERS; pi++) {
         if (s->peers[pi].fd != -1) {

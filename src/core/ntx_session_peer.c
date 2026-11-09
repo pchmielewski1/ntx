@@ -1352,7 +1352,7 @@ void ntx_session_peer_send_ext_handshake(struct ntx_session *s, int pi) {
     int meta_size = t->have_meta ? (int)t->info_raw_n : 0;
     uint8_t hs[256];
     size_t hsn = 0;
-    ntx_ext_handshake_build(hs, &hsn, names, ids, n_ext, meta_size, ntx_netx_port(s->netx), "ntx/" NTX_VERSION);
+    ntx_ext_handshake_build(hs, &hsn, names, ids, n_ext, meta_size, ntx_session_adv_port(s), "ntx/" NTX_VERSION);
     if (!hsn) return;
     uint8_t wire[261];
     size_t wn = ntx_ext_msg_build(wire, sizeof(wire), 0, hs, hsn);

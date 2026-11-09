@@ -39,6 +39,8 @@
 #include "../src/proto/ntx_tracker.c"
 #include "../src/proto/ntx_http.c"
 
+#include "../src/proto/ntx_share_trackers.c"
+
 static int fail(const char *m) {
     printf("FAIL %s\n", m);
     return 1;

@@ -71,6 +71,14 @@
 #include "../src/proto/ntx_utmeta.c"
 #include "../src/proto/ntx_pe_vc.c"
 
+#include "../src/core/ntx_share.c"
+#include "../src/core/ntx_share_meta.c"
+#include "../src/core/ntx_share_out.c"
+#include "../src/core/ntx_session_priv.c"
+#include "../src/core/ntx_session_portmap.c"
+#include "../src/proto/ntx_share_trackers.c"
+#include "../src/proto/ntx_pcp.c"
+
 /* Security audit: a peer must not be able to write block data it was never asked for, overwrite a
  * piece we already verified, or write outside the piece.  The wire path (PIECE message) only accepts
  * blocks that match an outstanding request; ntx_session_data_on_piece additionally refuses

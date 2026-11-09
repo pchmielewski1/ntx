@@ -79,6 +79,8 @@ void ntx_session_free(ntx_session *s) {
      * into the freed session (mirrors the peer-slot teardown below). */
     if (s->netx) ntx_netx_timer_cancel(s->netx, tick_wrapper, s);
     if (s->cfg && s->cfg->dht) ntx_dht_stop();
+    ntx_session_portmap_stop(s); /* lifetime 0 for live mappings, bounded */
+    ntx_session_share_free(s);
     ntx_session_trk_free(s);
     for (int pi = 0; pi < NTX_SESSION_MAX_PEERS; pi++) {
         int fd = s->peers[pi].fd;
@@ -281,6 +283,7 @@ int ntx_session_add_torrent_file(ntx_session *s, const char *path) {
 
 void ntx_session_remove(ntx_session *s, int i) {
     if (i < 0 || i >= NTX_SESSION_MAX_TTS) return;
+    ntx_session_share_on_remove(s, i); /* drops the slot and its queued events before trk_stop */
     ntx_torrent *t = &s->tts[i];
     if (t->state != NTX_TTS_DEAD) ntx_session_trk_stop(s, i);
     ntx_store_close(&t->store);
@@ -362,6 +365,8 @@ void ntx_session_tick(struct ntx_session *s) {
     ntx_session_peer_hs_tick(s);
     ntx_session_data_tick(s);
     ntx_session_data_verify_tick(s);
+    ntx_session_share_tick(s);
+    ntx_session_portmap_tick(s);
     if ((s->tick_n % 10) == 0) {
         /* Ring rotate stays in the UI path (ntx_main) only — dual rotate zeroed B/s. */
         ntx_session_stats_refresh(s, 0);

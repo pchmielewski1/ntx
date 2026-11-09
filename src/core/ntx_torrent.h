@@ -53,6 +53,7 @@ typedef struct ntx_torrent {
     uint8_t info_hash_v2[32]; /* sha256(info); zero if v1 */
     uint8_t meta_version; /* 0 = v1, 2 = v2/hybrid */
     uint8_t hybrid; /* 1 if metainfo carries both v1 and v2 fields */
+    uint8_t priv;   /* BEP27: non-zero "private" in info — tracker-only peers (design §4) */
     uint8_t *piece_layer; /* v2: concatenated per-file piece layers */
     size_t piece_layer_n; /* == np_total*32 for v2 verify layout */
     uint8_t layers_stall; /* pure-v2 layer acquisition stalled (bounded, not a meta loop) */

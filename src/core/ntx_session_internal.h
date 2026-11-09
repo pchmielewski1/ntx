@@ -10,8 +10,15 @@
 #include "ntx_pex_tx.h"
 #include "ntx_dial_bo.h"
 #include "ntx_hash_msg.h"
+#include "ntx_share.h"
+#include "ntx_session_portmap.h"
 
 enum { PH_PE = 0, PH_BTHS = 1, PH_OK = 2 };
+
+/* Opaque per-slot share state (ntx_share.c) and the port-mapping driver
+ * (ntx_session_portmap.c); both own their definitions. */
+struct ntx_share_slot;
+struct ntx_portmap;
 
 /* A route_connect result is a live connection when it is a real socket fd
  * (>= 0) OR a virt fd issued by the uTP glue (<= -NTX_UTP_VIRT_BASE). The raw
@@ -164,7 +171,24 @@ struct ntx_session {
      * punch_ok/punch_fail metrics. */
     uint32_t hp_rx_rendezvous, hp_rx_connect, hp_rx_error;
     uint32_t hp_dial_ok, hp_dial_fail, hp_race_dropped;
+
+    /* --share (design §5, §7, §8): per-slot share state, strict-MSE slots,
+     * inbound-promotion counter, per-tracker pin failures, peer origin for
+     * BEP 27, and the port-mapping driver. */
+    struct ntx_share_slot *share[NTX_SESSION_MAX_TTS];
+    uint8_t tts_enc_strict[NTX_SESSION_MAX_TTS];
+    uint16_t tts_in_ok[NTX_SESSION_MAX_TTS];
+    uint8_t trk_pin_fail[NTX_SESSION_MAX_TTS][NTX_SESSION_MAX_TRK];
+    uint8_t trk_started_ok[NTX_SESSION_MAX_TTS];
+    uint8_t peer_src[NTX_SESSION_MAX_PEERS];
+    struct ntx_portmap *pm;
 };
+
+/* Peer origin, recorded at slot allocation (bodies in ntx_session_priv.c, stream B). */
+enum { NTX_PSRC_NONE = 0, NTX_PSRC_TRACKER, NTX_PSRC_DHT, NTX_PSRC_PEX, NTX_PSRC_HOLEPUNCH, NTX_PSRC_INBOUND };
+int sp_dht_allowed(const struct ntx_session *s, int ti);
+int sp_ext_allowed(const struct ntx_session *s, int ti, int ext_local_id);
+int sp_dial_allowed(const struct ntx_session *s, int ti, uint8_t src);
 void ntx_session_tick(struct ntx_session *s);
 int ntx_session_peer_alloc(struct ntx_session *s, int fd, const ntx_addr *addr, uint16_t port, int tts_idx);
 void ntx_session_peer_free(struct ntx_session *s, int pi);

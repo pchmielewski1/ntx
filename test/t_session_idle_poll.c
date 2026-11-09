@@ -71,6 +71,14 @@
 #include "../src/proto/ntx_utmeta.c"
 #include "../src/proto/ntx_pe_vc.c"
 
+#include "../src/core/ntx_share.c"
+#include "../src/core/ntx_share_meta.c"
+#include "../src/core/ntx_share_out.c"
+#include "../src/core/ntx_session_priv.c"
+#include "../src/core/ntx_session_portmap.c"
+#include "../src/proto/ntx_share_trackers.c"
+#include "../src/proto/ntx_pcp.c"
+
 /* sp_peer_ok_poll is the second read path for established peers.  It used to read without refreshing the
  * idle clock, so a peer that only ever delivered data through it was dropped as "idle" after 300 s. */
 

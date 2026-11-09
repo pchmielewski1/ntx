@@ -30,6 +30,7 @@ typedef struct {
     int allow_local_peers; /* dial loopback / link-local / multicast peers too (--allow-local-peers); default off */
     int https_tofu; /* HTTPS SPKI TOFU pinning (default on; --no-https-tofu) */
     const char *https_pin_file; /* optional SPKI pin file (--https-pin-file=PATH) */
+    int port_map;   /* --port-map=1, --no-port-map=-1, auto=0 (design §8) */
 } ntx_config;
 
 #endif

@@ -26,6 +26,8 @@
 #include "../src/proto/ntx_bencode.c"
 #include "../src/ui/ntx_diag.c"
 
+#include "../src/proto/ntx_share_trackers.c"
+
 static int g_fail;
 
 static void expect(const char *name, int ok) {

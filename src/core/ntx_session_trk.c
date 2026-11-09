@@ -194,7 +194,7 @@ static void trk_send_announce_one(struct ntx_session *s, int tts_idx, int trk_id
     ntx_tracker_udp_announce_build(req, s->trk_conn_id[tts_idx][trk_idx], tid,
                                    t->info_hash, s->peer_id, s->tts_down[tts_idx],
                                    trk_left(t), s->tts_up[tts_idx], event, s->trk_key,
-                                   ntx_netx_port(s->netx));
+                                   ntx_session_adv_port(s));
     trk_store_pending(s, tid, tts_idx, trk_idx, ip, port);
     trk_sendto_ip(s, ip, port, req, 98);
 }
@@ -253,7 +253,7 @@ static void trk_http_announce(struct ntx_session *s, int tts_idx, int trk_idx, c
     static uint8_t tracker_id[8];
     char full[1600];
     size_t fn = ntx_tracker_http_url_build(full, sizeof full, url, t->info_hash, s->peer_id,
-                                           ntx_netx_port(s->netx), s->tts_up[tts_idx],
+                                           ntx_session_adv_port(s), s->tts_up[tts_idx],
                                            s->tts_down[tts_idx], trk_left(t), event,
                                            tracker_id, s->trk_key);
     if (!fn) {

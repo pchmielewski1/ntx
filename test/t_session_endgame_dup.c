@@ -74,6 +74,14 @@
 #include "../src/proto/ntx_utmeta.c"
 #include "../src/proto/ntx_pe_vc.c"
 
+#include "../src/core/ntx_share.c"
+#include "../src/core/ntx_share_meta.c"
+#include "../src/core/ntx_share_out.c"
+#include "../src/core/ntx_session_priv.c"
+#include "../src/core/ntx_session_portmap.c"
+#include "../src/proto/ntx_share_trackers.c"
+#include "../src/proto/ntx_pcp.c"
+
 /* Endgame: once every wanted block is already requested from some peer, an idle peer that has the data
  * asks for the stalest outstanding blocks too (at most one extra copy each), and the first copy to
  * arrive cancels the others.  Without it the last percent waits for the slowest peer's timeout. */

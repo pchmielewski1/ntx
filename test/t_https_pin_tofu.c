@@ -43,6 +43,8 @@
 #include "../src/proto/ntx_https.c"
 #include "../src/proto/ntx_https_pin.c"
 
+#include "../src/proto/ntx_share_trackers.c"
+
 #define A1_HOST "127.0.0.2" /* H — outside the built-in pool (127.0.0.1) */
 
 static int fail(const char *m) {

@@ -6,6 +6,10 @@
 
 #include "ntx_bencode.h"
 
+/* ntx_http_get / ntx_http_get_range: -2 = the pinned SPKI did not match (share
+ * trackers never fall back to TOFU); other negatives are the usual transport errors. */
+#define NTX_HTTP_E_PIN (-2)
+
 int ntx_http_get(const char *url, uint8_t *out, size_t cap, size_t *out_n);
 int ntx_http_get_range(const char *url, uint64_t off, uint64_t len, uint8_t *out, size_t cap, size_t *out_n);
 void ntx_http_set_proxy(const char *host, uint16_t port);

@@ -22,6 +22,11 @@ typedef struct {
     uint8_t meta_version;   /* 0 = v1, 2 = v2/hybrid metainfo */
     uint8_t hybrid;         /* 1 = metainfo carries v1 + v2 */
     uint8_t layers_pending; /* 1 = pure-v2 awaiting piece layers (22) */
+    /* --share (design §10, §11): BEP27 slot, share state (1 = HASHING..READY,
+     * 2 = FAILED), strict-MSE slot, trackers rejected on a pin miss, and the
+     * count of inbound connections promoted on this slot. */
+    uint8_t priv, share, enc_strict;
+    uint16_t trk_pin_fail, in_ok;
 } ntx_tts_stat;
 
 typedef struct {
@@ -45,6 +50,9 @@ typedef struct {
     uint16_t utp_conns; /* active uTP connections */
     uint64_t demux_dht, demux_utp, demux_drop; /* shared-sock classifier (ntx_netx) */
     uint32_t punch_ok, punch_fail;             /* BEP55 dial initiated / dial refused */
+    /* Port mapping for shares (design §8, §11): ntx_pm_state and the mapped TCP port. */
+    uint8_t port_map;
+    uint16_t ext_port;
 } ntx_stats;
 
 /* Implemented in ui/ntx_stats.c: ntx_stats_to_json */

@@ -26,6 +26,8 @@
 #include "../src/proto/ntx_https.c"
 #include "../src/proto/ntx_https_pin.c"
 
+#include "../src/proto/ntx_share_trackers.c"
+
 static int fail(const char *m) {
     printf("FAIL %s\n", m);
     return 1;

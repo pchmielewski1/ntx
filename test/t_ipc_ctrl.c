@@ -75,6 +75,14 @@
    own entry point. Production builds compile ntx_main.c without this macro. */
 #define NTX_NO_MAIN
 #include "../src/ntx_main.c"
+
+#include "../src/core/ntx_share.c"
+#include "../src/core/ntx_share_meta.c"
+#include "../src/core/ntx_share_out.c"
+#include "../src/core/ntx_session_priv.c"
+#include "../src/core/ntx_session_portmap.c"
+#include "../src/proto/ntx_share_trackers.c"
+#include "../src/proto/ntx_pcp.c"
 #undef NTX_NO_MAIN
 
 #include <stdio.h>

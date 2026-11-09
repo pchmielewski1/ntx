@@ -40,6 +40,8 @@
 #include "../src/proto/ntx_tracker.c"
 #include "../src/proto/ntx_http.c"
 
+#include "../src/proto/ntx_share_trackers.c"
+
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0x4000
 #endif

@@ -36,6 +36,8 @@
 #include "../src/proto/ntx_https.c"
 #include "../src/proto/ntx_https_pin.c"
 
+#include "../src/proto/ntx_share_trackers.c"
+
 _Static_assert(sizeof(ntx_tofu_rec) == 164, "tofu rec layout");
 
 static int fail(const char *m) {
