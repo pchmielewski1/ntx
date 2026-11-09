@@ -1,0 +1,14 @@
+# ntx --share metainfo fixture (test/scripts/share_gen.py)
+fixture: one_piece_16k
+name: one_piece_16k.bin
+size: 16384
+ps: 16384
+np: 1
+has_layers: 0
+salt: 00112233445566778899aabbccddeeff
+creation_date: 1700000000
+created_by: ntx/0.1.0
+ih_sha1: f28446e31cb1bb9bffc87bd1d3126ff7317afd09
+ih_sha256: beaed69c4ffe8cd5de44476db861f81d3e64516ca7df02310f5a9bd0badb0ff9
+root: 852a23120ddc21e39421f5061f08260e9aebaea76df6405058f52703f2139917
+pieces_sha1: 164951379342c649956709705669c71869c9a543

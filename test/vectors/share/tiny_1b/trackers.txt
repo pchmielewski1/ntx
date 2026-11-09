@@ -1,0 +1,2 @@
+https://tracker-one.test/announce
+https://tracker-two.test/announce
