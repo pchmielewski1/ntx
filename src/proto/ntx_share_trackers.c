@@ -44,15 +44,23 @@ static int strk_builtin_n = -1; /* -1 = hex not decoded yet */
 static const ntx_share_tracker *strk_test; /* test override, see test_set */
 static int strk_test_n, strk_test_on;
 
+/* hex → bin, shape mirrors hex_nibble/hex_to_bin in ntx_https_pin.c: the length
+ * is validated once, before the 32 bytes are decoded. strk_ prefix is required —
+ * the unity tests include both files into one translation unit. */
+static int strk_hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 static int strk_hex32(uint8_t out[32], const char *hex) {
-    int i;
-    if (!hex) return -1;
+    size_t i;
+    if (!hex || strlen(hex) != 2 * 32) return -1; /* exactly 64 hex chars */
     for (i = 0; i < 32; i++) {
-        int hi = (uint8_t)hex[2 * i], lo = (uint8_t)hex[2 * i + 1], h, l;
-        h = (hi >= '0' && hi <= '9') ? hi - '0' : (hi | 0x20) - 'a' + 10;
-        l = (lo >= '0' && lo <= '9') ? lo - '0' : (lo | 0x20) - 'a' + 10;
-        if (h < 0 || h > 15 || l < 0 || l > 15 || hex[2 * i + 2] != 0) return -1;
-        out[i] = (uint8_t)((h << 4) | l);
+        int hi = strk_hex_nibble(hex[2 * i]), lo = strk_hex_nibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[i] = (uint8_t)((hi << 4) | lo);
     }
     return 0;
 }

@@ -77,9 +77,12 @@
 #include "../src/proto/ntx_share_trackers.c"
 #include "../src/proto/ntx_pcp.c"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 static int fail(const char *name) {
     fprintf(stderr, "FAIL %s\n", name);
@@ -89,12 +92,19 @@ static int fail(const char *name) {
 int main(void) {
     ntx_config cfg;
     memset(&cfg, 0, sizeof cfg);
-    cfg.store_dir = "downloads";
+    /* Keep the test out of the tree root and off the network: dht = 0 means
+     * ntx_session_init never calls ntx_dht_start (no bootstrap, no
+     * downloads/ntx_dht_state). It also gives sp_dht_allowed its cfg.dht == 0
+     * case below. store_dir stays under test/.scratch/ (gitignored) so a stray
+     * write can never land next to the binary. */
+    cfg.store_dir = "test/.scratch/share_contract";
+    if (mkdir("test/.scratch", 0755) != 0 && errno != EEXIST) fail("scratch_dir");
+    if (mkdir("test/.scratch/share_contract", 0755) != 0 && errno != EEXIST) fail("store_dir");
     cfg.port_lo = 6881;
     cfg.port_hi = 6891;
     cfg.max_peers = 50;
     cfg.allow_local_peers = 1;
-    cfg.dht = 1;
+    cfg.dht = 0;
 
     ntx_netx *n = ntx_netx_init(&cfg);
     if (!n) fail("netx_init");
@@ -105,12 +115,22 @@ int main(void) {
     if (ntx_session_adv_port(s) != ntx_netx_port(s->netx)) fail("adv_port");
     if (ntx_session_portmap_state(s) != NTX_PM_OFF) fail("pm_state");
 
-    /* Policy hooks are permissive while stream B has no bodies. */
-    if (sp_dht_allowed(s, 0) != (cfg.dht != 0)) fail("sp_dht");
+    /* Policy hooks are permissive while stream B has no bodies. cfg.dht is 0 by
+     * default (offline rule above), so exercise both sides of == (cfg.dht != 0):
+     * s->cfg aliases this cfg (ntx_session_init stores the pointer), so flipping
+     * it is visible to the hook and restored right after. */
+    if (sp_dht_allowed(s, 0) != (cfg.dht != 0)) fail("sp_dht_off");
+    cfg.dht = 1;
+    if (sp_dht_allowed(s, 0) != (cfg.dht != 0)) fail("sp_dht_on");
+    cfg.dht = 0;
     if (sp_ext_allowed(s, 0, NTX_EXT_LOCAL_PEX) != 1) fail("sp_ext_pex");
     if (sp_ext_allowed(s, 0, NTX_EXT_LOCAL_HOLEPUNCH) != 1) fail("sp_ext_hp");
     if (sp_dial_allowed(s, 0, NTX_PSRC_PEX) != 1) fail("sp_dial_pex");
     if (sp_dial_allowed(s, 0, NTX_PSRC_INBOUND) != 1) fail("sp_dial_in");
+    /* ti == -1 (peer_tts[pi] before the handshake match) must be *allowed*, never
+     * used as an index: pin it so B1's body cannot read s->tts_*[-1] silently. */
+    if (sp_ext_allowed(s, -1, NTX_EXT_LOCAL_PEX) != 1) fail("sp_ext_pex_ti_neg");
+    if (sp_dial_allowed(s, -1, NTX_PSRC_DHT) != 1) fail("sp_dial_dht_ti_neg");
     if (ntx_session_share_state(s, 0) != NTX_SHARE_NONE) fail("share_none");
     if (ntx_session_share_serving(s, 0) != 1) fail("serving_none");
     if (ntx_session_share_pct(s, 0) != 0) fail("pct_none");
@@ -158,6 +178,34 @@ int main(void) {
         e != NTX_SHARE_E_BAD_ARG)
         fail("add_bad_arg");
     ntx_share_trackers_test_set(NULL, -1); /* built-in list restored */
+
+    /* The built-in list IS the Task 0 survey (7 hosts, docs/network.md) and the
+     * hex decoder must accept it: the fail-closed truncation in strk_builtin_init
+     * means a rejected pin drops every row from that point on. */
+    if (ntx_share_tracker_count() != 7) fail("builtin_count");
+    if (!ntx_share_available()) fail("builtin_gate");
+    printf("builtin count=%d available=%d\n", ntx_share_tracker_count(), ntx_share_available());
+    if (!ntx_share_tracker_get(6) || !ntx_share_tracker_get(6)->npins) fail("builtin_row6");
+    {
+        uint8_t pin[32];
+        /* strk_hex32 is visible here: this test includes ntx_share_trackers.c. */
+        if (strk_hex32(pin, "2f7626b32aeffb4442ce9253fd9fffbe037408da90e6f2bbc7d89a77b16cc5f2") != 0)
+            fail("hex32_valid");
+        if (pin[0] != 0x2f || pin[1] != 0x76 || pin[31] != 0xf2) fail("hex32_bytes");
+        if (strk_hex32(pin, "2F7626B32AEFFB4442CE9253FD9FFFBE037408DA90E6F2BBC7D89A77B16CC5F2") != 0)
+            fail("hex32_upper");
+        if (pin[0] != 0x2f || pin[31] != 0xf2) fail("hex32_upper_bytes");
+        if (strk_hex32(pin, "2f7626b32aeffb4442ce9253fd9fffbe037408da90e6f2bbc7d89a77b16cc5f") == 0)
+            fail("hex32_63"); /* 63 chars */
+        if (strk_hex32(pin, "2f7626b32aeffb4442ce9253fd9fffbe037408da90e6f2bbc7d89a77b16cc5f2a") == 0)
+            fail("hex32_65"); /* 65 chars */
+        if (strk_hex32(pin, "zz7626b32aeffb4442ce9253fd9fffbe037408da90e6f2bbc7d89a77b16cc5f2") == 0)
+            fail("hex32_nonhex");
+        if (strk_hex32(pin, "") == 0) fail("hex32_empty");
+        if (strk_hex32(pin, "ab") == 0) fail("hex32_ab");
+        if (strk_hex32(pin, "2f") == 0) fail("hex32_2f");
+        if (strk_hex32(pin, NULL) == 0) fail("hex32_null");
+    }
 
     /* stats_refresh must publish the stub values (ntx_pm_state / no ext port). */
     ntx_session_add_magnet(s, "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=T");
