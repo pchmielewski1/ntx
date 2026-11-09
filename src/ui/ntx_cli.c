@@ -3,6 +3,9 @@
 
 #include "../core/ntx_torrent.h"
 
+struct ntx_session; /* fwd decl: the portmap header declares session fns but does not forward-declare */
+#include "../core/ntx_session_portmap.h" /* NTX_PM_* == ntx_stats.port_map (design §8, §11) */
+
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -119,15 +122,47 @@ static void cli_flags_compact(const ntx_stats *st, const ntx_tts_stat *t, char *
     if (st && (st->punch_ok || st->punch_fail))
         snprintf(punch, sizeof punch, " punch%u/%u", st->punch_ok > 99 ? 99u : (unsigned)st->punch_ok,
                  st->punch_fail > 99 ? 99u : (unsigned)st->punch_fail);
+    /* Design §10 tags: appended after every existing tag so the §10 tail
+     * truncation drops them first. pin!/in cap at 99 like the peer counters,
+     * which is what keeps the all-max line inside CLI_MAX_LINE. */
+    char prv[8] = "", shr[8] = "", enc[8] = "", pin[16] = "", map[16] = "", inn[8] = "";
+    if (t->priv) snprintf(prv, sizeof prv, " prv");
+    if (t->share) snprintf(shr, sizeof shr, " shr%s", t->share == 2 ? "!" : "");
+    if (t->enc_strict) snprintf(enc, sizeof enc, " enc!");
+    if (t->trk_pin_fail)
+        snprintf(pin, sizeof pin, " pin!%u", t->trk_pin_fail > 99 ? 99u : (unsigned)t->trk_pin_fail);
+    if (st && st->port_map == NTX_PM_ACTIVE)
+        snprintf(map, sizeof map, " map:%u", st->ext_port);
+    else if (st && st->port_map == NTX_PM_CGNAT)
+        snprintf(map, sizeof map, " map!cg");
+    else if (st && st->port_map != NTX_PM_OFF)
+        snprintf(map, sizeof map, " map-"); /* PENDING = no gateway answer yet */
+    if (t->share)
+        snprintf(inn, sizeof inn, " in%u", t->in_ok > 99 ? 99u : (unsigned)t->in_ok);
     if (t->meta_need > 0) {
         unsigned mg = t->meta_got > 99 ? 99 : t->meta_got;
         unsigned mn = t->meta_need > 99 ? 99 : t->meta_need;
-        snprintf(out, cap, " trk%02u/%02up%02u%s pe%02u/%02u/%02uu%02ui%02u m%02u/%02u%s%s%s%s", tu, tt, tp,
-                 dead, a, h, o, u, ii, mg, mn, v2, dns, utp, punch);
+        snprintf(out, cap,
+                 " trk%02u/%02up%02u%s pe%02u/%02u/%02uu%02ui%02u m%02u/%02u%s%s%s%s%s%s%s%s%s%s",
+                 tu, tt, tp, dead, a, h, o, u, ii, mg, mn, v2, dns, utp, punch, prv, shr, enc, pin,
+                 map, inn);
     } else {
-        snprintf(out, cap, " trk%02u/%02up%02u%s pe%02u/%02u/%02uu%02ui%02u%s%s%s%s", tu, tt, tp, dead, a, h, o,
-                 u, ii, v2, dns, utp, punch);
+        snprintf(out, cap,
+                 " trk%02u/%02up%02u%s pe%02u/%02u/%02uu%02ui%02u%s%s%s%s%s%s%s%s%s%s", tu, tt, tp,
+                 dead, a, h, o, u, ii, v2, dns, utp, punch, prv, shr, enc, pin, map, inn);
     }
+}
+
+/* Design §10: the whole line stays inside CLI_MAX_LINE. Tags are the tail of
+ * the flags list, so over-long lines lose them from the end — cut on a tag
+ * boundary, never torn mid-tag. */
+static void cli_cap_line(char *line, size_t want, size_t cap) {
+    size_t lim = cap - 1 < CLI_MAX_LINE ? cap - 1 : CLI_MAX_LINE;
+    if (want <= lim) return;
+    line[lim] = 0;
+    while (lim > 0 && line[lim - 1] != ' ') lim--;
+    if (lim) line[--lim] = 0;
+    while (lim > 0 && line[lim - 1] == ' ') line[--lim] = 0;
 }
 
 static void cli_trim_to_width(char *line, int cols) {
@@ -141,7 +176,7 @@ static void cli_trim_to_width(char *line, int cols) {
     }
 }
 
-size_t ntx_cli_status_format(const ntx_stats *st, char *out, size_t cap) {
+static size_t cli_status_raw(const ntx_stats *st, char *out, size_t cap) {
     if (!st || !out || cap == 0) return 0;
 
     if (st->n <= 0) {
@@ -151,12 +186,17 @@ size_t ntx_cli_status_format(const ntx_stats *st, char *out, size_t cap) {
 
     const ntx_tts_stat *t = &st->t[0];
     char name[CLI_NAME_W + 4];
-    char flags[96]; /* staging room for trk/pe/m/v2/dns/utp/punch (line trimmed to CLI_MAX_LINE) */
+    /* Staging room for trk/pe/m/v2/dns/utp/punch + the §10 tags (worst case
+     * measured 110 B); the line is capped to CLI_MAX_LINE by cli_cap_line. */
+    char flags[128];
     cli_name_short(t->name, name, sizeof name);
     cli_flags_compact(st, t, flags, sizeof flags);
     const char *phase = t->phase[0] ? t->phase : "?";
 
-    if (t->state == NTX_TTS_META || (t->size == 0 && t->total == 0)) {
+    /* --share hashing rides the normal line so bar/pct show progress (§10);
+     * everything else without metadata keeps the META: rendering. */
+    if (strcmp(phase, "hash") != 0 &&
+        (t->state == NTX_TTS_META || (t->size == 0 && t->total == 0))) {
         return (size_t)snprintf(out, cap, "%-*s META:%-9s%s %3llus", CLI_NAME_W, name, phase, flags,
                                 (unsigned long long)st->uptime_s);
     }
@@ -196,6 +236,15 @@ size_t ntx_cli_status_format(const ntx_stats *st, char *out, size_t cap) {
                             "%-*s %3u%% %s  %6s/%-5s  v%-5s^%-5s %5s %4u/%-4u @%-4s%s", CLI_NAME_W,
                             name, (unsigned)t->pct, bar, dn, tot, spd_d, spd_u, eta,
                             (unsigned)t->done, (unsigned)t->total, phase, flags);
+}
+
+size_t ntx_cli_status_format(const ntx_stats *st, char *out, size_t cap) {
+    if (!st || !out || cap == 0) return 0;
+    /* raw returns the *would-be* length; the cap needs it, not the truncated
+     * strlen, to know how many tags did not fit. */
+    size_t want = cli_status_raw(st, out, cap);
+    if (cap > 1) cli_cap_line(out, want, cap);
+    return strlen(out);
 }
 
 void ntx_cli_status_update(const ntx_stats *st, FILE *fp, int *needs_nl) {
