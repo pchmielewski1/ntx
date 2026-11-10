@@ -127,8 +127,9 @@ static void cli_flags_compact(const ntx_stats *st, const ntx_tts_stat *t, char *
                  st->punch_fail > 99 ? 99u : (unsigned)st->punch_fail);
     /* Design §10 tags: appended after every existing tag so the §10 tail
      * truncation drops them first. pin!/in cap at 99 like the peer counters,
-     * so the widest §10 tail is 52 chars ("prv shr enc! pin!99 map:65535
-     * in99") — cli_cap_line trims it from the end when the rest leaves no room. */
+     * so the widest §10 tail is 36 chars with its leading spaces
+     * (" prv shr! enc! pin!99 map:65535 in99") — cli_cap_line trims it from
+     * the end when the rest leaves no room. */
     char prv[8] = "", shr[8] = "", enc[8] = "", pin[16] = "", map[16] = "", inn[8] = "";
     if (t->priv) snprintf(prv, sizeof prv, " prv");
     if (t->share) snprintf(shr, sizeof shr, " shr%s", t->share == 2 ? "!" : "");
