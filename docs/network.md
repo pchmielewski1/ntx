@@ -352,6 +352,19 @@ they explain the C1 results:
   shipped binary (see the C1 caveat at the head of this section). The workaround used for the C1
   column does not fix the client. See also `ntx_sock_resolve4` above, which has no such problem
   and is what UDP trackers use.
+- **Closed by Task B6 (commit `5d46511`), 2026-11-10.** `ntx_sock_resolve` now skips the `AAAA`
+  lookup unless `/proc/net/ipv6_route` holds a usable `::/0` default (one cached read; the route
+  must be `RTF_UP` with a metric other than `-1`, because networkd on this box installs an
+  unreachable `lo` default that otherwise reads as `::/0`). Re-measured with the shipped binary,
+  no AAAA stub, same machine — the C1 column above is now a real measurement for these two hosts:
+
+  ```
+  OK https://tracker.pmman.tech/announce peers_for_hash=2
+  OK https://tracker.nekomi.cn/announce peers_for_hash=2
+  ```
+
+  The same build before `5d46511` returned `FAIL … announce1: http/tls failure` for both. The
+  remaining C1 cells stay as measured with the stub; re-measure them at I1 with the fixed resolver.
 - **Bencode bodies terminated with `CRLF`.** opentracker-style servers end the announce
   dictionary with `e\r\n`. `ntx_be_parse` requires the input to be consumed exactly
   (`p.pos != n` → error), so `ntx_tracker_http_parse` answers "unrecognized response" and the
