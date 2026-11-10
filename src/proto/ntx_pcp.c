@@ -14,6 +14,8 @@
 #define PCP_MAP_DATA_LEN 36       /* §11.1 fig. 9 / fig. 10 */
 #define PCP_MAP_LEN (PCP_HDR_LEN + PCP_MAP_DATA_LEN)
 #define PCP_MAX_LEN 1100          /* §7: maximum UDP payload of a PCP message */
+#define PCP_NATPMP_OP_UDP 1       /* RFC 6886 §3.3 mapping opcodes */
+#define PCP_NATPMP_OP_TCP 2
 
 /* MAP opcode data offsets inside the 36 B following the common header:
  * nonce 12 | proto 1 + reserved 3 | internal port | assigned/suggested
@@ -129,8 +131,12 @@ int natpmp_parse_addr(const uint8_t *b, size_t n, uint8_t ext_ip[4]) {
 int natpmp_parse_map(const uint8_t *b, size_t n, uint8_t op, uint16_t int_port,
                      uint16_t *ext_port, uint32_t *lifetime)
 {
-    /* §3.3: Vers|OP|Result(16)|SSSE(32)|InternalPort|MappedPort|Lifetime(32) = 16 B. */
-    if (!b || !ext_port || !lifetime || n != 16 || b[0] != 0 || b[1] != 128 + op)
+    /* §3.3: Vers|OP|Result(16)|SSSE(32)|InternalPort|MappedPort|Lifetime(32) = 16 B.
+     * op is pinned to the two mapping opcodes; without the range check a caller
+     * passing op 3 would have 128 + 3 = 131 accepted as its own response. */
+    if (!b || !ext_port || !lifetime || n != 16 || b[0] != 0 ||
+        (op != PCP_NATPMP_OP_UDP && op != PCP_NATPMP_OP_TCP) ||
+        b[1] != (uint8_t)(128 + op))
         return -1;
     if (pcp_get16(b + 2) != PCP_RESULT_SUCCESS) return -1;
     if (pcp_get16(b + 8) != int_port) return -1;
@@ -140,8 +146,13 @@ int natpmp_parse_map(const uint8_t *b, size_t n, uint8_t op, uint16_t int_port,
 }
 
 int pcp_ip_is_cgnat_or_private(const uint8_t ip16[16]) {
-    /* Documented form is the on-wire one: IPv4 arrives IPv4-mapped. */
-    if (ip16[10] == 0xff && ip16[11] == 0xff) {
+    static const uint8_t zeros10[10] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    /* Documented form is the on-wire one: IPv4 arrives IPv4-mapped. All ten
+     * leading octets must be zero — testing only octets 10-11 would read the
+     * tail of a native IPv6 address (2001:db8::ffff:100.64.0.1, or a ULA like
+     * fd00::ffff:ffff:1) as if it were an IPv4 address. */
+    if (!memcmp(ip16, zeros10, 10) && ip16[10] == 0xff && ip16[11] == 0xff) {
         const uint8_t a = ip16[12], b = ip16[13];
         if (a == 10) return 1;                                   /* 10/8 */
         if (a == 172 && (b & 0xf0) == 16) return 1;              /* 172.16/12 */

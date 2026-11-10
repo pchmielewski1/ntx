@@ -1,6 +1,6 @@
 {
  "bin": "test/vectors/pcp/pcp.bin",
- "bin_sha256": "ec64d262deb14409a081257b1a7407f8576ce1a73fe341c45a896cd3fa4ef04a",
+ "bin_sha256": "c71d94301deb30a42efc4757623e4afe93f8b3d2f27e6595d3862b3ce93de7ef",
  "cases": [
   {
    "client_ip": "00000000000000000000ffffc0a8010a",
@@ -629,6 +629,36 @@
    "result": 0
   },
   {
+   "epoch": 86400,
+   "expect": -1,
+   "ext_port": -1,
+   "hex": "00830000000151801ae19cbb00001c20",
+   "int_port": 6881,
+   "kind": "parse_natpmp_map",
+   "len": 16,
+   "lifetime": -1,
+   "name": "natpmp_map_resp_op3",
+   "note": "op 3 is outside the contract (1 udp / 2 tcp), even with a matching OP 131",
+   "off": 4515,
+   "op": 3,
+   "result": 0
+  },
+  {
+   "epoch": 86400,
+   "expect": -1,
+   "ext_port": -1,
+   "hex": "00800000000151801ae19cbb00001c20",
+   "int_port": 6881,
+   "kind": "parse_natpmp_map",
+   "len": 16,
+   "lifetime": -1,
+   "name": "natpmp_map_resp_op0",
+   "note": "op 0 is the address opcode, not a mapping (RFC 6886 \u00a73.3)",
+   "off": 4531,
+   "op": 0,
+   "result": 0
+  },
+  {
    "addr": "::ffff:100.64.0.1",
    "expect": 1,
    "hex": "00000000000000000000ffff64400001",
@@ -636,7 +666,7 @@
    "len": 16,
    "name": "cgnat___ffff_100-64-0-1",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:100.64.0.1)",
-   "off": 4515
+   "off": 4547
   },
   {
    "addr": "::ffff:100.127.255.255",
@@ -646,7 +676,7 @@
    "len": 16,
    "name": "cgnat___ffff_100-127-255-255",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:100.127.255.255)",
-   "off": 4531
+   "off": 4563
   },
   {
    "addr": "::ffff:100.128.0.1",
@@ -656,7 +686,7 @@
    "len": 16,
    "name": "cgnat___ffff_100-128-0-1",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:100.128.0.1)",
-   "off": 4547
+   "off": 4579
   },
   {
    "addr": "::ffff:100.63.255.255",
@@ -666,7 +696,7 @@
    "len": 16,
    "name": "cgnat___ffff_100-63-255-255",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:100.63.255.255)",
-   "off": 4563
+   "off": 4595
   },
   {
    "addr": "::ffff:10.0.0.1",
@@ -676,7 +706,7 @@
    "len": 16,
    "name": "cgnat___ffff_10-0-0-1",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:10.0.0.1)",
-   "off": 4579
+   "off": 4611
   },
   {
    "addr": "::ffff:10.255.255.255",
@@ -686,7 +716,7 @@
    "len": 16,
    "name": "cgnat___ffff_10-255-255-255",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:10.255.255.255)",
-   "off": 4595
+   "off": 4627
   },
   {
    "addr": "::ffff:11.0.0.1",
@@ -696,7 +726,7 @@
    "len": 16,
    "name": "cgnat___ffff_11-0-0-1",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:11.0.0.1)",
-   "off": 4611
+   "off": 4643
   },
   {
    "addr": "::ffff:172.16.0.1",
@@ -706,7 +736,7 @@
    "len": 16,
    "name": "cgnat___ffff_172-16-0-1",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:172.16.0.1)",
-   "off": 4627
+   "off": 4659
   },
   {
    "addr": "::ffff:172.31.255.255",
@@ -716,7 +746,7 @@
    "len": 16,
    "name": "cgnat___ffff_172-31-255-255",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:172.31.255.255)",
-   "off": 4643
+   "off": 4675
   },
   {
    "addr": "::ffff:172.15.255.255",
@@ -726,7 +756,7 @@
    "len": 16,
    "name": "cgnat___ffff_172-15-255-255",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:172.15.255.255)",
-   "off": 4659
+   "off": 4691
   },
   {
    "addr": "::ffff:172.32.0.1",
@@ -736,7 +766,7 @@
    "len": 16,
    "name": "cgnat___ffff_172-32-0-1",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:172.32.0.1)",
-   "off": 4675
+   "off": 4707
   },
   {
    "addr": "::ffff:192.168.0.1",
@@ -746,7 +776,7 @@
    "len": 16,
    "name": "cgnat___ffff_192-168-0-1",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:192.168.0.1)",
-   "off": 4691
+   "off": 4723
   },
   {
    "addr": "::ffff:192.167.255.255",
@@ -756,7 +786,7 @@
    "len": 16,
    "name": "cgnat___ffff_192-167-255-255",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:192.167.255.255)",
-   "off": 4707
+   "off": 4739
   },
   {
    "addr": "::ffff:193.168.0.1",
@@ -766,7 +796,7 @@
    "len": 16,
    "name": "cgnat___ffff_193-168-0-1",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:193.168.0.1)",
-   "off": 4723
+   "off": 4755
   },
   {
    "addr": "::ffff:8.8.8.8",
@@ -776,7 +806,7 @@
    "len": 16,
    "name": "cgnat___ffff_8-8-8-8",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:8.8.8.8)",
-   "off": 4739
+   "off": 4771
   },
   {
    "addr": "::ffff:0.0.0.0",
@@ -786,7 +816,7 @@
    "len": 16,
    "name": "cgnat___ffff_0-0-0-0",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:0.0.0.0)",
-   "off": 4755
+   "off": 4787
   },
   {
    "addr": "::ffff:255.255.255.255",
@@ -796,7 +826,7 @@
    "len": 16,
    "name": "cgnat___ffff_255-255-255-255",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:255.255.255.255)",
-   "off": 4771
+   "off": 4803
   },
   {
    "addr": "fc00::1",
@@ -806,7 +836,7 @@
    "len": 16,
    "name": "cgnat_fc00__1",
    "note": "pcp_ip_is_cgnat_or_private(fc00::1)",
-   "off": 4787
+   "off": 4819
   },
   {
    "addr": "fdff::1",
@@ -816,7 +846,7 @@
    "len": 16,
    "name": "cgnat_fdff__1",
    "note": "pcp_ip_is_cgnat_or_private(fdff::1)",
-   "off": 4803
+   "off": 4835
   },
   {
    "addr": "fe00::1",
@@ -826,7 +856,7 @@
    "len": 16,
    "name": "cgnat_fe00__1",
    "note": "pcp_ip_is_cgnat_or_private(fe00::1)",
-   "off": 4819
+   "off": 4851
   },
   {
    "addr": "::1",
@@ -836,7 +866,7 @@
    "len": 16,
    "name": "cgnat___1",
    "note": "pcp_ip_is_cgnat_or_private(::1)",
-   "off": 4835
+   "off": 4867
   },
   {
    "addr": "2001:db8::1",
@@ -846,7 +876,7 @@
    "len": 16,
    "name": "cgnat_2001_db8__1",
    "note": "pcp_ip_is_cgnat_or_private(2001:db8::1)",
-   "off": 4851
+   "off": 4883
   },
   {
    "addr": "::",
@@ -856,7 +886,7 @@
    "len": 16,
    "name": "cgnat___",
    "note": "pcp_ip_is_cgnat_or_private(::)",
-   "off": 4867
+   "off": 4899
   },
   {
    "addr": "::ffff:169.254.1.1",
@@ -866,7 +896,7 @@
    "len": 16,
    "name": "cgnat___ffff_169-254-1-1",
    "note": "pcp_ip_is_cgnat_or_private(::ffff:169.254.1.1)",
-   "off": 4883
+   "off": 4915
   },
   {
    "addr": "::10.0.0.1",
@@ -876,7 +906,7 @@
    "len": 16,
    "name": "cgnat___10-0-0-1",
    "note": "pcp_ip_is_cgnat_or_private(::10.0.0.1)",
-   "off": 4899
+   "off": 4931
   },
   {
    "addr": "2001:db8::ff:ffff",
@@ -886,7 +916,7 @@
    "len": 16,
    "name": "cgnat_2001_db8__ff_ffff",
    "note": "pcp_ip_is_cgnat_or_private(2001:db8::ff:ffff)",
-   "off": 4915
+   "off": 4947
   },
   {
    "addr": "fd00::ffff:ffff",
@@ -896,10 +926,160 @@
    "len": 16,
    "name": "cgnat_fd00__ffff_ffff",
    "note": "pcp_ip_is_cgnat_or_private(fd00::ffff:ffff)",
-   "off": 4931
+   "off": 4963
+  },
+  {
+   "addr": "2002:a00:1::ffff:10.0.0.1",
+   "expect": 0,
+   "hex": "20020a00000100000000ffff0a000001",
+   "kind": "cgnat",
+   "len": 16,
+   "name": "cgnat_2002_a00_1__ffff_10-0-0-1",
+   "note": "pcp_ip_is_cgnat_or_private(2002:a00:1::ffff:10.0.0.1)",
+   "off": 4979
+  },
+  {
+   "addr": "2001:db8::ffff:100.64.0.1",
+   "expect": 0,
+   "hex": "20010db8000000000000ffff64400001",
+   "kind": "cgnat",
+   "len": 16,
+   "name": "cgnat_2001_db8__ffff_100-64-0-1",
+   "note": "pcp_ip_is_cgnat_or_private(2001:db8::ffff:100.64.0.1)",
+   "off": 4995
+  },
+  {
+   "addr": "fe80::ffff:10.0.0.1",
+   "expect": 0,
+   "hex": "fe800000000000000000ffff0a000001",
+   "kind": "cgnat",
+   "len": 16,
+   "name": "cgnat_fe80__ffff_10-0-0-1",
+   "note": "pcp_ip_is_cgnat_or_private(fe80::ffff:10.0.0.1)",
+   "off": 5011
+  },
+  {
+   "addr": "64:ff9b::ffff:10.0.0.1",
+   "expect": 0,
+   "hex": "0064ff9b000000000000ffff0a000001",
+   "kind": "cgnat",
+   "len": 16,
+   "name": "cgnat_64_ff9b__ffff_10-0-0-1",
+   "note": "pcp_ip_is_cgnat_or_private(64:ff9b::ffff:10.0.0.1)",
+   "off": 5027
+  },
+  {
+   "addr": "fd00::ffff:ffff:1",
+   "expect": 1,
+   "hex": "fd000000000000000000ffffffff0001",
+   "kind": "cgnat",
+   "len": 16,
+   "name": "cgnat_fd00__ffff_ffff_1",
+   "note": "pcp_ip_is_cgnat_or_private(fd00::ffff:ffff:1)",
+   "off": 5043
+  },
+  {
+   "addr": "fc00::ffff:8.8.8.8",
+   "expect": 1,
+   "hex": "fc000000000000000000ffff08080808",
+   "kind": "cgnat",
+   "len": 16,
+   "name": "cgnat_fc00__ffff_8-8-8-8",
+   "note": "pcp_ip_is_cgnat_or_private(fc00::ffff:8.8.8.8)",
+   "off": 5059
+  },
+  {
+   "addr": "fdff::ffff:ffff:ffff",
+   "expect": 1,
+   "hex": "fdff0000000000000000ffffffffffff",
+   "kind": "cgnat",
+   "len": 16,
+   "name": "cgnat_fdff__ffff_ffff_ffff",
+   "note": "pcp_ip_is_cgnat_or_private(fdff::ffff:ffff:ffff)",
+   "off": 5075
+  },
+  {
+   "addr": "fc00::",
+   "expect": 1,
+   "hex": "fc000000000000000000000000000000",
+   "kind": "cgnat",
+   "len": 16,
+   "name": "cgnat_fc00__",
+   "note": "pcp_ip_is_cgnat_or_private(fc00::)",
+   "off": 5091
+  },
+  {
+   "addr": "fe80::",
+   "expect": 0,
+   "hex": "fe800000000000000000000000000000",
+   "kind": "cgnat",
+   "len": 16,
+   "name": "cgnat_fe80__",
+   "note": "pcp_ip_is_cgnat_or_private(fe80::)",
+   "off": 5107
+  },
+  {
+   "addr": "2002::",
+   "expect": 0,
+   "hex": "20020000000000000000000000000000",
+   "kind": "cgnat",
+   "len": 16,
+   "name": "cgnat_2002__",
+   "note": "pcp_ip_is_cgnat_or_private(2002::)",
+   "off": 5123
+  },
+  {
+   "addr": "::ff:10.0.0.1",
+   "expect": 0,
+   "hex": "0000000000000000000000ff0a000001",
+   "kind": "cgnat",
+   "len": 16,
+   "name": "cgnat___ff_10-0-0-1",
+   "note": "pcp_ip_is_cgnat_or_private(::ff:10.0.0.1)",
+   "off": 5139
+  },
+  {
+   "addr": "::ff:100.64.0.1",
+   "expect": 0,
+   "hex": "0000000000000000000000ff64400001",
+   "kind": "cgnat",
+   "len": 16,
+   "name": "cgnat___ff_100-64-0-1",
+   "note": "pcp_ip_is_cgnat_or_private(::ff:100.64.0.1)",
+   "off": 5155
+  },
+  {
+   "addr": "::ff00:10.0.0.1",
+   "expect": 0,
+   "hex": "00000000000000000000ff000a000001",
+   "kind": "cgnat",
+   "len": 16,
+   "name": "cgnat___ff00_10-0-0-1",
+   "note": "pcp_ip_is_cgnat_or_private(::ff00:10.0.0.1)",
+   "off": 5171
+  },
+  {
+   "addr": "::1:ffff:a00:1",
+   "expect": 0,
+   "hex": "00000000000000000001ffff0a000001",
+   "kind": "cgnat",
+   "len": 16,
+   "name": "cgnat___1_ffff_a00_1",
+   "note": "pcp_ip_is_cgnat_or_private(::1:ffff:a00:1)",
+   "off": 5187
+  },
+  {
+   "addr": "::1:ffff:6440:1",
+   "expect": 0,
+   "hex": "00000000000000000001ffff64400001",
+   "kind": "cgnat",
+   "len": 16,
+   "name": "cgnat___1_ffff_6440_1",
+   "note": "pcp_ip_is_cgnat_or_private(::1:ffff:6440:1)",
+   "off": 5203
   }
  ],
- "count": 68,
+ "count": 85,
  "normative": "RFC 6887 \u00a77.1/\u00a77.2/\u00a77.4/\u00a711.1, RFC 6886 \u00a73.2/\u00a73.3",
  "task": "B4-pcp-natpmp-codec",
  "vectors": "pcp"

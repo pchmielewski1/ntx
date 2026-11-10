@@ -262,6 +262,21 @@ def cases():
                  NATPMP_INT_PORT, 0, 0,
                  "deletion ack: result 0, external port 0, lifetime 0 (RFC 6886 §3.4)", 0)
 
+    # Out-of-contract op: the contract pins op to 1 (udp) / 2 (tcp). A parser
+    # that only compares b[1] against 128 + op would accept OP 131 for op 3.
+    m = struct.pack(">BBH", 0, 131, 0) + struct.pack(">I", NATPMP_EPOCH)
+    m += struct.pack(">HHI", NATPMP_INT_PORT, NATPMP_EXT_PORT, NATPMP_LIFETIME)
+    add("natpmp_map_resp_op3", "parse_natpmp_map", m,
+        "op 3 is outside the contract (1 udp / 2 tcp), even with a matching OP 131",
+        op=3, int_port=NATPMP_INT_PORT, result=0, ext_port=-1, lifetime=-1,
+        epoch=NATPMP_EPOCH, expect=-1)
+    m = struct.pack(">BBH", 0, 128, 0) + struct.pack(">I", NATPMP_EPOCH)
+    m += struct.pack(">HHI", NATPMP_INT_PORT, NATPMP_EXT_PORT, NATPMP_LIFETIME)
+    add("natpmp_map_resp_op0", "parse_natpmp_map", m,
+        "op 0 is the address opcode, not a mapping (RFC 6886 §3.3)",
+        op=0, int_port=NATPMP_INT_PORT, result=0, ext_port=-1, lifetime=-1,
+        epoch=NATPMP_EPOCH, expect=-1)
+
     # --- CGNAT / private classifier on the 16-byte form -----------------
     for addr, expect in (
             ("::ffff:100.64.0.1", 1), ("::ffff:100.127.255.255", 1),
@@ -275,7 +290,30 @@ def cases():
             ("::ffff:255.255.255.255", 0), ("fc00::1", 1), ("fdff::1", 1),
             ("fe00::1", 0), ("::1", 0), ("2001:db8::1", 0), ("::", 0),
             ("::ffff:169.254.1.1", 0), ("::10.0.0.1", 0),
-            ("2001:db8::ff:ffff", 0), ("fd00::ffff:ffff", 1)):
+            ("2001:db8::ff:ffff", 0), ("fd00::ffff:ffff", 1),
+            # Native IPv6 whose octets 10-11 are ff ff, so a classifier that
+            # tests only those two octets reads the tail as an IPv4 address.
+            # Both failure directions must stay correct: the four below are
+            # public/native and must not be called private, and the fd/fc ones
+            # are ULA and must not be called public.
+            ("2002:a00:1::ffff:10.0.0.1", 0),      # 6to4, tail = 10/8
+            ("2001:db8::ffff:100.64.0.1", 0),      # doc prefix, tail = CGNAT
+            ("fe80::ffff:10.0.0.1", 0),             # link-local, tail = 10/8
+            ("64:ff9b::ffff:10.0.0.1", 0),          # NAT64 well-known, tail = 10/8
+            ("fd00::ffff:ffff:1", 1),                # ULA misread as 255.255.0.1
+            ("fc00::ffff:8.8.8.8", 1),               # ULA misread as 8.8.8.8
+            ("fdff::ffff:ffff:ffff", 1),             # top of fc00::/7, v4-shaped tail
+            ("fc00::", 1), ("fe80::", 0), ("2002::", 0),
+            # Ten leading zero octets but only ONE of octets 10/11 is 0xff: a
+            # malformed "mapped" address. Testing octet 11 alone takes the v4
+            # branch on the first two and calls them private; testing octet 10
+            # alone takes it on the third.
+            ("::ff:10.0.0.1", 0), ("::ff:100.64.0.1", 0),
+            ("::ff00:10.0.0.1", 0),
+            # Octet 9 is the last one that has to be zero: a native address
+            # with 01 there and a private-looking tail must not take the v4
+            # branch, so a 9-byte (not 10-byte) prefix check is caught too.
+            ("::1:ffff:a00:1", 0), ("::1:ffff:6440:1", 0)):
         add("cgnat_" + addr.replace(":", "_").replace(".", "-"), "cgnat",
             ipaddress.IPv6Address(addr).packed,
             "pcp_ip_is_cgnat_or_private(%s)" % addr, addr=addr, expect=expect)
@@ -285,6 +323,9 @@ def cases():
 
 def main():
     cs = cases()
+    names = [c["name"] for c in cs]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    assert not dupes, "duplicate case names: %s" % dupes
     blob = b"".join(bytes.fromhex(c["hex"]) for c in cs)
     off = 0
     for c in cs:

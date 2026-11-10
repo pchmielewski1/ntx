@@ -98,6 +98,33 @@ static int num_field(const gm *c, const char *k, int64_t *out) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Every case advertises both its position in the blob ("off") and its bytes
+ * ("hex"). Nothing else ties the two together — the whole-blob sha256 covers
+ * pcp.bin alone, so a meta whose hex no longer matches the bytes at off would
+ * still pass every parser check. Pin them together per case. */
+static void test_blob_hex(const gm *cases, const uint8_t *blob, size_t blobn) {
+    char tn[160];
+    for (size_t i = 0; i < cases->ne; i++) {
+        const gm *c = cases->el[i];
+        const char *name = "?", *hex = NULL;
+        int64_t off = -1, ln = -1;
+        if (str_field(c, "name", &name) != 0) name = "?";
+        if (str_field(c, "hex", &hex) != 0 || gm_num(gm_get(c, "off"), &off) != 0 ||
+            gm_num(gm_get(c, "len"), &ln) != 0 || off < 0 || ln < 0) {
+            tname(tn, sizeof tn, "blobhex", name);
+            check(0, tn);
+            continue;
+        }
+        uint8_t tmp[1152];
+        long hn = hexbytes(hex, tmp, sizeof tmp);
+        int ok = hn == (long)ln && (size_t)off + (size_t)ln <= blobn &&
+                 (ln == 0 || memcmp(blob + off, tmp, (size_t)ln) == 0);
+        tname(tn, sizeof tn, "blobhex", name);
+        check(ok, tn);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 static void test_builders(const gm *cases) {
     static const char *names[] = {
         "map_req_tcp", "map_req_udp_zero_sugg", "map_req_delete",
@@ -320,6 +347,7 @@ int main(void) {
     dighex[64] = 0;
     check(strcmp(dighex, want_sha) == 0, "bin-sha256");
 
+    test_blob_hex(cases, blob, mn);
     test_builders(cases);
     test_parse_pcp(cases);
     test_parse_natpmp(cases);

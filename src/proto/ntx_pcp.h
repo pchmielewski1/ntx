@@ -26,7 +26,10 @@ typedef struct { uint8_t result; uint32_t lifetime, epoch; uint16_t ext_port; ui
  * Strict per §8: the length ceiling and multiple, the R bit, the opcode, the nonce,
  * the protocol and the internal port must all match the request, and no byte past
  * n is read. Result codes other than 0 (success) and 1 are -1 — a mapping is only
- * what SUCCESS grants. On -1/-2 the contents of *r are unspecified. */
+ * what SUCCESS grants. On -1/-2 the contents of *r are unspecified.
+ * r->lifetime is the server's value VERBATIM, unclamped — RFC 6887 §8.3 wants
+ * the client to cap an absurd one, and that cap (with the renewal clock) is
+ * the session driver's job, so ntx_session_portmap.c must bound it before use. */
 int pcp_parse_map(const uint8_t *b, size_t n, const uint8_t nonce[12], uint8_t proto, uint16_t int_port,
                   ntx_pcp_map_resp *r);
 
@@ -35,7 +38,11 @@ size_t natpmp_build_addr(uint8_t out[2]);
 size_t natpmp_build_map(uint8_t out[12], uint8_t op /*1 udp, 2 tcp*/, uint16_t int_port, uint16_t sugg_port, uint32_t lifetime);
 
 /* Both return 0 on a well-formed matching response and -1 on anything else
- * (length, version, opcode, result code or internal-port mismatch). */
+ * (length, version, opcode, result code or internal-port mismatch);
+ * natpmp_parse_map also needs op to be 1 or 2.
+ * Lifetime is the server's value VERBATIM, unclamped — RFC 6887 §8.3 wants the
+ * client to cap an absurd one, and that cap (with the renewal clock) is the
+ * session driver's job, so ntx_session_portmap.c must bound it before use. */
 int natpmp_parse_addr(const uint8_t *b, size_t n, uint8_t ext_ip[4]);
 int natpmp_parse_map(const uint8_t *b, size_t n, uint8_t op, uint16_t int_port, uint16_t *ext_port, uint32_t *lifetime);
 
