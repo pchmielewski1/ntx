@@ -15,7 +15,10 @@
 /*
  * Weak stub so unit tests that #include ntx_sock.c without DoH/TLS still link.
  * Full binary + tests that include ntx_doh.c get the strong DoH implementation.
+ * A test that must drive the answers (test/t_sock_route4.c) defines
+ * NTX_SOCK_TEST_STRONG_DOH before the include and supplies its own pair.
  */
+#ifndef NTX_SOCK_TEST_STRONG_DOH
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((weak))
 #endif
@@ -38,6 +41,7 @@ int ntx_doh_lookup_aaaa(const char *host, uint8_t out[16]) {
     (void)out;
     return -1;
 }
+#endif /* !NTX_SOCK_TEST_STRONG_DOH */
 
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((weak)) unsigned ntx_doh_ok;
@@ -225,6 +229,64 @@ int ntx_sock_connect4(int fd, uint32_t ip_net, uint16_t port) {
     return ntx_sock_connect_addr(fd, &a, port);
 }
 
+/* AAAA is only useful if the host can actually send an IPv6 packet. /proc/net/
+ * ipv6_route is read once per process and the answer cached (no threads, no
+ * blocking network in the loop); a missing/unreadable file counts as "no
+ * route", which is also the answer on a kernel built without IPv6. */
+static const char *sock_route6_path = "/proc/net/ipv6_route";
+static int sock_route6_cached = -1;
+
+#define NTX_SOCK_RTF_UP 0x00000001u
+
+static int sock_v6_default_route(void) {
+    if (sock_route6_cached >= 0) return sock_route6_cached;
+    int ok = 0;
+    FILE *f = fopen(sock_route6_path, "r");
+    if (f) {
+        char line[256], dst[80], gw[80], src[80];
+        unsigned int dlen = 1, glen = 0, metric = 0, ref = 0, use = 0, flags = 0;
+        /* line = <dst> <dlen> <nexthop> <glen> <src> <metric> <refcnt> <use>
+         * <flags> <dev>; one sscanf per line, or the field offsets drift. */
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "%79s %x %79s %x %79s %x %x %x %x",
+                       dst, &dlen, gw, &glen, src, &metric, &ref, &use,
+                       &flags) != 9)
+                continue;
+            if (dlen != 0) continue; /* only ::/0 counts as usable IPv6 */
+            /* This host has a ::/0 line and still cannot send a packet: it is
+             * networkd's unreachable default on lo (flags 0x0200200, metric
+             * -1). ::/0 on its own would read as IPv6-capable on exactly the
+             * IPv4-only hosts this fallback exists for. */
+            if (!(flags & NTX_SOCK_RTF_UP) || metric == 0xFFFFFFFFu) continue;
+            int all_zero = dst[0] != '\0';
+            for (size_t i = 0; dst[i]; i++)
+                if (dst[i] != '0') {
+                    all_zero = 0;
+                    break;
+                }
+            if (all_zero) {
+                ok = 1;
+                break;
+            }
+        }
+        fclose(f);
+    }
+    sock_route6_cached = ok;
+    return ok;
+}
+
+/* Test hook: point the route probe at a fixture (NULL => the real file) and
+ * drop the cache, so both answers are reachable in one process. */
+void ntx_sock_test_set_route_file6(const char *path) {
+    sock_route6_path = path ? path : "/proc/net/ipv6_route";
+    sock_route6_cached = -1;
+}
+
+/* ponytail: single-shot family pick, not Happy Eyeballs — the AAAA is kept even
+ * if connecting to it then fails, because the callers (src/proto/ntx_http.c:76,
+ * :98, src/proto/ntx_https.c:81, src/proto/ntx_dht.c:152) resolve once and do
+ * not retry the other family. Upgrade path: connect-failure retry across
+ * families (RFC 8305 style) at those call sites. */
 int ntx_sock_resolve(const char *host, ntx_addr *out) {
     if (!host || !out) return -1;
     memset(out, 0, sizeof *out);
@@ -260,7 +322,7 @@ int ntx_sock_resolve(const char *host, ntx_addr *out) {
         return -1;
     }
     uint8_t v6[16];
-    if (ntx_doh_lookup_aaaa(host, v6) == 0) {
+    if (sock_v6_default_route() && ntx_doh_lookup_aaaa(host, v6) == 0) {
         out->family = NTX_AF_INET6;
         memcpy(out->u.v6, v6, 16);
         return 0;
