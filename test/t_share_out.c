@@ -14,9 +14,11 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -32,13 +34,27 @@ static void check(int cond, const char *name) {
     if (!cond) fails = 1;
 }
 
+/* Every magnet case that must fail: the header promises out is an empty string
+ * on failure, so poison it first and require both the rc and the cleared
+ * buffer. (NULL out / zero cap have nothing to clear, so only rc is checked.) */
+static void magnet_bad(const char *what, char *out, size_t cap, const uint8_t *ih, const uint8_t *ih2,
+                       const char *name, const char *const *trk, int ntrk) {
+    if (out && cap) out[0] = 'Z';
+    int rc = ntx_share_magnet(out, cap, ih, ih2, name, trk, ntrk);
+    check(rc != 0 && (!out || cap == 0 || out[0] == 0), what);
+}
+
 static int mkdir_scratch(void) {
     if (mkdir("test/.scratch", 0755) != 0 && errno != EEXIST) return -1;
     if (mkdir(OUTDIR, 0755) != 0 && errno != EEXIST) return -1;
     return 0;
 }
 
+/* On every failure *out is left NULL, so a caller that frees after a failed
+ * read can never free a stale pointer from an earlier call. */
 static int read_all(const char *path, uint8_t **out, size_t *out_n) {
+    *out = NULL;
+    *out_n = 0;
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
     struct stat st;
@@ -87,6 +103,23 @@ static int list_ours(char names[][256], size_t cap) {
     }
     closedir(d);
     return (int)n;
+}
+
+/* Entries of OUTDIR whose name contains ".tmp", whatever their prefix. The
+ * writer derives the tmp name from the torrent name, so a long name that is not
+ * so_-prefixed (the zzz… case below) leaves a tmp the so_ scan cannot see. */
+static int count_tmps(const char *except) {
+    DIR *d = opendir(OUTDIR);
+    if (!d) return -1;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (!strstr(de->d_name, ".tmp")) continue;
+        if (except && strcmp(de->d_name, except) == 0) continue;
+        n++;
+    }
+    closedir(d);
+    return n;
 }
 
 /* Independent UTF-8 check for the basename assertion (the writer's own helper
@@ -171,6 +204,12 @@ int main(void) {
 
     if (mkdir_scratch() != 0) { printf("FAIL scratch\n"); return 1; }
 
+    /* umask(000) for the whole run: open(...,0600) plus fchmod are the only
+     * thing that can produce the 0600 the writer promises, and a umask can only
+     * clear bits — at a permissive umask a mutant that drops both still shows
+     * 0600. With 000 the mode must come from the code under test. */
+    mode_t old_umask = umask(000);
+
     /* ---- magnet: the Review Focus 1 round trip ---- */
     {
         const char *name = "a b&c%d#e+\xC5\x82.bin";
@@ -206,20 +245,26 @@ int main(void) {
         check(strstr(mag, "dn=") == NULL, "magnet_no_dn_param");
         ntx_magnet m;
         check(ntx_magnet_parse(mag, &m) == 0 && m.has_name == 0 && m.n_trackers == 0, "magnet_no_name_parse");
-        check(ntx_share_magnet(NULL, sizeof mag, ih, ih2, "x", trk, 0) != 0, "magnet_null_out");
-        check(ntx_share_magnet(mag, 0, ih, ih2, "x", trk, 0) != 0, "magnet_zero_cap");
-        check(ntx_share_magnet(mag, sizeof mag, NULL, ih2, "x", trk, 0) != 0, "magnet_null_ih");
-        check(ntx_share_magnet(mag, sizeof mag, ih, NULL, "x", trk, 0) != 0, "magnet_null_ih2");
-        check(ntx_share_magnet(mag, sizeof mag, ih, ih2, NULL, trk, 0) != 0, "magnet_null_name");
-        check(ntx_share_magnet(mag, sizeof mag, ih, ih2, "x", NULL, 2) != 0, "magnet_null_trk");
-        check(ntx_share_magnet(mag, sizeof mag, ih, ih2, "x", trk, -1) != 0, "magnet_neg_ntrk");
+        magnet_bad("magnet_null_out", NULL, sizeof mag, ih, ih2, "x", trk, 0);
+        magnet_bad("magnet_zero_cap", mag, 0, ih, ih2, "x", trk, 0);
+        magnet_bad("magnet_null_ih", mag, sizeof mag, NULL, ih2, "x", trk, 0);
+        magnet_bad("magnet_null_ih2", mag, sizeof mag, ih, NULL, "x", trk, 0);
+        magnet_bad("magnet_null_name", mag, sizeof mag, ih, ih2, NULL, trk, 0);
+        magnet_bad("magnet_null_trk", mag, sizeof mag, ih, ih2, "x", NULL, 2);
+        magnet_bad("magnet_neg_ntrk", mag, sizeof mag, ih, ih2, "x", trk, -1);
         {
             const char *bad[1] = { NULL };
-            check(ntx_share_magnet(mag, sizeof mag, ih, ih2, "x", bad, 1) != 0, "magnet_null_trk_row");
+            magnet_bad("magnet_null_trk_row", mag, sizeof mag, ih, ih2, "x", bad, 1);
             const char *empty[1] = { "" };
-            check(ntx_share_magnet(mag, sizeof mag, ih, ih2, "x", empty, 1) != 0, "magnet_empty_trk");
+            magnet_bad("magnet_empty_trk", mag, sizeof mag, ih, ih2, "x", empty, 1);
         }
-        check(ntx_share_magnet(mag, 64, ih, ih2, "x", trk, 2) != 0, "magnet_too_small");
+        magnet_bad("magnet_too_small", mag, 64, ih, ih2, "x", trk, 2);
+        /* mid-output truncation must also leave the buffer empty, not a partial
+         * magnet that a caller could hand to a peer */
+        {
+            char tiny[80]; /* > "magnet:?xt=urn:btih:" + 40 hex, < the full URL */
+            magnet_bad("magnet_truncated_empty", tiny, sizeof tiny, ih, ih2, "x", trk, 2);
+        }
         /* The real share list must fit the contract buffer NTX_SHARE_MAGNET_MAX
          * even in the worst case: every built-in tracker plus a 511 B name whose
          * bytes are all percent-encoded. (The JSON event caps a magnet lower —
@@ -343,7 +388,9 @@ int main(void) {
         check(ntx_share_name_ok("\xf4\x90\x80\x80") == 0, "name_above_max");
         check(ntx_share_name_ok("\xe2\x82") == 0, "name_truncated");
         check(ntx_share_name_ok("\x80") == 0, "name_stray_cont");
-        check(ntx_share_name_ok("a\x00" "b") == 1, "name_stops_at_nul");
+        /* No embedded-NUL case: the API is NUL-terminated (const char *, strlen
+         * bounded by contract), and "a\0b" collapses to "a" at compile time, so
+         * such a check would only re-assert strlen. */
     }
 
     /* ---- atomic writer ---- */
@@ -371,6 +418,9 @@ int main(void) {
         }
         check(found, "write_file_exists");
         check(!tmp, "write_no_tmp_left");
+        /* prefix-independent tmp scan: a tmp derived from a non-so_ name is
+         * invisible to list_ours (see the zzz… case below) */
+        check(count_tmps(NULL) == 0, "write_first_no_tmp_any_prefix");
         check(read_all(path, &rb, &rn) == 0, "write_readback");
         check(rn == n && memcmp(rb, buf, n) == 0, "write_bytes_equal");
         free(rb);
@@ -508,6 +558,133 @@ int main(void) {
             struct stat st;
             check(stat(p, &st) == 0 && (st.st_mode & 0777) == 0600, "write_long_mode");
             check(strlen(strrchr(p, '/') + 1) <= 255, "write_long_basename_len");
+            /* the tmp of this case is named zzz…-<8hex>.to.tmp<pid>, which the
+             * so_ scan above cannot see — this is the prefix-independent scan */
+            check(count_tmps(NULL) == 0, "write_long_no_tmp_any_prefix");
+            unlink(p);
+        }
+
+        /* O_EXCL on the tmp: without it, a symlink planted at the tmp name is
+         * opened and the rename then moves the symlink onto the final path, so an
+         * attacker who can write the store dir silently redirects the torrent
+         * file onto any file the sharper owns. */
+        {
+            char p[NTX_SHARE_PATH_MAX], tmp0[NTX_SHARE_PATH_MAX + 16], victim[NTX_SHARE_PATH_MAX + 24];
+            sprintf(p, "%s/%s_excl.torrent", OUTDIR, PREFIX);
+            snprintf(tmp0, sizeof tmp0, "%s.tmp0", p);
+            snprintf(victim, sizeof victim, "%s/%s_victim.bin", OUTDIR, PREFIX);
+            static const uint8_t secret[32] = {
+                0x53, 0x45, 0x43, 0x52, 0x45, 0x54, 0x2d, 0x44, 0x4f, 0x2d, 0x4e, 0x4f, 0x54,
+                0x2d, 0x54, 0x4f, 0x55, 0x43, 0x48, 0x2d, 0x4d, 0x45, 0x21, 0x21, 1, 2, 3, 4, 5, 6, 7, 8
+            };
+            unlink(p);
+            unlink(tmp0);
+            unlink(victim);
+            check(write_raw(victim, secret, sizeof secret) == 0, "excl_victim_seeded");
+
+            /* The target must be stored so it resolves from the link's own
+             * directory — the writer's tmp lives in OUTDIR, so a target relative
+             * to the CWD would dangle and open() would fail ENOENT instead of
+             * demonstrating the attack. */
+            check(symlink(strrchr(victim, '/') + 1, tmp0) == 0, "excl_symlink_planted");
+            check(ntx_share_write_torrent(p, buf, n, wh) == NTX_SHARE_OK, "excl_write_ok");
+
+            /* (a) the victim is byte-identical to its original content */
+            uint8_t *vb = NULL;
+            size_t vn = 0;
+            check(read_all(victim, &vb, &vn) == 0 && vn == sizeof secret && memcmp(vb, secret, vn) == 0,
+                  "excl_victim_untouched");
+            free(vb);
+
+            /* (b) the final path is a regular file (not the symlink) at 0600 */
+            struct stat lst;
+            check(lstat(p, &lst) == 0, "excl_final_lstat");
+            check(S_ISREG(lst.st_mode), "excl_final_is_regular_not_symlink");
+            check((lst.st_mode & 0777) == 0600, "excl_final_mode_0600");
+            check(read_all(p, &vb, &vn) == 0 && vn == n && memcmp(vb, buf, n) == 0, "excl_final_bytes");
+            free(vb);
+
+            /* (c) the retry loop moved off .tmp0: the planted symlink is still
+             * there, untouched, and no other tmp survived the write */
+            check(lstat(tmp0, &lst) == 0 && S_ISLNK(lst.st_mode), "excl_tmp0_still_symlink");
+            char base[128];
+            snprintf(base, sizeof base, "%s.tmp0", strrchr(p, '/') + 1);
+            check(count_tmps(base) == 0, "excl_no_other_tmp_left");
+
+            unlink(tmp0);
+            unlink(victim);
+            unlink(p);
+        }
+
+        /* Failure path must not leave a tmp behind: RLIMIT_FSIZE under the payload
+         * size makes the write itself fail (SIGXFSZ ignored → write returns EFBIG),
+         * which is the cheapest fault injector that needs no privileges. */
+        {
+            char p[NTX_SHARE_PATH_MAX];
+            sprintf(p, "%s/%s_wfail.torrent", OUTDIR, PREFIX);
+            unlink(p);
+
+            struct rlimit old_fl, lim;
+            check(getrlimit(RLIMIT_FSIZE, &old_fl) == 0, "fail_getrlimit");
+            signal(SIGXFSZ, SIG_IGN);
+            lim.rlim_cur = 16; /* below the ~79 B torrent */
+            lim.rlim_max = old_fl.rlim_max;
+            check(setrlimit(RLIMIT_FSIZE, &lim) == 0, "fail_setrlimit");
+
+            check(ntx_share_write_torrent(p, buf, n, wh) == NTX_SHARE_E_IO, "fail_write_is_io");
+
+            check(setrlimit(RLIMIT_FSIZE, &old_fl) == 0, "fail_restore_rlimit");
+            signal(SIGXFSZ, SIG_DFL);
+
+            struct stat st;
+            check(stat(p, &st) != 0, "fail_no_final_file");
+            check(count_tmps(NULL) == 0, "fail_no_tmp_left_after_io_error");
+            unlink(p);
+        }
+
+        /* An existing torrent we cannot identify because it is over
+         * SOUT_MAX_TORRENT is never read, hashed or replaced — even though its
+         * info subtree would have matched. 8 x 600 KB string values keep every
+         * string under the parser's 1 MiB cap, so only the file-size cap can be
+         * what stops this. */
+        {
+            char p[NTX_SHARE_PATH_MAX];
+            sprintf(p, "%s/%s_huge.torrent", OUTDIR, PREFIX);
+            unlink(p);
+            size_t blob = 600000, nblob = 8;
+            size_t big_n = (n - 1) + nblob * (blob + 8 + 16) + 1;
+            uint8_t *big = malloc(big_n + 32);
+            if (!big) { printf("FAIL oom_huge\n"); return 1; }
+            size_t o = 0;
+            memcpy(big + o, buf, n - 1); /* drop the closing 'e' */
+            o += n - 1;
+            for (size_t k = 0; k < nblob; k++) {
+                int w = snprintf((char *)big + o, 32, "1:%c%zu:", 'A' + (char)k, blob);
+                if (w < 0) { free(big); printf("FAIL huge\n"); return 1; }
+                o += (size_t)w;
+                memset(big + o, 'x', blob);
+                o += blob;
+            }
+            big[o++] = 'e';
+            check(o > SOUT_MAX_TORRENT, "huge_fixture_over_cap");
+            /* sanity: it is real bencode with the very info subtree that hashes to wh */
+            ntx_be be;
+            size_t bc = 0;
+            check(ntx_be_parse(big, o, &be, &bc, 32, (size_t)2 << 20) == 0, "huge_parses");
+            const ntx_be *hi = ntx_be_dict_get(&be, "info");
+            uint8_t hsh[20];
+            ntx_sha1(big + hi->start, hi->end - hi->start, hsh);
+            ntx_be_free(&be);
+            check(memcmp(hsh, wh, 20) == 0, "huge_same_hash");
+            check(write_raw(p, big, o) == 0, "huge_seeded");
+            free(big);
+
+            check(ntx_share_write_torrent(p, buf, n, wh) == NTX_SHARE_E_EXISTS, "huge_exists_fail_closed");
+            uint8_t *rb2 = NULL;
+            size_t rn2 = 0;
+            check(read_all(p, &rb2, &rn2) == 0 && rn2 == o, "huge_untouched");
+            free(rb2);
+            check(count_tmps(NULL) == 0, "huge_no_tmp_left");
             unlink(p);
         }
 
@@ -515,6 +692,7 @@ int main(void) {
         free(buf);
     }
 
+    umask(old_umask); /* the run's files were all written under 000 on purpose */
     printf("%s share_out (%d fail)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }
