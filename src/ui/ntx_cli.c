@@ -3,7 +3,10 @@
 
 #include "../core/ntx_torrent.h"
 
-struct ntx_session; /* fwd decl: the portmap header declares session fns but does not forward-declare */
+/* Only the NTX_PM_* enum is needed here; ntx_session_portmap.h declares the
+ * ntx_session_portmap_* fns taking `struct ntx_session *` but does not
+ * forward-declare the struct itself (opaque to the CLI). */
+struct ntx_session;
 #include "../core/ntx_session_portmap.h" /* NTX_PM_* == ntx_stats.port_map (design §8, §11) */
 
 #include <stdio.h>
@@ -124,19 +127,23 @@ static void cli_flags_compact(const ntx_stats *st, const ntx_tts_stat *t, char *
                  st->punch_fail > 99 ? 99u : (unsigned)st->punch_fail);
     /* Design §10 tags: appended after every existing tag so the §10 tail
      * truncation drops them first. pin!/in cap at 99 like the peer counters,
-     * which is what keeps the all-max line inside CLI_MAX_LINE. */
+     * so the widest §10 tail is 52 chars ("prv shr enc! pin!99 map:65535
+     * in99") — cli_cap_line trims it from the end when the rest leaves no room. */
     char prv[8] = "", shr[8] = "", enc[8] = "", pin[16] = "", map[16] = "", inn[8] = "";
     if (t->priv) snprintf(prv, sizeof prv, " prv");
     if (t->share) snprintf(shr, sizeof shr, " shr%s", t->share == 2 ? "!" : "");
     if (t->enc_strict) snprintf(enc, sizeof enc, " enc!");
     if (t->trk_pin_fail)
         snprintf(pin, sizeof pin, " pin!%u", t->trk_pin_fail > 99 ? 99u : (unsigned)t->trk_pin_fail);
-    if (st && st->port_map == NTX_PM_ACTIVE)
+    /* map:<port> needs a port worth showing: ACTIVE with ext_port == 0 has no
+     * usable mapping yet (stats zero ext_port unless the state is ACTIVE, and
+     * adv_port is 0 before the socket is bound), so it reads as "no mapping". */
+    if (st && st->port_map == NTX_PM_ACTIVE && st->ext_port)
         snprintf(map, sizeof map, " map:%u", st->ext_port);
     else if (st && st->port_map == NTX_PM_CGNAT)
         snprintf(map, sizeof map, " map!cg");
     else if (st && st->port_map != NTX_PM_OFF)
-        snprintf(map, sizeof map, " map-"); /* PENDING = no gateway answer yet */
+        snprintf(map, sizeof map, " map-"); /* PENDING, NONE, or ACTIVE w/o ext port */
     if (t->share)
         snprintf(inn, sizeof inn, " in%u", t->in_ok > 99 ? 99u : (unsigned)t->in_ok);
     if (t->meta_need > 0) {
