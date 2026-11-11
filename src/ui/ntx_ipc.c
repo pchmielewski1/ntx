@@ -52,16 +52,51 @@ int ntx_hex40(char out[41], const uint8_t h[20]) {
     return 40;
 }
 
+/* §6.4/§11: "share" is advertised only while the built-in tracker list is
+   usable. Weak reference for the same reason as the wrappers in ntx_main.c:
+   test/t_cli.c links this TU with no share objects. */
+__attribute__((weak)) int ntx_share_available(void);
+/* Same reason: test/t_cli.c links this TU without the share objects, so a
+   strong reference on the event emitter's only session-side helper would be an
+   undefined symbol there. NULL ⇒ the emitter labels a failure "bad_arg". */
+__attribute__((weak)) const char *ntx_share_err_code(ntx_share_err e);
+
 int ntx_ipc_hello_json(char *out, size_t cap, const char *build_id) {
     char esc_build[64 * 6 + 1];
     if (ntx_json_escape(esc_build, sizeof esc_build, build_id ? build_id : "") < 0)
         esc_build[0] = 0;
+    const char *sh = (ntx_share_available && ntx_share_available()) ? ",\"share\"" : "";
     int w = snprintf(out, cap,
                      "{\"type\":\"hello\",\"v\":1,\"protocol\":\"ntx-json\","
                      "\"max_tts\":%d,\"max_peers\":%d,\"build\":\"%s\","
                      "\"caps\":[\"ping\",\"status\",\"hello\",\"add\",\"pause\","
-                     "\"resume\",\"remove\",\"quit\"]}",
-                     NTX_SESSION_MAX_TTS, NTX_SESSION_MAX_PEERS, esc_build);
+                     "\"resume\",\"remove\",\"quit\"%s]}",
+                     NTX_SESSION_MAX_TTS, NTX_SESSION_MAX_PEERS, esc_build, sh);
+    return (w < 0 || (size_t)w >= cap) ? -1 : w;
+}
+
+int ntx_ipc_share_event_json(char *out, size_t cap, const ntx_share_event *ev) {
+    if (!ev) return -1;
+    int w;
+    if (!ev->ok) {
+        const char *code = ntx_share_err_code ? ntx_share_err_code(ev->err) : "bad_arg";
+        w = snprintf(out, cap, "{\"type\":\"share\",\"i\":%d,\"ok\":0,\"code\":\"%s\"}", ev->i, code);
+        return (w < 0 || (size_t)w >= cap) ? -1 : w;
+    }
+    char ih[41], ih2[65], name[512 * 6 + 1], magnet[NTX_SHARE_MAGNET_MAX * 6 + 1],
+         tor[NTX_SHARE_PATH_MAX * 6 + 1];
+    ntx_hex40(ih, ev->ih);
+    static const char hx[] = "0123456789abcdef";
+    for (int k = 0; k < 32; k++) { ih2[2 * k] = hx[ev->ih2[k] >> 4]; ih2[2 * k + 1] = hx[ev->ih2[k] & 15u]; }
+    ih2[64] = 0;
+    if (ntx_json_escape(name, sizeof name, ev->name) < 0 ||
+        ntx_json_escape(magnet, sizeof magnet, ev->magnet) < 0 ||
+        ntx_json_escape(tor, sizeof tor, ev->torrent_path) < 0)
+        return -1; /* §11.1: never a torn escape -> no line at all */
+    w = snprintf(out, cap,
+                 "{\"type\":\"share\",\"i\":%d,\"ok\":1,\"ih\":\"%s\",\"ih2\":\"%s\","
+                 "\"name\":\"%s\",\"magnet\":\"%s\",\"torrent\":\"%s\"}",
+                 ev->i, ih, ih2, name, magnet, tor);
     return (w < 0 || (size_t)w >= cap) ? -1 : w;
 }
 
@@ -197,6 +232,7 @@ static ntx_ipc_cmd ipc_map(const char *c) {
     if (!strcmp(c, "resume")) return NTX_CMD_RESUME;
     if (!strcmp(c, "remove")) return NTX_CMD_REMOVE;
     if (!strcmp(c, "quit")) return NTX_CMD_QUIT;
+    if (!strcmp(c, "share")) return NTX_CMD_SHARE;
     return NTX_CMD_NONE;
 }
 
@@ -208,7 +244,7 @@ void ntx_ipc_parse(const char *line, ntx_ipc_req *r) {
     if (*p != '{') return;
     p = ipc_ws(p + 1);
     if (*p == '}') return;                /* {} → no cmd → bad_json (§6.4) */
-    int path_overflow = 0;
+    int path_overflow = 0, magnet_overflow = 0, torrent_overflow = 0;
     for (;;) {
         char key[16];
         int krc = ipc_json_str(&p, key, sizeof key);
@@ -235,6 +271,7 @@ void ntx_ipc_parse(const char *line, ntx_ipc_req *r) {
         int is_cmd = !strcmp(key, "cmd"), is_seq = !strcmp(key, "seq");
         int is_i = !strcmp(key, "i");
         int is_mag = !strcmp(key, "magnet"), is_path = !strcmp(key, "path");
+        int is_tor = !strcmp(key, "torrent");
         if (*p == '"') {
             if (is_seq || is_i) return;    /* numbers must not be strings */
             if (is_cmd) {
@@ -251,20 +288,24 @@ void ntx_ipc_parse(const char *line, ntx_ipc_req *r) {
                 } else {
                     r->cmd_seen = 1;
                 }
-            } else if (is_mag) {
-                if (ipc_json_str(&p, r->magnet, sizeof r->magnet) != 0) return;
-                r->has_magnet = 1;
-            } else if (is_path) {
+            } else if (is_mag || is_path || is_tor) {
+                /* measure first, then store: a value over the cap is "too long"
+                   (io), never bad_json, and the public buffer stays at the cap */
                 const char *start = p;
-                size_t plen = 0;
-                if (ipc_json_str_len(&p, &plen) != 0) return;
-                r->has_path = 1;
-                path_overflow = 0;
-                if (plen >= NTX_IPC_ARGS_MAX) {
-                    path_overflow = 1;
-                } else {
+                size_t vlen = 0;
+                if (ipc_json_str_len(&p, &vlen) != 0) return;
+                char *dst = is_mag ? r->magnet : is_path ? r->path : r->torrent;
+                size_t dcap = is_mag ? (size_t)NTX_IPC_MAGNET_MAX : (size_t)(NTX_IPC_ARGS_MAX - 1);
+                if (is_mag) r->has_magnet = 1;
+                else if (is_path) r->has_path = 1;
+                else r->has_torrent = 1;
+                int over = vlen > dcap;
+                if (is_mag) magnet_overflow = over;
+                else if (is_path) path_overflow = over;
+                else torrent_overflow = over;
+                if (!over) {
                     const char *q = start;
-                    if (ipc_json_str(&q, r->path, sizeof r->path) != 0) return;
+                    if (ipc_json_str(&q, dst, dcap + 1) != 0) return;
                 }
             } else {
                 /* §6.1: unknown-key value skipped by MEASURE only —
@@ -275,7 +316,7 @@ void ntx_ipc_parse(const char *line, ntx_ipc_req *r) {
                 if (ipc_json_str_len(&p, &skip) != 0) return;
             }
         } else if (*p == '-' || (*p >= '0' && *p <= '9')) {
-            if (is_cmd || is_mag || is_path) return; /* those must be strings */
+            if (is_cmd || is_mag || is_path || is_tor) return; /* those must be strings */
             long long v;
             if (ipc_num(&p, &v) != 0) return;
             if (is_seq) { r->seq = v; r->has_seq = 1; }
@@ -306,12 +347,18 @@ void ntx_ipc_parse(const char *line, ntx_ipc_req *r) {
     case NTX_CMD_ADD: {
         int both = r->has_magnet + r->has_path;
         if (both != 1) r->pre = NTX_IPC_E_BAD_ARG;               /* not either/both */
-        else if (r->has_magnet && !r->magnet[0]) r->pre = NTX_IPC_E_BAD_ARG;
+        else if (r->has_magnet && !magnet_overflow && !r->magnet[0]) r->pre = NTX_IPC_E_BAD_ARG;
         else if (r->has_path && !path_overflow && !r->path[0]) r->pre = NTX_IPC_E_BAD_ARG;
         else if (r->has_path && (path_overflow || strlen(r->path) > 511)) r->pre = NTX_IPC_E_IO; /* §6.4 */
+        else if (r->has_magnet && magnet_overflow) r->pre = NTX_IPC_E_IO; /* §11: magnet > 2048 B */
         else r->pre = NTX_IPC_OK;
         break;
     }
+    case NTX_CMD_SHARE: /* §11: path required, torrent optional (== --share-from) */
+        if (!r->has_path || (!path_overflow && !r->path[0])) r->pre = NTX_IPC_E_BAD_ARG;
+        else if (path_overflow || (r->has_torrent && torrent_overflow)) r->pre = NTX_IPC_E_IO;
+        else r->pre = NTX_IPC_OK;
+        break;
     default:
         r->pre = NTX_IPC_OK;
         break;

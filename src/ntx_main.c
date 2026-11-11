@@ -184,6 +184,27 @@ static int share_drain_events(ntx_session *s, int *fatal) {
     return 0;
 }
 
+/* §11: JSON counterpart of share_drain_events (which is CLI-only). Drained after
+   the dispatch and before the snapshot, so the per-tick order is ack → share
+   event → stats. Own buffer, never g_js/g_ack (§11: "osobny bufor ≥ 8 KiB"), sized
+   for the §11.1 escape blow-up over the ntx_share_event fields (magnet 4096×6 +
+   name 512×6 + path 1024×6 + the two hashes); a line that would not fit is
+   dropped whole, never torn. A failed share is reported as {"ok":0,"code":…} and
+   the session keeps serving — unlike CLI mode, where share_drain_events leaves
+   the loop with exit 1. Weak refs so test/t_cli_https.c keeps linking (same
+   pattern as ntx_share_available above). */
+static char g_share_evt[40960];
+__attribute__((weak)) int ntx_session_share_poll_event(ntx_session *s, ntx_share_event *ev);
+__attribute__((weak)) int ntx_ipc_share_event_json(char *out, size_t cap, const ntx_share_event *ev);
+
+static void ipc_share_events(ntx_session *s) {
+    if (!ntx_session_share_poll_event || !ntx_ipc_share_event_json) return;
+    ntx_share_event ev;
+    while (ntx_session_share_poll_event(s, &ev))
+        if (ntx_ipc_share_event_json(g_share_evt, sizeof g_share_evt, &ev) > 0)
+            ipc_emit(g_share_evt);
+}
+
 static const char *load_magnet_file(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
@@ -473,6 +494,15 @@ int main(int argc, char **argv) {
         /* CLI mode only: under --stats-json the share event is JSON's (§9/C3). */
         if (g_share_path && !g_stats_json && share_drain_events(s, &share_failed)) break;
         if (g_ipc_open) ipc_pump_tick(s); /* §3.6: commands first, then the snapshot */
+        /* §11: acks are out, so the share events (own buffer) go next — still
+           before the snapshot below. CLI mode drains the same queue in
+           share_drain_events instead, and under --stats-json nothing raw may
+           touch stdout, so this is the only emitter of the JSON share event. */
+        /* ponytail: skipped on the quit tick — §8 pins the quit ack as the LAST
+         * line (asserted by assert_ipc.py and ipc_post_quit_stop), so an event
+         * still in the queue at quit is dropped. Upgrade path: drain before the
+         * quit ack is emitted, inside the dispatcher's QUIT branch. */
+        if (g_stats_json && !g_ipc_quit) ipc_share_events(s);
         if (g_ipc_quit) break; /* ack already on stdout; exit code 0 (§6.2) */
         uint64_t now = ntx_mono_ms();
         if (now - last_ui >= 100) {

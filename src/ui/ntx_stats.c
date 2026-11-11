@@ -40,7 +40,9 @@ int ntx_stats_to_json(const ntx_stats *st, char *out, size_t cap) {
                          "\"peers_interested\":%u,"
                          "\"meta_got\":%u,\"meta_need\":%u,\"verify_q\":%u,"
                          "\"meta_version\":%u,\"hybrid\":%u,\"layers_pending\":%u,"
-                         "\"size\":%llu,\"down\":%llu,\"up\":%llu}",
+                         "\"size\":%llu,\"down\":%llu,\"up\":%llu,"
+                         "\"priv\":%u,\"share\":%u,\"enc_strict\":%u,"
+                         "\"trk_pin_fail\":%u,\"in_ok\":%u}",
                          emitted ? "," : "",
                          (unsigned)t->slot, ih, esc_name, (unsigned)t->state, esc_phase, t->pct, t->spd_d, t->spd_u, t->eta_s,
                          t->done, t->total, t->partial, t->peers,
@@ -51,7 +53,9 @@ int ntx_stats_to_json(const ntx_stats *st, char *out, size_t cap) {
                          (unsigned)t->meta_need, (unsigned)t->verify_q,
                          (unsigned)t->meta_version, (unsigned)t->hybrid, (unsigned)t->layers_pending,
                          (unsigned long long)t->size,
-                         (unsigned long long)t->down, (unsigned long long)t->up);
+                         (unsigned long long)t->down, (unsigned long long)t->up,
+                         (unsigned)t->priv, (unsigned)t->share, (unsigned)t->enc_strict,
+                         (unsigned)t->trk_pin_fail, (unsigned)t->in_ok);
         if (w < 0 || (size_t)w >= bcap - pos) { truncated = 1; break; } /* §5.4 */
         pos += (size_t)w;
         emitted++;
@@ -67,6 +71,7 @@ int ntx_stats_to_json(const ntx_stats *st, char *out, size_t cap) {
                       "\"utp\":%u,\"utp_conns\":%u,\"utp_v6\":%u,"
                       "\"demux_dht\":%llu,\"demux_utp\":%llu,\"demux_drop\":%llu,"
                       "\"punch_ok\":%u,\"punch_fail\":%u,"
+                      "\"port_map\":%u,\"ext_port\":%u,"
                       "\"n\":%d,\"torrents\":[",
                       st->down_Bps, st->up_Bps, st->total_peers, st->conn_peers,
                       (unsigned long long)st->down_total, (unsigned long long)st->up_total,
@@ -77,7 +82,8 @@ int ntx_stats_to_json(const ntx_stats *st, char *out, size_t cap) {
                       (unsigned)st->utp, (unsigned)st->utp_conns, (unsigned)st->utp_v6,
                       (unsigned long long)st->demux_dht, (unsigned long long)st->demux_utp,
                       (unsigned long long)st->demux_drop,
-                      st->punch_ok, st->punch_fail, emitted);
+                      st->punch_ok, st->punch_fail,
+                      (unsigned)st->port_map, (unsigned)st->ext_port, emitted);
     const char *tail = truncated ? "],\"truncated\":1}" : "]}";
     size_t tl = strlen(tail);
     if (hn < 0 || (size_t)hn > IPC_HDR_RES || (size_t)hn + pos + tl + 1 > cap) {

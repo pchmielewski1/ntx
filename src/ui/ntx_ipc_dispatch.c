@@ -27,6 +27,7 @@ static const char *ipc_cmd_label(ntx_ipc_cmd c) {
     case NTX_CMD_RESUME: return "resume";
     case NTX_CMD_REMOVE: return "remove";
     case NTX_CMD_QUIT: return "quit";
+    case NTX_CMD_SHARE: return "share";
     default: return "";
     }
 }
@@ -40,6 +41,7 @@ static const char *ipc_code_label(ntx_ipc_code c) {
     case NTX_IPC_E_BAD_ARG: return "bad_arg";
     case NTX_IPC_E_FULL: return "full";
     case NTX_IPC_E_IO: return "io";
+    case NTX_IPC_E_NO_TRACKERS: return "no_trackers";
     default: return "internal";
     }
 }
@@ -185,6 +187,25 @@ int ntx_ipc_dispatch(struct ntx_session *s, const char *line, char *out, size_t 
         ntx_session_remove(s, r.i);
         if (ipc_seg(out, cap, &pos, "\"i\":%d,\"ok\":1,\"state\":%d}", r.i, (int)NTX_TTS_DEAD) < 0)
             return ipc_tail_internal(out, cap);
+        return 0;
+    }
+    case NTX_CMD_SHARE: {
+        /* §11: the synchronous verdicts are bad_arg / io / full / no_trackers
+           (ntx_share_err_code is the single source of the code strings). The ack
+           carries i + state but NO ih: the hash only exists once hashing is done,
+           and it arrives on the separate "share" event line. */
+        ntx_share_err serr = NTX_SHARE_E_BAD_ARG;
+        int ti = ntx_session_share_add(s, r.path, r.has_torrent ? r.torrent : 0, &serr);
+        if (ti < 0) {
+            out[0] = 0; pos = 0;
+            if (ipc_seg(out, cap, &pos, "{\"type\":\"err\",") < 0) return ipc_tail_internal(out, cap);
+            if (r.has_seq && ipc_seg(out, cap, &pos, "\"seq\":%lld,", r.seq) < 0) return ipc_tail_internal(out, cap);
+            if (ipc_seg(out, cap, &pos, "\"cmd\":\"%s\",\"ok\":0,\"code\":\"%s\"}", ec,
+                        ntx_share_err_code(serr)) < 0) return ipc_tail_internal(out, cap);
+            return 0;
+        }
+        if (ipc_seg(out, cap, &pos, "\"i\":%d,\"ok\":1,\"state\":%d}",
+                    ti, (int)s->tts[ti].state) < 0) return ipc_tail_internal(out, cap);
         return 0;
     }
     default:

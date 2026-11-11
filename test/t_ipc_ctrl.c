@@ -219,14 +219,16 @@ int main(void) {
 
     if (ok("ipc_helpers_v1")) return 1;
 
-    /* §7 hello — verbatim contract keys, caps catalog in fixed order */
+    /* §7 hello — verbatim contract keys, caps catalog in fixed order.
+       C3/§11: this TU links ntx_share_trackers.c, so the built-in list is usable
+       and "share" is appended (the gated-off spelling is pinned in c3_caps_share). */
     char hl[512];
     int hn = ntx_ipc_hello_json(hl, sizeof hl, "seed-ratio-v1");
     if (hn <= 0) return fail("hello_len");
     if (strcmp(hl, "{\"type\":\"hello\",\"v\":1,\"protocol\":\"ntx-json\","
                    "\"max_tts\":16,\"max_peers\":128,\"build\":\"seed-ratio-v1\","
                    "\"caps\":[\"ping\",\"status\",\"hello\",\"add\",\"pause\","
-                   "\"resume\",\"remove\",\"quit\"]}") != 0)
+                   "\"resume\",\"remove\",\"quit\",\"share\"]}") != 0)
         return fail("hello_body");
     if (ntx_ipc_hello_json(hl, 64, "x") != -1) return fail("hello_tiny_cap");
     /* hostile build id must not break the line (§11.1 escape discipline) */
@@ -631,6 +633,183 @@ int main(void) {
         if (seen != 65) { drop(s4, nx); return fail("bud2_count"); }
         drop(s4, nx);
         if (ok("ipc_post_quit_stop")) return 1;
+    }
+
+    { /* ── §11 Task C3: share cmd parse, magnet limit, caps, stats fields, event ── */
+        ntx_ipc_req r;
+        ntx_ipc_parse("{\"cmd\":\"share\",\"path\":\"/x\",\"torrent\":\"/y.torrent\",\"seq\":3}", &r);
+        if (r.pre != NTX_IPC_OK || r.cmd != NTX_CMD_SHARE || !r.has_torrent ||
+            strcmp(r.torrent, "/y.torrent") != 0 || r.seq != 3 || !r.has_seq)
+            return fail("c3_parse_share");
+        ntx_ipc_parse("{\"cmd\":\"share\",\"path\":\"\"}", &r);
+        if (r.pre != NTX_IPC_E_BAD_ARG) return fail("c3_share_empty_path");
+        ntx_ipc_parse("{\"cmd\":\"share\"}", &r);
+        if (r.pre != NTX_IPC_E_BAD_ARG) return fail("c3_share_no_path");
+        {
+            char line[1200], big[513];
+            memset(big, 'a', 512); big[512] = 0;
+            snprintf(line, sizeof line, "{\"cmd\":\"share\",\"path\":\"%s\"}", big);
+            ntx_ipc_parse(line, &r);
+            if (r.pre != NTX_IPC_E_IO) return fail("c3_share_path_512");
+            big[511] = 0; /* 511 B is the contract limit */
+            snprintf(line, sizeof line, "{\"cmd\":\"share\",\"path\":\"%s\"}", big);
+            ntx_ipc_parse(line, &r);
+            if (r.pre != NTX_IPC_OK || strlen(r.path) != 511) return fail("c3_share_path_511");
+            big[511] = 'a'; big[512] = 0; /* back to 512 B for the torrent limit */
+            snprintf(line, sizeof line, "{\"cmd\":\"share\",\"path\":\"/x\",\"torrent\":\"%s\"}", big);
+            ntx_ipc_parse(line, &r);
+            if (r.pre != NTX_IPC_E_IO) return fail("c3_share_torrent_512");
+        }
+        /* magnet in add: 2048 B is accepted, 2049 B is io (frame limit 4096 kept) */
+        {
+            char line[2200], mag[2050];
+            for (int probe = 0; probe < 3; probe++) {
+                static const size_t len[] = { 2000, 2048, 2049 };
+                memset(mag, 'a', len[probe]);
+                mag[len[probe]] = 0;
+                snprintf(line, sizeof line, "{\"cmd\":\"add\",\"magnet\":\"%s\"}", mag);
+                ntx_ipc_parse(line, &r);
+                if (len[probe] <= 2048) {
+                    if (r.pre != NTX_IPC_OK || strlen(r.magnet) != len[probe])
+                        return fail("c3_magnet_under_ok");
+                } else if (r.pre != NTX_IPC_E_IO) {
+                    return fail("c3_magnet_2049_io");
+                }
+            }
+        }
+        if (ok("c3_parse_share")) return 1;
+
+        /* caps carries "share" exactly while ntx_share_available() (§6.4/§11) */
+        {
+            char hl[512];
+            static ntx_share_tracker one[2];
+            for (int k = 0; k < 2; k++) {
+                one[k].url = "https://x.invalid/announce";
+                one[k].host = "x.invalid";
+                one[k].npins = 1;
+                memset(one[k].pins[0], k + 1, 32);
+            }
+            ntx_share_trackers_test_set(one, 2);
+            if (!ntx_share_available()) { ntx_share_trackers_test_set(0, -1); return fail("c3_caps_setup"); }
+            if (ntx_ipc_hello_json(hl, sizeof hl, "b") <= 0 || !strstr(hl, "\"quit\",\"share\"]"))
+                { ntx_share_trackers_test_set(0, -1); return fail("c3_caps_on"); }
+            ntx_share_trackers_test_set(one, 1); /* below NTX_SHARE_MIN_TRACKERS */
+            if (ntx_share_available()) { ntx_share_trackers_test_set(0, -1); return fail("c3_gate_off"); }
+            if (ntx_ipc_hello_json(hl, sizeof hl, "b") <= 0 || strstr(hl, "share"))
+                { ntx_share_trackers_test_set(0, -1); return fail("c3_caps_off"); }
+            if (strcmp(hl, "{\"type\":\"hello\",\"v\":1,\"protocol\":\"ntx-json\","
+                           "\"max_tts\":16,\"max_peers\":128,\"build\":\"b\","
+                           "\"caps\":[\"ping\",\"status\",\"hello\",\"add\",\"pause\","
+                           "\"resume\",\"remove\",\"quit\"]}") != 0)
+                { ntx_share_trackers_test_set(0, -1); return fail("c3_caps_off_exact"); }
+            ntx_share_trackers_test_set(0, -1);
+            if (ntx_ipc_hello_json(hl, sizeof hl, "b") <= 0 || !strstr(hl, "\"share\""))
+                return fail("c3_caps_restored");
+        }
+        if (ok("c3_caps_share")) return 1;
+
+        /* §11 stats fields, additive at the end of each scope */
+        {
+            ntx_stats st;
+            char js[4096];
+            memset(&st, 0, sizeof st);
+            st.n = 1;
+            st.port_map = 2;
+            st.ext_port = 40123;
+            st.t[0].slot = 0;
+            st.t[0].priv = 1; st.t[0].share = 1; st.t[0].enc_strict = 1;
+            st.t[0].trk_pin_fail = 0; st.t[0].in_ok = 0;
+            if (ntx_stats_to_json(&st, js, sizeof js) <= 0) return fail("c3_stats_fit");
+            if (!strstr(js, "\"priv\":1,\"share\":1,\"enc_strict\":1,\"trk_pin_fail\":0,\"in_ok\":0"))
+                return fail("c3_stats_torrent_fields");
+            if (!strstr(js, "\"port_map\":2,\"ext_port\":40123")) return fail("c3_stats_session_fields");
+            if (!ipc_ok_local(js)) return fail("c3_stats_parseable");
+        }
+        if (ok("c3_stats_fields")) return 1;
+
+        /* §11 share event lines: the ready shape with the §11.1 escaping, and the
+           failure shape whose code comes from ntx_share_err_code */
+        {
+            ntx_share_event ev;
+            char line[40960];
+            memset(&ev, 0, sizeof ev);
+            ev.i = 3; ev.ok = 1;
+            for (int k = 0; k < 20; k++) ev.ih[k] = (uint8_t)k;
+            for (int k = 0; k < 32; k++) ev.ih2[k] = (uint8_t)(0xa0 + k);
+            snprintf(ev.name, sizeof ev.name, "a\"b\\c\nd");
+            snprintf(ev.magnet, sizeof ev.magnet, "magnet:?xt=urn:btih:%040x", 1);
+            snprintf(ev.torrent_path, sizeof ev.torrent_path, "/tmp/x.bin");
+            if (ntx_ipc_share_event_json(line, sizeof line, &ev) <= 0) return fail("c3_evt_len");
+            if (!ipc_ok_local(line)) return fail("c3_evt_parseable");
+            if (strncmp(line, "{\"type\":\"share\",\"i\":3,\"ok\":1,", 25) != 0)
+                return fail("c3_evt_head");
+            if (!strstr(line, "\"ih\":\"000102030405060708090a0b0c0d0e0f10111213\""))
+                return fail("c3_evt_ih");
+            if (!strstr(line, "\"ih2\":\"a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf\""))
+                return fail("c3_evt_ih2");
+            if (!strstr(line, "\"name\":\"a\\\"b\\\\c\\nd\"")) return fail("c3_evt_escape");
+            if (!strstr(line, "\"magnet\":\"magnet:")) return fail("c3_evt_magnet");
+            if (!strstr(line, "\"torrent\":\"/tmp/x.bin\"}")) return fail("c3_evt_torrent");
+            ev.ok = 0; ev.err = NTX_SHARE_E_NO_TRACKERS;
+            if (ntx_ipc_share_event_json(line, sizeof line, &ev) <= 0 ||
+                strcmp(line, "{\"type\":\"share\",\"i\":3,\"ok\":0,\"code\":\"no_trackers\"}") != 0)
+                return fail("c3_evt_fail");
+            if (ntx_ipc_share_event_json(line, 32, &ev) != -1) return fail("c3_evt_tiny_cap");
+        }
+        if (ok("c3_share_event_json")) return 1;
+
+        /* dispatcher over a live session: §11 ack (i/ok/state 4 = VERIFY, no ih)
+           and the synchronous err codes io / bad_arg / no_trackers */
+        {
+            ntx_config cfg;
+            ntx_netx *nx;
+            memset(&cfg, 0, sizeof cfg);
+            cfg.store_dir = "/tmp/ntx-ipc-t6";
+            ntx_session *s = mk(&nx, &cfg);
+            char out[2048];
+            FILE *wf = fopen("/tmp/ntx-ipc-t6/c3-share.bin", "wb");
+            if (!wf) { drop(s, nx); return fail("c3_file"); }
+            fputs("0123456789", wf);
+            fclose(wf);
+
+            ntx_ipc_dispatch(s, "{\"cmd\":\"share\",\"seq\":31}", out, sizeof out);
+            if (!strstr(out, "\"cmd\":\"share\"") || !strstr(out, "\"code\":\"bad_arg\"") ||
+                !strstr(out, "\"seq\":31") || strstr(out, "\"i\":"))
+                return fail("c3_d_bad_arg");
+            ntx_ipc_dispatch(s, "{\"cmd\":\"share\",\"path\":\"\",\"seq\":32}", out, sizeof out);
+            if (!strstr(out, "\"code\":\"bad_arg\"")) return fail("c3_d_bad_arg_empty");
+            ntx_ipc_dispatch(s, "{\"cmd\":\"share\",\"path\":\"/tmp/ntx-ipc-t6/nope.bin\",\"seq\":33}",
+                             out, sizeof out);
+            if (!strstr(out, "\"cmd\":\"share\"") || !strstr(out, "\"code\":\"io\"") ||
+                !strstr(out, "\"seq\":33"))
+                return fail("c3_d_io");
+
+            static ntx_share_tracker one[2];
+            for (int k = 0; k < 2; k++) {
+                one[k].url = "https://x.invalid/announce";
+                one[k].host = "x.invalid";
+                one[k].npins = 1;
+                memset(one[k].pins[0], k + 1, 32);
+            }
+            ntx_share_trackers_test_set(one, 1); /* gate closed -> no_trackers */
+            ntx_ipc_dispatch(s, "{\"cmd\":\"share\",\"path\":\"/tmp/ntx-ipc-t6/c3-share.bin\",\"seq\":34}",
+                             out, sizeof out);
+            ntx_share_trackers_test_set(0, -1);
+            if (!strstr(out, "\"code\":\"no_trackers\"") || !strstr(out, "\"seq\":34"))
+                return fail("c3_d_no_trackers");
+
+            ntx_ipc_dispatch(s, "{\"cmd\":\"share\",\"path\":\"/tmp/ntx-ipc-t6/c3-share.bin\",\"seq\":35}",
+                             out, sizeof out);
+            if (strcmp(out, "{\"type\":\"ack\",\"seq\":35,\"cmd\":\"share\",\"i\":0,\"ok\":1,\"state\":4}") != 0)
+                return fail("c3_d_ack"); /* §11: no ih — the hash is not known yet */
+
+            /* The queue still holds nothing: share_add leaves the slot HASHING and
+               ntx_session_share_poll_event reports only HASHING-exited slots, so the
+               ready line is covered synthetically in c3_share_event_json above. */
+            if (ntx_session_share_state(s, 0) != NTX_SHARE_HASHING) { drop(s, nx); return fail("c3_d_state"); }
+            drop(s, nx);
+        }
+        if (ok("c3_dispatch_share")) return 1;
     }
 
     return 0; /* tasks append here; keep the final line intact */

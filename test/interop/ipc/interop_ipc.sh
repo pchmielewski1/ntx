@@ -135,6 +135,22 @@ wait_for '"seq":6,"cmd":"remove","i":0,"ok":1,"state":5' 3 "$MAIN_OUT" main
 say '{"cmd":"remove","seq":7,"i":0}'              # repeat → no_slot
 wait_for '"seq":7,"cmd":"remove","i":0,"ok":0,"code":"no_slot"' 3 "$MAIN_OUT" main
 
+# §11 share: synchronous errors only, both io. A missing path fails the open,
+# a directory fails S_ISREG — both before any hashing, and a build whose share
+# tracker list is unusable answers no_trackers instead (§6.4), so the wait
+# accepts either and assert_ipc.py pins the accepted set.
+mkdir -p "$WORK/adir"
+say "{\"cmd\":\"share\",\"seq\":9,\"path\":\"$WORK/nope.bin\"}"
+wait_for '"seq":9,"cmd":"share","ok":0,"code":"' 3 "$MAIN_OUT" main
+grep -q '"seq":9,"cmd":"share","ok":0,"code":"io"' "$MAIN_OUT" ||
+    grep -q '"seq":9,"cmd":"share","ok":0,"code":"no_trackers"' "$MAIN_OUT" ||
+    die "share of a missing file is neither io nor no_trackers"
+say "{\"cmd\":\"share\",\"seq\":10,\"path\":\"$WORK/adir\"}"
+wait_for '"seq":10,"cmd":"share","ok":0,"code":"' 3 "$MAIN_OUT" main
+grep -q '"seq":10,"cmd":"share","ok":0,"code":"io"' "$MAIN_OUT" ||
+    grep -q '"seq":10,"cmd":"share","ok":0,"code":"no_trackers"' "$MAIN_OUT" ||
+    die "share of a directory is neither io nor no_trackers"
+
 # Variant A: quit is the LAST command; fd stays open until the ack lands.
 say '{"cmd":"quit","seq":8}'
 wait_for '"seq":8,"cmd":"quit","ok":1' 3 "$MAIN_OUT" main

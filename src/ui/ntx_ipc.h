@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "../core/ntx_session.h" /* NTX_SESSION_MAX_TTS / _MAX_PEERS */
+#include "../core/ntx_share.h"   /* ntx_share_event (the §11 share event line) */
 
 /* JSON string escape (JSON Control API §11.1).
    Rules: '"' -> \" , '\\' -> \\ , '\n' -> \n , '\r' -> \r , '\t' -> \t ,
@@ -18,20 +19,22 @@ int ntx_hex40(char out[41], const uint8_t h[20]);
 
 /* ── Commands (§6) — pure parse + validation, no session calls (§6.4) ── */
 #define NTX_IPC_LINE_MAX 4096 /* §3.7 frame limit */
-#define NTX_IPC_ARGS_MAX 512  /* magnet/path value cap (§6.4: path ≤ 511 + NUL) */
+#define NTX_IPC_ARGS_MAX 512  /* path/torrent value cap (§6.4, §11: ≤ 511 + NUL) */
+#define NTX_IPC_MAGNET_MAX 2048 /* §11: magnet in add grew from 511 B (relaxation, back-compat) */
 #define NTX_IPC_CMD_ECHO 64   /* unknown-cmd echo cap (§8 err.cmd) */
 
 typedef enum {
     NTX_IPC_OK = 0,
     NTX_IPC_E_BAD_JSON, NTX_IPC_E_UNKNOWN_CMD, NTX_IPC_E_BAD_I,
     NTX_IPC_E_NO_SLOT, NTX_IPC_E_NOT_READY, NTX_IPC_E_BAD_ARG,
-    NTX_IPC_E_FULL, NTX_IPC_E_IO, NTX_IPC_E_INTERNAL
+    NTX_IPC_E_FULL, NTX_IPC_E_IO, NTX_IPC_E_INTERNAL,
+    NTX_IPC_E_NO_TRACKERS /* §11: new code, kept last so the v1 values are stable */
 } ntx_ipc_code;
 
 typedef enum {
     NTX_CMD_NONE = -1,
     NTX_CMD_PING = 0, NTX_CMD_STATUS, NTX_CMD_HELLO, NTX_CMD_ADD,
-    NTX_CMD_PAUSE, NTX_CMD_RESUME, NTX_CMD_REMOVE, NTX_CMD_QUIT
+    NTX_CMD_PAUSE, NTX_CMD_RESUME, NTX_CMD_REMOVE, NTX_CMD_QUIT, NTX_CMD_SHARE
 } ntx_ipc_cmd;
 
 typedef struct ntx_ipc_req {
@@ -43,9 +46,10 @@ typedef struct ntx_ipc_req {
     long long i_raw; /* untruncated "i" token; the dispatcher bounds-checks THIS
                         (parser truncates to int for the hot path; a huge literal
                         can wrap past the int guard — see the bounds check in ntx_ipc_dispatch.c). */
-    char magnet[NTX_IPC_ARGS_MAX];
+    char magnet[NTX_IPC_MAGNET_MAX + 1]; /* §11: add accepts a magnet of up to 2048 B */
     char path[NTX_IPC_ARGS_MAX];
-    int has_magnet, has_path; /* key presence, even for empty values (§6.4) */
+    char torrent[NTX_IPC_ARGS_MAX]; /* share: the optional --share-from .torrent (§11) */
+    int has_magnet, has_path, has_torrent; /* key presence, even for empty values (§6.4) */
     char cmd_echo[NTX_IPC_CMD_ECHO]; /* verbatim cmd token for ack/err */
 } ntx_ipc_req;
 
@@ -55,8 +59,15 @@ typedef struct ntx_ipc_req {
 void ntx_ipc_parse(const char *line, ntx_ipc_req *r);
 
 /* Contract hello (§7). Returns length or -1 when cap too small.
-   Key order is the document order of §7; build_id passes the escaper. */
+   Key order is the document order of §7; build_id passes the escaper.
+   §11: "share" joins caps only while ntx_share_available() (the §6.4 gate). */
 int ntx_ipc_hello_json(char *out, size_t cap, const char *build_id);
+
+/* Share result line (§11), one per share, own buffer >= 8 KiB:
+   ok: {"type":"share","i":K,"ok":1,"ih":"<40 hex>","ih2":"<64 hex>","name":…,
+        "magnet":…,"torrent":…}   fail: {"type":"share","i":K,"ok":0,"code":"…"}
+   Returns length or -1 when the line would not fit cap. */
+int ntx_ipc_share_event_json(char *out, size_t cap, const ntx_share_event *ev);
 
 /* ── dispatcher (§6, §8): execute one parsed line, emit ack/err ─────────
    Returns bitfield: NTX_IPC_F_EMIT_STATUS → glue re-emits a stats snapshot

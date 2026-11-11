@@ -19,9 +19,17 @@ def die(msg):
 if len(sys.argv) != 2:
     die("usage: assert_ipc.py <out.ndjson>")
 
-CAPS = ["ping", "status", "hello", "add", "pause", "resume", "remove", "quit"]
+BASE_CAPS = ["ping", "status", "hello", "add", "pause", "resume", "remove", "quit"]
+# §11: "share" is advertised only while ntx_share_available() (>= NTX_SHARE_MIN_TRACKERS
+# pinned https hosts), so the expected caps depend on the build under test.
+SHARE_CAP = "share"
+# Scripted share probes (interop_ipc.sh, seq 9 and 10): a missing file and a
+# directory both fail the open/S_ISREG gate of share_add (§11) → io. no_trackers
+# is accepted too so the gate stays honest on a build whose tracker list is
+# unusable (§6.4), where share_add refuses before the filesystem check.
+SHARE_ERR = ("io", "no_trackers")
 CODES = ("bad_json", "unknown_cmd", "bad_i", "no_slot", "not_ready",
-         "bad_arg", "full", "io", "internal")
+         "bad_arg", "full", "io", "internal", "no_trackers")
 
 lines = []
 with open(sys.argv[1], "rb") as f:
@@ -40,13 +48,14 @@ if lines[0].get("type") != "hello" or lines[0].get("protocol") != "ntx-json" \
         or lines[0].get("v") != 1:
     die(f"FAIL hello must be line 0, got: {lines[0]}")
 caps = lines[0]["caps"]
-if caps != CAPS:
+if caps not in (BASE_CAPS, BASE_CAPS + [SHARE_CAP]):
     die(f"FAIL caps drift: {caps}")
 hellos = sum(1 for ln in lines if ln.get("type") == "hello")
 if hellos != 1:
     die(f"FAIL hello must be emitted exactly once, saw {hellos}")
 
 replies = {}
+share_errs = {}
 for ln in lines:
     t = ln.get("type")
     if t == "stats":
@@ -77,16 +86,22 @@ for ln in lines:
             die(f"FAIL unknown code: {ln.get('code')}")
         if "seq" in ln:
             replies[ln["seq"]] = ln["cmd"]
+            if ln["cmd"] == "share":
+                share_errs[ln["seq"]] = ln.get("code")
 
 # scripted expectations of interop_ipc.sh (same order, same seq numbers).
 # seq=7 is the idempotency probe: the shipped dispatcher answers a remove of a
 # DEAD slot with err/no_slot — the reply still echoes seq+cmd, so it is recorded
 # from the err branch above (the brief's own wait_for pins '"code":"no_slot"').
-want = {1: "ping", 2: "add", 3: "pause", 4: "pause", 5: "resume",
-        6: "remove", 7: "remove", 8: "quit"}
+want = {1: "ping", 2: "add", 3: "pause", 4: "pause", 5: "resume", 6: "remove",
+        7: "remove", 8: "quit", 9: "share", 10: "share"}
 for seq, cmd in want.items():
     if replies.get(seq) != cmd:
         die(f"FAIL ack seq={seq} want={cmd} got={replies.get(seq)}")
+# §11 synchronous share errors: a nonexistent path and a directory are both io.
+for seq in (9, 10):
+    if share_errs.get(seq) not in SHARE_ERR:
+        die(f"FAIL share seq={seq} want code in {SHARE_ERR} got={share_errs.get(seq)}")
 if lines[-1].get("cmd") != "quit" or lines[-1].get("type") != "ack" \
         or lines[-1].get("ok") != 1:
     die(f"FAIL last line must be the quit ack: {lines[-1]}")
