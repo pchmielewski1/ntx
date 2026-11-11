@@ -39,6 +39,9 @@ static void trk_note_ok(struct ntx_session *s, int tts_idx, int trk_idx) {
     if (tts_idx < 0 || tts_idx >= NTX_SESSION_MAX_TTS) return;
     if (trk_idx < 0 || trk_idx >= NTX_SESSION_MAX_TRK) return;
     s->trk_fail[tts_idx][trk_idx] = 0;
+    /* §5.5: a share is READY only once a pinned tracker answered this slot's
+     * `started`; the event is whatever trk_http_event currently holds. */
+    if (s->trk_http_event[tts_idx] == NTX_TRACKER_EVENT_STARTED) s->trk_started_ok[tts_idx] = 1;
 }
 
 static void trk_note_fail(struct ntx_session *s, int tts_idx, int trk_idx, const char *why) {
@@ -247,6 +250,10 @@ void ntx_session_trk_free(struct ntx_session *s) {
 static void trk_http_apply(struct ntx_session *s, int tts_idx, int trk_idx, const char *url,
                            const uint8_t *body, size_t bn);
 
+/* Announce fetch seam: tests swap this to inject NTX_HTTP_E_PIN without a TLS
+ * server. Production always calls ntx_http_get. */
+int (*strk_http_get)(const char *url, uint8_t *out, size_t cap, size_t *out_n) = ntx_http_get;
+
 static void trk_http_announce(struct ntx_session *s, int tts_idx, int trk_idx, const char *url, int event) {
     ntx_torrent *t = &s->tts[tts_idx];
     if (trk_is_dead(s, tts_idx, trk_idx)) return;
@@ -264,7 +271,17 @@ static void trk_http_announce(struct ntx_session *s, int tts_idx, int trk_idx, c
     }
     uint8_t body[8192];
     size_t bn = 0;
-    if (ntx_http_get(full, body, sizeof body, &bn) != 0) {
+    int hrc = strk_http_get(full, body, sizeof body, &bn);
+    if (hrc == NTX_HTTP_E_PIN) { /* §5.5 fail-closed: never retry a rejected key */
+        s->trk_pin_fail[tts_idx][trk_idx] = 1;
+        s->trk_fail[tts_idx][trk_idx] = NTX_TRK_MAX_FAIL;
+        s->trk_http_pending[tts_idx][trk_idx] = 0;
+        if (s->cfg && s->cfg->verbose)
+            ntx_diag( "ntx: trk http pin fail: %s\n", url);
+        return;
+    }
+    /* E_PIN return site lands with Task B3; seam pinned here */
+    if (hrc != 0) {
         trk_note_fail(s, tts_idx, trk_idx, "http");
         if (s->cfg && s->cfg->verbose)
             ntx_diag( "ntx: trk http connect fail: %s\n", url);

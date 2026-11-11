@@ -156,5 +156,51 @@ int main(void) {
     close(fd);
     printf("PASS bad_args\n");
 
+    /* A5 extension: a decoy file that already exists must be provably untouched
+     * by the read-only store — same mtime (both clocks) and same bytes — while
+     * every write API on that store fails. No new file under test/ is created
+     * for this: the decoy is a tracked source file of the suite. */
+    {
+        static const char *decoys[] = {"test/t_store_ro.c", "test/t_store_ro.c"};
+        const char *dp = decoys[0];
+        struct stat d0;
+        if (stat(dp, &d0) != 0) fail("decoy_stat");
+        int dfd = open(dp, O_RDONLY);
+        if (dfd < 0) fail("decoy_open");
+        off_t dlen = lseek(dfd, 0, SEEK_END);
+        if (dlen <= 0) fail("decoy_len");
+        static uint8_t dbuf[1 << 16];
+        if (dlen > (off_t)sizeof dbuf) dlen = (off_t)sizeof dbuf;
+        if (pread(dfd, dbuf, (size_t)dlen, 0) != dlen) fail("decoy_read");
+
+        ntx_store dst;
+        if (ntx_store_open_ro_fd(&dst, dfd, (uint64_t)dlen, PS) != 0) fail("decoy_ro_open");
+        if (dst.ro != 1) fail("decoy_ro_flag");
+        static uint8_t junk[4096];
+        memset(junk, 0x5A, sizeof junk);
+        for (uint32_t i = 0; i < dst.np; i++)
+            if (ntx_store_write(&dst, i, 0, junk, sizeof junk) != -1) fail("decoy_write_allowed");
+        if (ntx_store_complete(&dst, 0, junk) != 0) fail("decoy_complete_claimed");
+        for (uint32_t i = 0; i < dst.np; i++)
+            if (ntx_store_pmap(&dst, i) != 0) fail("decoy_pmap_touched");
+        if (ntx_store_verified_bytes(&dst) != 0) fail("decoy_verified");
+        ntx_store_close(&dst);
+        if (fcntl(dfd, F_GETFD) == -1) fail("decoy_fd_closed");
+
+        struct stat d1;
+        if (stat(dp, &d1) != 0) fail("decoy_stat2");
+        if (d1.st_size != d0.st_size || d1.st_mtime != d0.st_mtime ||
+            d1.st_mtim.tv_nsec != d0.st_mtim.tv_nsec || d1.st_ctim.tv_nsec != d0.st_ctim.tv_nsec ||
+            d1.st_ctim.tv_sec != d0.st_ctim.tv_sec || d1.st_ino != d0.st_ino)
+            fail("decoy_mtime_changed");
+        static uint8_t again[1 << 16];
+        int d2 = open(dp, O_RDONLY);
+        if (d2 < 0 || read(d2, again, (size_t)dlen) != dlen) fail("decoy_reread");
+        close(d2);
+        if (memcmp(again, dbuf, (size_t)dlen) != 0) fail("decoy_bytes_changed");
+        close(dfd);
+        printf("PASS decoy_untouched\n");
+    }
+
     return 0;
 }

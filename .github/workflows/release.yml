@@ -87,8 +87,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Release gate (design §6.2): every built-in share-tracker key must still verify
+      # against the system CA store, no host may answer a full scrape, and at least
+      # NTX_SHARE_MIN_TRACKERS hosts must qualify. A blocking row fails the release.
+      - name: Share tracker pins gate
+        run: make pins-check
+
       - name: Build
         run: make ntx NTX_VERSION="$NTX_RELEASE_VERSION"
+
+      # The test table (-DNTX_SHARE_TRACKERS_INC) must never reach a published binary.
+      - name: No test trackers in the release binary
+        run: |
+          ! strings ntx | grep -q NTX-TEST-TRACKERS \
+            || { echo "ntx contains the NTX-TEST-TRACKERS banner"; exit 1; }
 
       - name: Size gate (< 1 MiB)
         run: make size

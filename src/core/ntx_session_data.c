@@ -209,6 +209,7 @@ static int data_opt_pi = -1;
 
 static int data_ratio_threshold_hit(struct ntx_session *s, int ti) {
     if (ti < 0 || ti >= s->n_tts) return 0;
+    if (s->share[ti]) return 0; /* §5.5: the author is often the only source — no ratio cap */
     ntx_torrent *t = &s->tts[ti];
     if (t->size == 0) return 0;
     return s->tts_up[ti] >= (uint64_t)NTX_SEED_RATIO_NUM * t->size;
@@ -497,6 +498,12 @@ static void data_refuse(struct ntx_session *s, int pi, uint32_t idx, uint32_t of
 /* Read the block and put it on the wire. 0 = sent (counted as uploaded), -1 = could not. */
 static int data_serve(struct ntx_session *s, int pi, int i, uint32_t idx, uint32_t off, uint32_t len) {
     ntx_torrent *t = &s->tts[i];
+    /* §5.5: a share that is still hashing (or has failed/changed) must never
+     * serve bytes — its store is not the finished, hashed view of the file. */
+    if (!ntx_session_share_serving(s, i)) {
+        data_refuse(s, pi, idx, off, len);
+        return -1;
+    }
     uint8_t buf[NTX_PEER_REQ_LEN];
     int n = ntx_store_read(&t->store, idx, off, buf, len);
     if (n <= 0) {
@@ -857,6 +864,10 @@ void ntx_session_data_verify_tick(struct ntx_session *s) {
     for (int i = 0; i < s->n_tts; i++) {
         ntx_torrent *t = &s->tts[i];
         if (t->state != NTX_TTS_VERIFY) continue;
+        /* A share holds VERIFY while it hashes, when np is still 0: verifying it
+         * here would read have_n == np == 0 as "complete" and announce a torrent
+         * whose info-hash is forty zeros (§5.3). ntx_share.c owns that slot. */
+        if (s->share[i]) continue;
         uint32_t budget = (2u * 1024u * 1024u) / (t->ps ? (uint32_t)t->ps : 1u);
         if (budget < 1u) budget = 1u;
         uint32_t to = t->verify_off + budget;
@@ -914,7 +925,14 @@ void ntx_session_holepunch_dial(struct ntx_session *s, int tts_idx, const ntx_ad
      * punched endpoint; punch_fail = dial refused before launch (dedup,
      * caps, alloc, dead route). This is the single
      * aggregation site for the counters. */
-    if (ntx_session_add_peer_dial_ex(s, tts_idx, addr, port, 1)) /* the remote dials us as well: no back-off */
+    /* A punch is never held back by the redial back-off and is tagged by its
+     * real origin, so a private slot refuses it (BEP27 §4.4) instead of being
+     * dialled through the tracker tag.
+     * ponytail: clears the endpoint's back-off instead of a force+src dial
+     * variant, because ntx_session.c has none. Upgrade: add
+     * ntx_session_add_peer_dial_ex_src(s,…,force,src) there. */
+    ntx_dial_bo_ok(&s->dial_bo, addr, port);
+    if (ntx_session_add_peer_src(s, tts_idx, addr, port, NTX_PSRC_HOLEPUNCH))
         s->hp_dial_ok++;
     else
         s->hp_dial_fail++;

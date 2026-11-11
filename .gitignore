@@ -13,6 +13,7 @@ test/.riscv64*.tmp
 /ntx
 /ntx-mipsel
 /ntx-riscv64
+/ntx-sharetest
 test/t_*
 !test/t_*.c
 

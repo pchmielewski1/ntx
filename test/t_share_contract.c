@@ -174,9 +174,15 @@ int main(void) {
     if (strcmp(ntx_share_tracker_get(1)->host, "trk-b.example") != 0) fail("trk_get");
     if (ntx_share_tracker_get(2) != NULL) fail("trk_get_oob");
     e = NTX_SHARE_OK;
-    if (ntx_session_share_add(s, "test/t_share_contract.c", NULL, &e) != -1 ||
-        e != NTX_SHARE_E_BAD_ARG)
-        fail("add_bad_arg");
+    {
+        /* Task A5 replaced the share stub, so this is no longer the stub's
+         * E_BAD_ARG: with two test trackers a regular file yields a live slot
+         * (task-A5 brief, case 1). Removed again so the stub-state pins below
+         * still describe a bare session. */
+        int si = ntx_session_share_add(s, "test/t_share_contract.c", NULL, &e);
+        if (si < 0 || e != NTX_SHARE_OK) fail("add_real_file");
+        ntx_session_remove(s, si);
+    }
     ntx_share_trackers_test_set(NULL, -1); /* built-in list restored */
 
     /* The built-in list IS the Task 0 survey (7 hosts, docs/network.md) and the
