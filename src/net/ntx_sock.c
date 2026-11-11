@@ -276,9 +276,17 @@ static int sock_v6_default_route(void) {
 }
 
 /* Test hook: point the route probe at a fixture (NULL => the real file) and
- * drop the cache, so both answers are reachable in one process. */
+ * drop the cache, so both answers are reachable in one process. The path is
+ * copied: the caller may pass a string that dies before the next resolve. */
 void ntx_sock_test_set_route_file6(const char *path) {
-    sock_route6_path = path ? path : "/proc/net/ipv6_route";
+    static char copy[256];
+    if (!path) {
+        sock_route6_path = "/proc/net/ipv6_route";
+    } else {
+        strncpy(copy, path, sizeof copy - 1);
+        copy[sizeof copy - 1] = '\0';
+        sock_route6_path = copy;
+    }
     sock_route6_cached = -1;
 }
 

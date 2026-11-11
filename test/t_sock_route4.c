@@ -61,7 +61,10 @@ int ntx_doh_lookup_a(const char *host, uint32_t *ip_out) {
 #define BLACKHOLE_ROUTE6 "test/.scratch/sock_route4/v6_blackhole"
 #define MISSING_ROUTE6 "test/.scratch/sock_route4/definitely_absent"
 
-/* Real /proc/net/ipv6_route layout: <dst-hex> <plen-hex> <nexthop-hex> <plen> ... */
+/* Real /proc/net/ipv6_route layout (9 fields, hex):
+ * <dst> <dlen> <nexthop> <glen> <src> <metric> <refcnt> <use> <flags> <dev>.
+ * Every line below carries usable flags (RTF_UP=1) and a sane metric, so a gate
+ * that forgets the flags/metric check still passes this fixture by accident. */
 static const char NO_ROUTE6_TEXT[] =
     "fe800000000000000000000000000000 40 00000000000000000000000000000000 00 "
     "00000000000000000000000000000000 00000100 00000001 00000000 00000001 eth0\n"
@@ -69,7 +72,15 @@ static const char NO_ROUTE6_TEXT[] =
     "00000000000000000000000000000000 00000100 00000001 00000000 00000001 lo\n"
     /* trap: prefix length 0 on a NON-zero destination is not the default route */
     "20010db8000000000000000000000000 00 00000000000000000000000000000000 00 "
-    "00000000000000000000000000000000 00000100 00000001 00000000 00000001 eth0\n";
+    "00000000000000000000000000000000 00000100 00000001 00000000 00000001 eth0\n"
+    /* trap: all-zero dst at the WRONG prefix length — only ::/0 is a default */
+    "00000000000000000000000000000000 40 00000000000000000000000000000000 00 "
+    "00000000000000000000000000000000 00000100 00000001 00000000 00000001 eth0\n"
+    "00000000000000000000000000000000 80 00000000000000000000000000000000 00 "
+    "00000000000000000000000000000000 00000100 00000001 00000000 00000001 eth0\n"
+    /* trap: ::1 with prefix 0 — a dst[0]=='0' / startswith test reads this as :: */
+    "00000000000000000000000000000001 00 00000000000000000000000000000000 00 "
+    "00000000000000000000000000000000 00000100 00000001 00000000 00000001 lo\n";
 
 static const char WITH_ROUTE6_TEXT[] =
     "fe800000000000000000000000000000 40 00000000000000000000000000000000 00 "
@@ -183,7 +194,9 @@ static void case_blackhole_default_is_no_route(void) {
     check(aaaa_calls == 0, "blackhole-v6-default-never-asks-AAAA");
 }
 
-/* 6 — unreadable route file (no IPv6 support at all) behaves as "no route". */
+/* 6 — unreadable route file (no IPv6 support at all) behaves as "no route", and
+ * stays that way: the answer must be CACHED on the open-failure path too, so a
+ * second resolve does not re-read (and does not fail open to AAAA). */
 static void case_missing_route_file_is_no_route(void) {
     aaaa_calls = a_calls = 0;
     ntx_sock_test_set_route_file6(MISSING_ROUTE6);
@@ -191,6 +204,48 @@ static void case_missing_route_file_is_no_route(void) {
     check(ntx_sock_resolve(HOST_BOTH, &a) == 0 && is_v4(&a, htonl(A_REC)),
           "missing-route-file-falls-back-to-A");
     check(aaaa_calls == 0, "missing-route-file-never-asks-AAAA");
+    /* Same again: caching the failure is what keeps AAAA from being tried on
+     * the second call (sock_route6_cached = ok, not f ? ok : -1/1). */
+    check(ntx_sock_resolve(HOST_BOTH, &a) == 0 && is_v4(&a, htonl(A_REC)) &&
+              aaaa_calls == 0,
+          "missing-route-file-stays-cached-on-2nd-resolve");
+}
+
+/* 7 — the file is read ONCE: mutating the fixture under a live cache must not
+ * change the answer. (A gate that re-reads per resolve flips v6 -> v4 here.) */
+#define MUTABLE_ROUTE6 "test/.scratch/sock_route4/mutable"
+
+static void case_route_file_read_once(void) {
+    if (write_fixture(MUTABLE_ROUTE6, WITH_ROUTE6_TEXT) != 0) {
+        check(0, "mutable-fixture-write");
+        return;
+    }
+    aaaa_calls = a_calls = 0;
+    ntx_sock_test_set_route_file6(MUTABLE_ROUTE6);
+    ntx_addr a;
+    check(ntx_sock_resolve(HOST_BOTH, &a) == 0 && is_rec_v6(&a),
+          "read-once-first-resolve-is-v6");
+    if (write_fixture(MUTABLE_ROUTE6, NO_ROUTE6_TEXT) != 0) {
+        check(0, "mutable-fixture-rewrite");
+        return;
+    }
+    check(ntx_sock_resolve(HOST_BOTH, &a) == 0 && is_rec_v6(&a) &&
+              aaaa_calls == 2 && a_calls == 0,
+          "read-once-rewrite-under-live-cache-changes-nothing");
+}
+
+/* 8 — the hook copies the path: the caller's buffer may be gone by the next
+ * resolve (a hook that stored the pointer would read clobbered stack here). */
+static void case_hook_copies_the_path(void) {
+    char buf[64];
+    snprintf(buf, sizeof buf, "%s", WITH_ROUTE6);
+    aaaa_calls = a_calls = 0;
+    ntx_sock_test_set_route_file6(buf);
+    memset(buf, 'X', sizeof buf); /* caller's string dies */
+    ntx_addr a;
+    check(ntx_sock_resolve(HOST_BOTH, &a) == 0 && is_rec_v6(&a) &&
+              aaaa_calls == 1 && a_calls == 0,
+          "hook-copies-path-after-buffer-clobbered");
 }
 
 int main(void) {
@@ -204,6 +259,8 @@ int main(void) {
     case_no_record_fails();
     case_blackhole_default_is_no_route();
     case_missing_route_file_is_no_route();
+    case_route_file_read_once();
+    case_hook_copies_the_path();
     ntx_sock_test_set_route_file6(NULL); /* leave the hook off for any re-use */
     if (!fails) printf("PASS sock-route4\n");
     else printf("FAIL sock-route4\n");
