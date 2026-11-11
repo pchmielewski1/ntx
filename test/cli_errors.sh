@@ -77,7 +77,7 @@ expect_exact() {
   fi
   if ! grep -Fxq -- "$want_line" "$TMP/err"; then
     echo "FAIL $name: stderr lacks the exact line:" >&2
-    sed 's/^/    want| /' <<<"$want_line" >&2
+    printf '%s\n' "$want_line" | sed 's/^/    want| /' >&2
     sed 's/^/    got | /' "$TMP/err" | head -5 >&2
     fails=$((fails + 1))
     return
