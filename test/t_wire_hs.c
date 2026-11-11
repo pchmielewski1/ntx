@@ -257,6 +257,20 @@ int main(void) {
         WH(got[27] == 0x15, "hybrid+dht reserved[7]==0x15");
         cfg.dht = 0;
 
+        /* ---- §7.1: no slot chosen, no hash advertised -------------------- */
+        /* An inbound plaintext peer we have not matched yet has peer_tts < 0. The
+         * builder must not fall back to the first live slot — that is the port-scan
+         * info-hash leak §7.1 removes. m[0] == 0 is the caller's "send nothing". */
+        s->peer_tts[3] = -1;
+        memset(got, 0xA5, sizeof got);
+        sp_build_bt_handshake(s, 3, got);
+        WH(got[0] == 0, "unbound peer gets no handshake (m[0]==0)");
+        int hash_leak = 0;
+        for (int k = 20; k < 48; k++)
+            if (got[k]) hash_leak = 1;
+        WH(!hash_leak, "unbound HS carries no info hash");
+        s->peer_tts[3] = 1;
+
         /* ---- Step 2: pure-v2 join by trunc20(sha256(info)) */
         WH(sp_match_tts(s, sha2_b) == 2, "pure-v2 joins via exact trunc20 root");
         /* hybrid still joins by its advertised v1 sha1 */

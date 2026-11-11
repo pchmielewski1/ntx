@@ -67,6 +67,14 @@ void sp_plaintext_fallback(struct ntx_session *s, int pi) {
         return;
     }
     ntx_pe *pe = &s->pe[pi];
+    if (s->peer_outbound[pi]) {
+        /* §7: we dialled, so the torrent is already known — a share is MSE-only. */
+        int ti = s->peer_tts[pi];
+        if (ti >= 0 && ti < s->n_tts && s->tts_enc_strict[ti]) {
+            sp_drop(s, pi, "plaintext_strict_share");
+            return;
+        }
+    }
     s->peer_plain[pi] = 1;
     s->peer_phase[pi] = PH_BTHS;
     s->peers[pi].st = NTX_PEER_ST_HS;
@@ -79,7 +87,9 @@ void sp_plaintext_fallback(struct ntx_session *s, int pi) {
     }
     pe->inn = 0;
     sp_vlog_peer(s, pi, "plaintext", "compat fallback");
-    ntx_session_peer_send_handshake(s, pi);
+    /* §7.1: an initiator we did not dial gets no byte until its own hash
+     * arrived and matched a slot — sp_bths_try answers from there. */
+    if (s->peer_outbound[pi]) ntx_session_peer_send_handshake(s, pi);
 }
 
 void sp_pe_finish(struct ntx_session *s, int pi) {

@@ -204,6 +204,10 @@ void ntx_session_peer_on_connect(struct ntx_session *s, int fd, void *ctx) {
         ntx_session_peer_on_rw(s, fd, ctx);
 }
 
+/* Body in ntx_session_bt_hs.c: the MSE responder's HS, built at accept time before
+ * the torrent is known (safe — it only ever goes out RC4-encrypted after SKEY). */
+void sp_build_mse_responder_hs(struct ntx_session *s, uint8_t m[68]);
+
 void ntx_session_peer_on_accept(struct ntx_session *s, ntx_netx *n, int peer_fd, void *ctx) {
     (void)ctx;
     sp_g_s = s;
@@ -225,7 +229,9 @@ void ntx_session_peer_on_accept(struct ntx_session *s, ntx_netx *n, int peer_fd,
     sp_pe_set_infohash(s, pi);
     {
         uint8_t hs[68];
-        sp_build_bt_handshake(s, pi, hs);
+        /* The MSE responder's HS is only ever sent RC4-encrypted after SKEY
+         * matched, so it is safe to build before the torrent is known. */
+        sp_build_mse_responder_hs(s, hs);
         ntx_pe_set_bt_handshake(&s->pe[pi], hs);
     }
     ntx_cbs cbs = {sp_rw_cb, sp_rw_cb, peer_cl_cb};

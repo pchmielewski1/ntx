@@ -45,6 +45,7 @@ int sp_promote_peer_ok(struct ntx_session *s, int pi, const uint8_t hs[68]) {
     s->peer_buflen[pi] = n;
     s->peer_phase[pi] = PH_OK;
     if (s->peers[pi].fd <= -NTX_UTP_VIRT_BASE) s->utp_ok_n++;
+    if (!s->peer_outbound[pi]) s->tts_in_ok[ti]++; /* §7: inbound reachability of the share */
     memcpy(s->peers[pi].id, hs + 48, 20); /* BEP55 race tie-break key */
     s->peers[pi].id_set = 1;
     if (ti >= 0 && ti < s->n_tts)
@@ -89,20 +90,7 @@ void sp_bths_resync(uint8_t *buf, size_t *bl) {
     }
 }
 
-void sp_build_bt_handshake(struct ntx_session *s, int pi, uint8_t m[68]) {
-    int ti = s->peer_tts[pi];
-    if (ti < 0) {
-        for (int i = 0; i < s->n_tts; i++) {
-            if (s->tts[i].state != NTX_TTS_DEAD) {
-                ti = i;
-                break;
-            }
-        }
-    }
-    if (ti < 0 || ti >= s->n_tts) {
-        memset(m, 0, 68);
-        return;
-    }
+static void sp_fill_bt_handshake(struct ntx_session *s, int ti, uint8_t m[68]) {
     m[0] = 19;
     memcpy(m + 1, "BitTorrent protocol", 19);
     memset(m + 20, 0, 8);
@@ -122,6 +110,34 @@ void sp_build_bt_handshake(struct ntx_session *s, int pi, uint8_t m[68]) {
     if (s->tts[ti].hybrid || s->tts[ti].meta_version == 2) m[27] |= 0x10;
     memcpy(m + 28, s->tts[ti].info_hash, 20);
     memcpy(m + 48, s->peer_id, 20);
+}
+
+/* §7.1: no slot chosen means no hash to advertise. Answering an initiator whose
+ * hash we have not seen (or refusing a strict slot) must never leak one. */
+void sp_build_bt_handshake(struct ntx_session *s, int pi, uint8_t m[68]) {
+    int ti = s->peer_tts[pi];
+    if (ti < 0 || ti >= s->n_tts || s->tts[ti].state == NTX_TTS_DEAD) {
+        memset(m, 0, 68);
+        return;
+    }
+    sp_fill_bt_handshake(s, ti, m);
+}
+
+/* The MSE responder's own handshake, offered at accept time, before the torrent
+ * is known. Unchanged by §7.1: it only ever goes out RC4-encrypted under keys
+ * derived from an info hash the initiator already proved with SKEY, so a scanner
+ * cannot read it.
+ * ponytail: still the first live slot, as before §7.1. Ceiling: a multi-slot
+ * session whose SKEY matched a non-first candidate answers with the wrong hash
+ * (pre-existing). Upgrade: let ntx_pe set bt_hs after RECV_SKEY, where
+ * pe->infohash holds the matched hash, and drop this function. */
+void sp_build_mse_responder_hs(struct ntx_session *s, uint8_t m[68]) {
+    for (int i = 0; i < s->n_tts; i++)
+        if (s->tts[i].state != NTX_TTS_DEAD) {
+            sp_fill_bt_handshake(s, i, m);
+            return;
+        }
+    memset(m, 0, 68);
 }
 
 void sp_peer_ok_hello(struct ntx_session *s, int pi) {
@@ -199,12 +215,22 @@ int sp_bths_try(struct ntx_session *s, int pi) {
         return 1;
     }
     s->peer_tts[pi] = ti;
+    /* §7/§7.1: the first byte we send on an inbound plaintext connection is this
+     * reply, so it happens only now — after the hash is known and matched. */
+    if (s->peer_plain[pi] && !s->peer_outbound[pi]) {
+        if (s->tts_enc_strict[ti]) {
+            sp_drop(s, pi, "plaintext_strict_share");
+            return 1;
+        }
+        ntx_session_peer_send_handshake(s, pi);
+    }
     sp_note_peer_fast(s, pi, buf);
     sp_setup_phave(s, pi, ti);
     memmove(buf, buf + 68, *bl - 68);
     *bl -= 68;
     s->peer_phase[pi] = PH_OK;
     if (s->peers[pi].fd <= -NTX_UTP_VIRT_BASE) s->utp_ok_n++;
+    if (!s->peer_outbound[pi]) s->tts_in_ok[ti]++; /* §7: inbound reachability of the share */
     s->peers[pi].st = NTX_PEER_ST_OK;
     s->peers[pi].hs_t0 = ntx_mono_ms(); /* ok_t0 */
     {
