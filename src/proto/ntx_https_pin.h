@@ -15,8 +15,12 @@ void ntx_https_set_tofu_path(const char *path);
 void ntx_https_tofu_set_enabled(int on);  /* default 1 */
 int  ntx_https_tofu_enabled(void);
 
-/* TOFU note after the handshake — seen = unix time */
-int  ntx_https_tofu_note(const char *host, const uint8_t pin[32]); /* 1=ok, -1=bad host */
+/* TOFU note after the handshake — seen = unix time.
+ * -1 also for a host in the share-tracker pool: those are fail-closed (§6.1),
+ * so they never enter TOFU and their pins never come from the TOFU store. */
+int  ntx_https_tofu_note(const char *host, const uint8_t pin[32]); /* 1=ok, -1=bad host or share host */
+/* Sources, first match wins: built-in pin pool → test pool → share-tracker
+ * pool (fail-closed) → pin file → TOFU. */
 int  ntx_https_pin_lookup(const char *host, uint16_t port,
     uint8_t out_pins[][32], int max_pins, int *out_npins);
 
