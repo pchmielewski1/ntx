@@ -45,6 +45,10 @@ Defaults are those of `ntx_main.c`. `ntx --help` prints the same list.
 | `--utp` | off | Enable uTP (BEP 29) on the shared UDP socket. Outbound dials go over uTP first; a dial still unanswered after `NTX_UTP_DIAL_MS` (1500 ms) is retried over TCP. After 40 such misses without a single working uTP peer the session stops trying uTP first. Incoming uTP connections are accepted. If the UDP port cannot be bound, uTP stays off. Not used when a tunnel is established. Details: [network.md](network.md). |
 | `--compat-peers` | on | Allow plaintext BitTorrent when message-stream encryption (MSE/PE) fails. The flag is accepted for explicitness; it is already on by default and there is no option to turn it off. |
 | `--allow-local-peers` | off | Also dial peer addresses that are normally refused: `0.0.0.0/8`, loopback, link-local (`169.254.0.0/16`, includes the cloud metadata address), multicast / reserved (`224.0.0.0` and above) and the IPv6 equivalents (`::`, `::1`, `fe80::/10`, `ff00::/8`, IPv4-mapped forms of the above). The filter applies to outbound dials, whatever the source of the address (tracker, PEX, DHT, holepunch). Private LAN ranges (RFC 1918, IPv6 ULA) are never blocked. |
+| `--share=PATH` | none | Share a single regular file. `ntx` hashes it, writes a private hybrid `.torrent` into the store directory, announces on the built-in pinned HTTPS share trackers, seeds and prints the magnet link on stdout. `PATH` may be a symlink; the target must be a regular file of size > 0. `--share` is a torrent source, so it cannot be combined with a magnet, a `.torrent` or a link file, and it cannot be given twice. The file is opened read-only, kept open for the whole share and never written to. Details: [storage.md](storage.md), [network.md](network.md#share-trackers-and-pinned-keys). |
+| `--share-from=FILE.torrent` | none | Re-share under an existing link: take the metainfo (name, piece length, hashes) from `FILE.torrent` and verify the file against it instead of hashing it fresh. Only valid together with `--share=`. **Not implemented in this build** — the parser accepts the flag and `ntx_session_share_add` rejects any non-NULL value, so the session exits `1` with `ntx: cannot share <path>: invalid share argument`. |
+| `--port-map` | automatic with a share | Ask the default gateway for a NAT-PMP/PCP port mapping of the listen port (PCP first, NAT-PMP after a version mismatch). Mapping already runs automatically while a share is live; this flag turns it on for a session without one too. Refused together with `--proxy` or `--tunnel`. |
+| `--no-port-map` | off | Never map a port, even while sharing. Mutually exclusive with `--port-map`. |
 | `--no-https-tofu` | TOFU on | Disable trust-on-first-use pinning for HTTPS hosts. Hosts without a built-in or file pin are then refused. |
 | `--https-pin-file=PATH` | none | Extra SPKI pins. One pin per line: `host 64-hex-digits` (SHA-256 of the leaf SubjectPublicKeyInfo). `host` is exact or `*.suffix` (does not match the bare suffix). Lines starting with `#` are comments; at most 16 pins are read. A missing or unreadable file is silently ignored. |
 | `--stats-json` | off | Print NDJSON on stdout instead of the status line and accept commands on stdin. See [json-api.md](json-api.md). |
@@ -63,6 +67,50 @@ TCP is bound on the first free port in `[--port-lo, --port-hi]`. A reversed rang
 - If a tunnel is configured but not established at connect time, peer connections fall through to the proxy or to a direct connection (see [network.md](network.md)).
 - DNS-over-HTTPS lookups connect directly to the pinned resolver addresses; they are **not** routed through `--proxy` or `--tunnel`.
 - Tor/VPN are external: point `--proxy` at a local SOCKS5 daemon (for example `socks5:127.0.0.1:9050`) or use an OS-level VPN. `ntx` does not embed Tor.
+
+### Private shares
+
+Design:
+[superpowers/specs/2026-11-08-private-share-design.md](superpowers/specs/2026-11-08-private-share-design.md);
+`§` references below are sections of that document.
+
+`--share=PATH` turns the session into a seeder for one local file. What happens, in order:
+
+1. Synchronous checks (open, `S_ISREG`, size, name, tracker table, a free slot). A
+   failure here is fatal: `ntx: cannot share <path>: <reason>` on stderr, exit `1`.
+2. The file is hashed (phase `hash`, `@hash` in the status line). `ntx` holds the
+   descriptor for the whole share, so renaming or unlinking the path does not break it.
+3. A private hybrid (v1 + v2) torrent is built and written to
+   `<store-dir>/<name>-<8 hex of ih>.torrent` with mode `0600`; the info dictionary
+   carries `private = 1` and a 16-random-byte `ntx salt` key, so two shares of the
+   same bytes get different links ([protocol.md](protocol.md), [storage.md](storage.md)).
+4. The share is announced on the built-in pinned HTTPS share trackers only — no DHT,
+   no PEX, no holepunch, no non-tracker dials
+   ([network.md](network.md#share-trackers-and-pinned-keys)). Peer connections for the
+   slot require message-stream encryption.
+5. Once at least one share tracker answers, the share is ready: the magnet link goes
+   to **stdout** and the note `ntx: shared — <name> (torrent <path>)` to stderr.
+   `ntx --share=FILE > link.txt` therefore produces a file `ntx` itself accepts.
+
+Behaviour worth knowing:
+
+- The file is opened read-only and is never written to. It is re-`fstat`ed once a
+  second; a change in `st_dev`, `st_ino`, `st_size`, `st_mtime` or `st_ctime` ends the
+  share — the row shows `shr!`, peers are choked, a `stopped` announce is sent, and
+  CLI mode exits `1` with `ntx: share failed: the file changed while sharing`.
+- Share slots are exempt from the upload-ratio cap: `--share` seeds until the file
+  changes or the process is stopped, whatever `--up-limit` or the ratio does to a
+  normal seed.
+- If nothing is ready after 60 s, one diagnostic goes to stderr:
+  `ntx: share <name> not ready after 60s: trackers ok=X dead=Y pinned=Z of W`. When
+  every share tracker failed its pin check the wording instead says
+  `ntx: share <name>: keys in this ntx build are out of date or a MITM is in progress; update ntx`.
+- Dead share trackers are revived with a backoff that starts at 5 minutes and doubles
+  up to 60 minutes. A tracker rejected for a bad SPKI pin is never retried in the
+  session.
+- `--port-map` / `--no-port-map` decide whether `ntx` asks the gateway for an external
+  port while the share runs (design §8); the public swarm is never mapped. Port
+  mapping is on by default whenever a share is live and off otherwise.
 
 ## Validation and exit codes
 
@@ -84,6 +132,11 @@ Command-line errors (exit `2`) are reported on stderr, followed by `ntx: try '<a
 | malformed `--proxy` (other scheme, missing or zero port, text after the port) | `ntx: invalid --proxy value '...' (expected socks5:HOST:PORT)` |
 | malformed `--tunnel` | `ntx: invalid --tunnel value '...' (expected HOST:PORT)` |
 | `--dht` together with `--proxy` or `--tunnel` | `ntx: --dht cannot be combined with --proxy/--tunnel (DHT traffic is UDP and would bypass them)` |
+| `--share` together with a magnet, a `.torrent` or a link file | `ntx: --share cannot be combined with a magnet or .torrent argument` |
+| `--share` given twice | `ntx: --share given twice` |
+| `--share-from` without `--share` | `ntx: --share-from requires --share` |
+| `--port-map` together with `--no-port-map` | `ntx: --port-map and --no-port-map are mutually exclusive` |
+| `--port-map` together with `--proxy` or `--tunnel` | `ntx: --port-map cannot be used with --proxy or --tunnel (inbound traffic would bypass it and the mapping would reveal your address)` |
 | argument that is not a magnet, a `.torrent` name, or a readable file with a magnet on its first line | `ntx: '...' is not a magnet link, a .torrent file, or a readable file whose first line is a magnet link` |
 | extra positional argument | `ntx: unexpected argument '...'` |
 
@@ -93,6 +146,9 @@ Start-up failures (exit `1`):
 |-----------|---------|
 | magnet without a valid `xt=urn:btih:` / `urn:btmh:` | `ntx: invalid magnet link (needs xt=urn:btih:... or urn:btmh:...): ...` |
 | `.torrent` missing, empty or not valid metainfo | `ntx: cannot load .torrent file (missing, empty or not valid metainfo): ...` |
+| `--share` in a build with too few pinned share trackers | `ntx: cannot share: no HTTPS share trackers are pinned in this build` |
+| `--share` whose synchronous checks fail (unreadable, not a regular file, empty, bad name, `--share-from`, no slot) | `ntx: cannot share <path>: <reason>` where `<reason>` is the share module's text — `invalid share argument`, `cannot read the file`, `too many shared files`, `file too large to share`, `this file is already shared`, `the file changed while sharing`, `invalid file name` |
+| a `--share` that fails after it was added (CLI mode only — under `--stats-json` the failure is a JSON `share` event instead) | `ntx: share failed: <reason>`, same table of reasons |
 
 The tests for these cases live in `test/cli_errors.sh` (`make test-cli`).
 
@@ -142,6 +198,14 @@ Tags are appended in this order. Counters are capped at 99.
 | `dnsXX` | Last DNS-over-HTTPS provider that answered: `Q9` Quad9, `OD` OpenDNS, `CD` Control D, `LD` LibreDNS, `UC` UncensoredDNS, `OB` OpenBLD, `DP` DNSPod. `dns..XX`: a lookup is in flight. `dns!`: every provider failed. `dns!XX`: the pin check failed for provider `XX` (possible man-in-the-middle). |
 | `utpN` | `--utp` is on; `N` live uTP connections. Absent without `--utp`. |
 | `punchO/F` | BEP 55 holepunch dials started / refused. Absent until the first one. |
+| `prv` | The metainfo is private (BEP 27: `private` present and non-zero in the info dictionary). |
+| `shr` / `shr!` | This torrent is a `--share`. `shr!` replaces it once the shared file changed on disk and the share was stopped (design §10). |
+| `enc!` | Strict message-stream encryption is in force for this torrent: every peer connection must complete MSE/PE, plaintext peers are dropped without fallback. Set for shares. |
+| `pin!N` | `N` share tracker hosts whose SPKI pin check failed (possible man-in-the-middle, or the built-in keys are out of date — see [network.md](network.md#share-trackers-and-pinned-keys)). Capped at 99; absent when `N` is 0. |
+| `map:<port>` | Port mapping is `active` and the gateway handed back external port `<port>` (design §8). |
+| `map!cg` | The gateway mapped a CGNAT-range external address (`100.64.0.0/10`), so inbound connections are unlikely to work. |
+| `map-` | Port mapping is on but there is no usable external port yet: pending, unsupported by the gateway, or active with no port reported. |
+| `inN` | Only with `shr`: `N` inbound peers reached the share and completed a strict-encryption handshake. Capped at 99. |
 | `@phase` | Current phase (next table). |
 
 ### Phases
@@ -156,6 +220,7 @@ Tags are appended in this order. Counters are capped at 99.
 | `meta-wait` | A peer is connected but the metadata size is not known yet. |
 | `meta` | Downloading metadata (BEP 9). |
 | `verify` | Scanning existing files on disk after a restart. |
+| `hash` | Only with `--share`: the shared file is being hashed (design §5.3). The bar and percentage show hashing progress, not a download. |
 | `dl` | Pieces are arriving. |
 | `wait` | At least one peer has unchoked us, nothing has arrived yet. |
 | `choked` | Peers connected but none lets us download. |

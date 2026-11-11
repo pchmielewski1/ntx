@@ -37,6 +37,9 @@ Replace `t_sha1` with any file name from the table below. (`test/t_*` binaries a
 | `make test-riscv-shell` | Runs the shell gates (`test-cli`, `test-net`, `test-ipc`, `test-tls13`) against `./ntx-riscv64` under `qemu-riscv64` via `scripts/riscv/run-shell-suites.sh`. Reads the existing `ntx-riscv64`, does not rebuild it, and never touches the native `./ntx`. |
 | `make test-mipsel` | Cross-compiles every `test/t_*.c` to `test/.mipsel.<name>.tmp` and runs each under `qemu-mipsel` via `scripts/mips/run-suite.sh`. Propagates `NTX_TEST_TIMEOUT_SCALE` for TCG timing; timing-sensitive suites use `test/tscale.h`. |
 | `make native-check` | Out-of-tree host compile+run of all `src/` and `test/t_*.c` into `test/.agent-work/native-check/` (`scripts/mips/native-check.sh`). Used to prove mipsel portability edits did not regress the native build; never writes root `.test.tmp` / `ntx`. |
+| `make pins-check` | Release gate for the share-tracker keys: runs `python3 scripts/pins/pins.py check`. Reaches the network (per host, up to 3 `openssl` attempts). Exit `1` means do not publish: a verified key that is not pinned, a WebPKI failure, a host that serves a full `/scrape`, or fewer than `NTX_SHARE_MIN_TRACKERS` (2) qualified hosts. An unreachable host is a warning only. Never run by `make` or `make test`. |
+| `make pins-update` | `python3 scripts/pins/pins.py update`: the only writer of the generated block in `src/proto/ntx_share_trackers.c` and of the share rows of `pins.txt`. Absorbs a verified new key into the row's free pin slot (oldest dropped at 4), prints a unified diff, commits nothing. Refuses to write a block below the host minimum. Also reaches the network. |
+| `make ntx-sharetest` | Builds `./ntx-sharetest`, a release-shaped binary that replaces the tracker table with `scripts/pins/sharetest_trackers.inc` through `-DNTX_SHARE_TRACKERS_INC`. The `.inc` prints a banner, so a test binary cannot be mistaken for a release build. `make clean` removes it. |
 | `make probe` | Builds `./trk_http_probe` from `test/trk_http_probe.c`. It is a manual tool, not a test: it announces a fixed info hash to a few public HTTP trackers and prints `<url> rc=<status> np=<peers>` for each. It needs internet access, and exits 0 if at least one tracker returned peers. |
 | `make clean` | Removes `ntx`, `ntx-mipsel`, `ntx-riscv64`, `trk_http_probe` and the temporary test binaries. |
 
@@ -75,7 +78,10 @@ a fast aarch64 host and a few minutes on an Actions runner. For a sudo-less envi
 - Job `riscv64`, on `ubuntu-22.04`: `make riscv`, `make size-riscv`, `make test-riscv`, `make test-riscv-shell` (after apt-installing `gcc-riscv64-linux-gnu`, `libc6-dev-riscv64-cross` and `qemu-user`).
 - Job `sanitizers`, on `ubuntu-latest`: `make test` with `CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -std=c11 -D_POSIX_C_SOURCE=200809L"` and `ASAN_OPTIONS=detect_leaks=0`. (Overriding `CFLAGS` drops `-Werror`.)
 
-`make test-live`, `make test-interop`, the other interop scripts and `make probe` are not run in CI.
+`make test-live`, `make test-interop`, the other interop scripts, `make probe` and the two
+network-touching share targets `make pins-check` / `make pins-update` are not run in CI. The
+share suites run as ordinary `test/t_*.c` suites and need no network; the pins tool runs offline
+from fixtures.
 
 ## Sanitizer sweep
 
@@ -239,15 +245,52 @@ All files are in `test/`.
 | `t_tls_pin.c` | TLS handshake against mock servers: ALPN, TLS 1.3 to 1.2 fallback, SPKI pin set and mismatch |
 | `t_tls_rec_nonce.c` | The TLS 1.2 GCM record layer never reuses a (key, nonce) pair |
 
+### Private shares (BEP 27, `--share`)
+
+Design: [superpowers/specs/2026-11-08-private-share-design.md](superpowers/specs/2026-11-08-private-share-design.md).
+Feature docs: [cli.md](cli.md#private-shares), [protocol.md](protocol.md#private-torrents-bep-27),
+[storage.md](storage.md#sharing-a-file), [network.md](network.md#share-trackers-and-pinned-keys).
+
+| Suite | What it tests |
+|-------|---------------|
+| `t_share_meta.c` | The streaming share hasher and the hybrid v1+v2 builder (design §5.2, §5.3). Golden bytes come from `test/scripts/share_gen.py` (Python `hashlib` plus handwritten bencode) in `test/vectors/share/` (`tiny_1b`, `one_piece_16k`, `exact_multi`, `multi_tail`); the C output must match byte for byte. Covers 1 B, exactly one piece, a multiple of the piece length and a multiple plus 1 B, and the rule that `piece layers` exist only above one piece. The metainfo validator is the second gate: the built `info` + layers must validate and come out private. |
+| `t_share_out.c` | Magnet builder, the atomic `0600` `.torrent` writer and the name checks (design §5.4). A name with `&`, `%`, `#`, `+`, a space and UTF-8 must survive a magnet round trip through `ntx_magnet_parse`; the `.torrent` basename must stay inside `NAME_MAX` with the stem cut on a UTF-8 boundary while the name inside the torrent stays whole. The "same hash" rule is checked against a real parse of the existing file (`ntx_be_parse` + SHA-1 of the raw `info`), so the fixtures are hand-built bencode. |
+| `t_share_session.c` | Share lifecycle in the session (design §5.1-§5.5) with a loopback `ntx_netx` and a forked local TCP tracker on loopback (the trackers are plain `http://` — HTTPS is enforced by the built-in list and by `pins.py`, not here). Cases: the synchronous gates (`io` for a directory or an empty file, `bad_name` for a control character, `no_trackers` with an emptied table), hashing (`phase == "hash"`, `share == 1`, zero info hash, tick under 50 ms, nothing served while hashing), the finished state (`DONE`, all pieces had, read-only store over the held fd, `pre_complete`, the `.torrent` present, the source file untouched), the `started` announce after the mapping settles and exactly one event per share, `remove` during hashing, a pin failure that is never revived, tracker revival at 300 s then 600 s, the ratio exemption, the piece-count ceiling and the `changed` warning, and the A3-to-A4 round trip through the real validator. |
+| `t_share_contract.c` | The share/portmap/policy surface exists and behaves as specified (design §13). Also pins the built-in table at seven hosts, which is what makes the `test/cli_errors.sh` help gate meaningful. |
+| `t_share_pins.c` | Share-tracker hosts are pinned through the built-in share pool and never reach TOFU; a pin mismatch on an HTTPS GET surfaces as `NTX_HTTP_E_PIN` (design §6.1). Mock handshake (`NTX_HTTP_TEST_HOOKS`) on loopback — no DNS, no internet. |
+| `t_pcp.c` | PCP (RFC 6887) / NAT-PMP (RFC 6886) codec (design §8) against the committed golden vectors `test/vectors/pcp/pcp.bin` + `.meta.json`, generated by `test/scripts/pcp_vectors.py` with `struct` and no shared code. Every builder must reproduce its vector byte for byte; every parser case must return exactly `0` / `-1` / `-2` / `1` and, on success, only the fields a well-formed matching response carries. Cases are copied into a `0xDB`-poisoned buffer, so any read past `n` sees a value no legal packet holds. Also the CGNAT / private classifier on the 16-byte form. |
+| `t_portmap.c` | The port-mapping driver: default-route gateway discovery from the (test-overridable) route files, the PCP-then-NAT-PMP fallback, the nonce / protocol / port checks on the source address, retransmission to the retry cap, lifetime cap and renewal at half the grant, epoch rollback, the lifetime-0 delete on stop, CGNAT detection, and that nothing starts under a proxy or tunnel. |
+| `t_priv_bep27.c` | BEP 27 (design §4): a torrent whose info dictionary carries a non-zero `private` never touches DHT, PEX or `ut_holepunch`, is only dialled at tracker-sourced addresses, and a magnet that turns out to be private drops the outbound connections dialled before the info dictionary was known. Public controls dial `127.0.0.x`, so the refused private cases never reach the socket layer. |
+| `t_pe_strict.c` | Strict MSE for shares and the inbound-plaintext hold (design §7, §7.1): an inbound plaintext connection gets no answer before its initiator hash arrived and matched a slot (the port-scan info-hash leak); after a match a strict slot is refused without sending a byte, every other slot is answered with the **matched** slot's handshake; an outbound connection answered in plaintext by a strict slot is dropped; MSE to a strict slot still works and counts as an inbound success. |
+| `t_cli_tags.c` | The status-line tags of design §10 (see [cli.md](cli.md#diagnostic-tags)): `prv`, `shr` / `shr!`, `enc!`, `pin!N`, `map:<port>` / `map-` / `map!cg`, `inN`, and the `hash` phase — their relative order, their gating (no tags on a plain torrent, `in0` shown for a share, `pin!` suppressed at 0), the `@hash` rendering, and the `CLI_MAX_LINE` budget: the widest tail ` prv shr! enc! pin!99 map:65535 in99` fits, and an over-long line is cut on a tag boundary from the end, never torn. |
+| `t_store_ro.c` | The read-only store used by a share (`ntx_store_open_ro_fd`): one part over a caller-owned descriptor, no `open` / `ftruncate` / `mkdir`, no close of the caller's fd, and reads at the piece offset. |
+
+### Share tracker key gate
+
+`scripts/pins/pins.py` is exercised offline by **`test/pins_tool.sh`**, run from `make test-cli`.
+It replays recorded `openssl` results from `test/vectors/pins/<case>/fixture.txt` — cases `ok`,
+`new-key`, `webpki`, `full-scrape`, `unreachable`, `few-hosts` — and asserts the exit code of the
+§6.2 gate table plus one expected report row per case. No network and no real keys are touched.
+The fixtures record `HOST` / `PROBE … verify` / `PROBE … cert` / `PROBE … scrape` /
+`PROBE … unreachable` lines; certificates come from `openssl req -x509 -newkey rsa:2048 -nodes`
+and every pin is computed with the tool, never hand-typed.
+
+The online commands `make pins-check` and `make pins-update` are **not** part of `make test` or
+CI — they are the only targets allowed to reach the network, and they are run by hand at release
+time ([network.md](network.md#key-maintenance-and-the-release-gate)). `make ntx-sharetest` builds
+a binary against `scripts/pins/sharetest_trackers.inc` for manual end-to-end checks; the `.inc`
+prints a banner so it can never be mistaken for a release build.
+
 ## Other test programs and scripts
 
 | File | Purpose |
 |------|---------|
-| `test/cli_errors.sh` | `make test-cli` |
+| `test/cli_errors.sh` | `make test-cli`. Includes the `--share` / `--share-from` / `--port-map` block: the exact exit-2 wording (`--share cannot be combined with a magnet or .torrent argument`, `--share given twice`, `--share-from requires --share`, `--port-map and --no-port-map are mutually exclusive`, `--port-map cannot be used with --proxy or --tunnel (…)`), the exit-1 startup failures (`cannot share` for a directory, an empty file, a missing path, a control character in the name, and `--share-from` with a junk file), and the §6.4 help gate — a second binary built with `-DNTX_SHARE_TRACKERS_INC` pointing at a one-host table must not show the share options in `--help` at all and must answer `--share` with the `no_trackers` text and exit `1`. The built-in table itself is never edited here. |
 | `test/net_loopback.sh` | `make test-net` |
 | `test/tls13_interop.sh`, `test/tls_probe.c` | `make test-tls13` |
 | `test/interop/interop.sh`, `test/interop/Dockerfile`, `test/interop/tracker.py` | `make test-interop` (a minimal tracker runs next to `transmission-daemon` because its own announce endpoint is not usable) |
-| `test/interop/ipc/interop_ipc.sh`, `assert_ipc.py` | `make test-ipc` |
+| `test/interop/ipc/interop_ipc.sh`, `assert_ipc.py` | `make test-ipc`. Drives a real `--stats-json` pipe; the `share` cases assert the synchronous errors only (a missing file and a directory must answer `io`, or `no_trackers` in a build whose tracker table is unusable) |
+| `test/pins_tool.sh` | Offline gate for `scripts/pins/pins.py`, run from `make test-cli`; see [Share tracker key gate](#share-tracker-key-gate) |
 | `test/interop/v2/` | BEP52 interop matrix, run by hand; see [`test/interop/v2/README.md`](../test/interop/v2/README.md) |
 | `test/interop/utp/` | BEP29 uTP interop matrix (raw peer, relay and container engines), run by hand with `test/interop/utp/interop_utp.sh` |
 | `test/run_magnet.sh`, `test/run_magnet_120.sh` | Manual smoke tests against a live swarm (internet and a magnet link or `.torrent` you may download). Not part of any Make target |

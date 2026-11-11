@@ -70,27 +70,38 @@ has to stay under the 1 MiB gate of `make size`.
 - **Trade-offs:** faster restart of large torrents versus a new on-disk format that can go
   stale.
 
-### Torrent creation
-- **Today:** not implemented (`ntx` only reads metainfo).
-- **Needed:** hashing a directory into v1/v2/hybrid metainfo and a CLI for it.
+### Sharing a directory
+- **Today:** `--share` publishes exactly one regular file. A directory is refused as a bad
+  share argument, and there is no multi-file metainfo builder.
+- **Needed:** walk the tree, build a multi-file hybrid metainfo (BEP 52 file tree included),
+  and decide how the change detector treats added, removed or renamed members.
+- **Trade-offs:** the single-file share can prove "one file, one hash" cheaply; a directory
+  needs an explicit answer for what "changed" means.
 
-### Private torrents (BEP 27)
-- **Today:** the `private` flag in the info dictionary is not read. `ut_pex` is offered for every
-  torrent, and DHT (when `--dht` is set) is used regardless of the flag. Do not use `ntx` for
-  torrents from private trackers.
-- **Needed:** parse the flag; disable PEX, DHT and (with LSD) local discovery for such torrents.
+### Persistent share state
+- **Today:** a share lives only as long as the process. Nothing records what was shared, the
+  `.torrent` written into the store directory is the only artifact, and restarting `ntx` means
+  hashing the file again and re-announcing from scratch.
+- **Needed:** a small state file with the path, size, mtime, piece hashes and the `.torrent`
+  path, plus a revalidation pass so a stale entry can never serve wrong bytes.
+- **Trade-offs:** the first thing `ntx` writes that is not downloaded data, so it needs a
+  documented format and a location.
 
 ## Network
 
 ### NAT traversal and local discovery
-- **Today:** none. There is no UPnP, NAT-PMP/PCP or Local Service Discovery (BEP 14). Inbound
-  connections work only if the listen port is reachable. BEP 55 holepunching is supported
-  only as a connect target over uTP (no relaying, no rendezvous requests) and does not replace
-  port mapping.
-- **Needed:** an SSDP/UPnP-IGD client or a NAT-PMP/PCP client for the router, and a multicast
-  listener for LSD.
+- **Today:** UPnP-IGD is not implemented and Local Service Discovery (BEP 14) is not
+  implemented. NAT-PMP and PCP are: while a share is live `ntx` asks the default gateway for a
+  mapping of the listen port (`--port-map` / `--no-port-map`), reads the external port back into
+  the tracker announces and the BEP 10 `p` field, and reports the state as `port_map` /
+  `ext_port` ([`json-api.md`](json-api.md)). Outside a share, inbound connections work only if
+  the listen port is reachable. BEP 55 holepunching is supported only as a connect target over
+  uTP (no relaying, no rendezvous requests) and does not replace port mapping.
+- **Needed:** an SSDP/UPnP-IGD client (SSDP, XML and SOAP over HTTP) and a multicast listener
+  for LSD. The NAT-PMP/PCP driver in `src/core/ntx_session_portmap.c` is the precedent to build
+  a second mapping protocol on.
 - **Trade-offs:** UPnP means SSDP, XML and SOAP over HTTP with little to share with the
-  existing code. NAT-PMP/PCP is much smaller. Both add attack surface on the LAN side.
+  existing code, and it adds attack surface on the LAN side.
 
 ### Non-blocking tracker and DNS I/O
 - **Today:** HTTP(S) tracker requests and DoH lookups are blocking calls inside the event loop
@@ -134,8 +145,11 @@ has to stay under the 1 MiB gate of `make size`.
 
 Checked against the source tree; each is absent today.
 
-- **BEP 14** LSD and **UPnP/NAT-PMP**: see above.
-- **BEP 27** private torrents: see above.
+- **BEP 14** LSD and **UPnP-IGD**: see above (NAT-PMP and PCP are implemented).
+- **BEP 27** `private` is honoured: `ut_pex`, DHT lookups/announces and `ut_holepunch` are
+  refused for such a torrent, and only tracker-sourced addresses are dialled. A torrent from a
+  private tracker is still nothing to hand `ntx` — the flag is respected, but there is no
+  authentication to a tracker, no lease handling and no scrape.
 - **BEP 48** tracker scrape.
 - **BEP 53** magnet `so=` file selection, and magnet `x.pe` peer hints.
 - **BEP 19** web seeds listed in a `.torrent` (`url-list`); only the magnet `ws=` / `as=`

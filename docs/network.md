@@ -377,6 +377,69 @@ take its pins from the built-in pool with TOFU disabled (§6.1), which is Task 1
 first of the three outstanding items listed in the gate paragraph above — the ship verdict is
 stated there once, and it is **do not ship `--share` yet**.
 
+## Share trackers and pinned keys
+
+`ntx --share` announces only over HTTPS trackers whose leaf SPKI hash is compiled in
+(design §6). The survey above is the evidence for the table; this section describes the
+shipped mechanism. Sources: `src/proto/ntx_share_trackers.c`, `ntx_https_pin.c`,
+`scripts/pins/pins.py`.
+
+### The table
+
+`src/proto/ntx_share_trackers.c` holds a generated table of `{url, host, pins[]}` rows —
+seven hosts on the current build, each with one pin (up to `NTX_HTTPS_PIN_MAX` = 4 are
+possible while a key is being rolled over). The block between `/* BEGIN GENERATED
+(make pins-update) */` and `/* END GENERATED */` is machine output and is never hand
+edited. `NTX_SHARE_TRACKERS_INC` replaces the whole block at compile time, which is how
+`make ntx-sharetest` and the `test/cli_errors.sh` gate build a build with a different table.
+
+`ntx_share_available()` is `ntx_share_tracker_count() >= NTX_SHARE_MIN_TRACKERS` (2). Below
+that the feature is not in the release, and everything about it disappears: `--share`,
+`--share-from`, `--port-map` and `--no-port-map` are dropped from `--help`, `--share` is a
+startup failure (`ntx: cannot share: no HTTPS share trackers are pinned in this build`,
+exit `1`), and `"share"` is absent from the `caps` of the JSON `hello` line.
+
+### Fail-closed trust for share hosts
+
+Pin lookup order in `ntx_https_pin_lookup` is: built-in DoH pool → test pool → **share-tracker
+pool** → `--https-pin-file` → TOFU. A host in the share pool is fail-closed: its pin comes from
+the table only. It never falls through to the pin file or to TOFU, and `ntx_https_tofu_note`
+returns `-1` for it, so a share host is never trusted on first sight and a `--https-pin-file`
+line cannot override it. A mismatch aborts the TLS session and surfaces as `NTX_HTTP_E_PIN`;
+the tracker is then marked pin-failed for the session (`pin!N` in the status line,
+`trk_pin_fail` in the JSON stats) and **never retried** — a wrong key is treated as a
+man-in-the-middle, not as a transient error. Other trackers keep working; when every tracker
+of a share pin-failed, one diagnostic says so:
+`ntx: share <name>: keys in this ntx build are out of date or a MITM is in progress; update ntx`.
+
+A peer's HTTPS web seeds and every other HTTPS host keep the ordinary pool/file/TOFU rules;
+only the hosts named in the share table are fail-closed.
+
+### Key maintenance and the release gate
+
+`scripts/pins/pins.py` is the only writer of the generated block (and of the share rows of
+`pins.txt`). `make` and `make test` never run it; only these two targets do, and both reach
+the network:
+
+| Command | Meaning |
+|---------|---------|
+| `make pins-check` | Release gate. Exit `1` = do not publish. |
+| `make pins-update` | Absorb a verified new key into the row's free pin slot (oldest dropped at 4), regenerate the `pins.txt` share rows, print a diff, commit nothing. |
+| `make ntx-sharetest` | Builds `./ntx-sharetest` with `scripts/pins/sharetest_trackers.inc`, a test table that prints a banner so a stray test binary cannot pass for a release build. |
+
+Report rows are `<host> <OK|NEW-KEY|WEBPKI-FAIL|FULL-SCRAPE|UNREACHABLE> <detail>`. `check`
+fails on a verified key that is not listed, on a WebPKI failure, on a host that serves a full
+`/scrape`, or when fewer than two hosts qualify; an unreachable host is a warning only.
+`update` refuses to write a block that would fall below the minimum, so removing a host is a
+human act. Offline fixtures in `test/vectors/pins/<case>/fixture.txt` let `make test` exercise
+every row without a network — see [`testing.md`](testing.md).
+
+**Key lifetime.** The pinned keys are short-lived CDN edge certificates (the survey measured
+`notAfter` 2026-12-12 … 2027-01-04), so `make pins-check` is expected to demand a re-pin
+roughly monthly. Because every accepted host is behind one CDN, one key rotation or one CDN
+outage removes all share trackers at once; read the survey table as "one CDN, seven
+hostnames", not as diversity.
+
 ## Shared UDP socket and demultiplexing
 
 `ntx_netx` owns one UDP socket per address family on the same port number as the TCP listener
@@ -592,6 +655,51 @@ reason `bep55-race`. Two connections in the same direction are not treated as a 
 dial was refused before it started (duplicate, connection limits, allocation failure, no
 route). Whether the peer actually came up is visible in the normal peer counts.
 
+## NAT-PMP and PCP port mapping
+
+While a share is live, `ntx` asks the default gateway to forward the listen port (design §8).
+Codec: `src/proto/ntx_pcp.c` (pure byte transformers, no sockets, no state); policy and
+driver: `src/core/ntx_session_portmap.c` on the existing `ntx_netx` loop — no threads, no
+blocking calls.
+
+- **Protocol.** PCP (RFC 6887) `MAP` (opcode 1) first, 60 bytes: our address as an
+  IPv4-mapped IPv6, a random 12-byte nonce, protocol, internal port and suggested external
+  port, with the suggested external address left all-zeros ("no preference"). If the answer
+  reports a version mismatch the driver falls back to NAT-PMP (RFC 6886) — an external-address
+  request (2 bytes) plus a mapping request (12 bytes) per protocol, opcode 1 for UDP and 2 for
+  TCP. Both directions are mapped on the listen port.
+- **Peer and port.** Everything goes to the default gateway on port 5351 (`NTX_PCP_PORT`),
+  read from `/proc/net/route` (and `/proc/net/ipv6_route`), and the socket is `connect()`ed to
+  it. A datagram is fed to the parsers **only** when it comes from that gateway address — the
+  LAN side is the one place `ntx` accepts unsolicited UDP.
+- **Strictness.** The parser accepts a reply only when the length, version, opcode, R bit,
+  nonce, protocol and internal port all match the request; a result code other than `SUCCESS`
+  is a failure, so a mapping is only what a grant says. Nothing past the declared length is
+  read. The server's lifetime is taken verbatim and then capped by the driver (RFC 6887 §8.3).
+- **Retransmission and lifetime.** Nine sends per query at most, the gap starting at
+  `PM_PROBE_MS` (250 ms) and doubling (RFC 6887 §8.1.1). A grant is requested for 7200 s and
+  renewed at half the granted lifetime. A PCP epoch rollback resets the state. On exit
+  `ntx_session_portmap_stop()` sends lifetime-0 delete requests, bounded in time like the
+  `stopped` announces.
+- **Where the external port goes.** `ntx_session_adv_port()` returns the mapped external port
+  while the TCP mapping is `active`, and the listen port otherwise. It is the port in every
+  tracker announce — the `port=` parameter of an HTTP announce, the `port` field of a UDP
+  announce — and in the BEP 10 extension handshake `p` field, so peers learn the reachable
+  address.
+- **CGNAT.** A granted external address in `100.64.0.0/10` — or in RFC 1918, `10/8`,
+  `172.16/12`, `192.168/16`, `fc00::/7` — means the mapping is useless for inbound
+  connections; the state becomes `cgnat` (`map!cg`, `"port_map":4`) and inbound is left to
+  holepunching. With NAT-PMP the external-address query is what reveals it; PCP reads it from
+  the `MAP` reply.
+- **When it is off.** Never started under `--proxy` or `--tunnel` (the mapping would leak the
+  address the user is hiding, and inbound would bypass the proxy) — the command line refuses
+  that combination. `--no-port-map` disables it outright; `--port-map` enables it even without
+  a share. Otherwise it runs while at least one share is live and is released when the last
+  one goes. The public swarm is never mapped.
+- **State reporting.** `ntx_session_portmap_state()` is the JSON `port_map` field verbatim:
+  `0` off, `1` pending, `2` active, `3` none, `4` cgnat; `ext_port` is non-zero only in state
+  `2`. The status line shows `map:<port>`, `map-` or `map!cg` ([cli.md](cli.md#diagnostic-tags)).
+
 ## Limitations
 
 | Not available | Note |
@@ -601,5 +709,5 @@ route). Whether the peer actually came up is visible in the normal peer counts.
 | TLS PSK/resumption, 0-RTT, client certificates | not implemented |
 | Certificate chain and host name validation | not implemented; SPKI pins and TOFU are used instead |
 | Redirects for HTTP(S) requests | not followed |
-| UPnP, NAT-PMP, Local Service Discovery | not implemented; see [`roadmap.md`](roadmap.md) |
+| UPnP-IGD, Local Service Discovery | not implemented; see [`roadmap.md`](roadmap.md). NAT-PMP/PCP are implemented for shares — see [NAT-PMP and PCP port mapping](#nat-pmp-and-pcp-port-mapping) |
 | BEP 55 relay role, sending `rendezvous` | not implemented |

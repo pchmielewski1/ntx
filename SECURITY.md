@@ -85,7 +85,18 @@ Other things to know:
   strict pinning.
 - **Tracker announces, PEX and DHT are plaintext**; the info-hash and your IP address are
   visible to the network path. Peer-wire encryption (MSE/PE) is obfuscation, not
-  authentication.
+  authentication. **Share slots are the exception:** a peer of a `--share` must complete
+  MSE/PE (a plaintext peer is dropped, no fallback) and an inbound plaintext connection gets no
+  handshake from `ntx` until its own info hash has matched a slot, so a port scanner cannot
+  read a live info hash out of the listener. This is still obfuscation, not authentication —
+  strict mode raises the cost of passive observation and of a peer that refuses to encrypt; it
+  does not identify anyone.
+- **Share trackers are fail-closed.** Their pins are the compiled-in table only: not TOFU, not
+  `--https-pin-file`. A host whose leaf SPKI does not match any pinned value is refused and
+  never retried in that session (`pin!N`, `trk_pin_fail`). Below two usable hosts the feature
+  is not in the release at all. The pins are short-lived CDN edge keys, so a stale table and an
+  active man-in-the-middle look the same from here — the diagnostic says exactly that, and the
+  release gate is `make pins-check`.
 
 ## Pre-release security audit (October 2026)
 
@@ -135,7 +146,26 @@ What this audit did **not** cover:
 - **Local files.** Downloaded file names from metainfo are sanitised by the store layer, but a
   user who points `--store-dir` at a directory containing symlinks controls what happens there.
 - **Control channel.** `--stats-json` reads commands from stdin only (no socket, no network);
-  whoever controls the process's stdin already controls the process.
+  whoever controls the process's stdin already controls the process. That includes publishing
+  files: **whoever writes to stdin can share any readable file** (`share` with `path` publishes
+  that file's contents, name and size to the pinned share trackers and hands the magnet back on
+  stdout). There is no allow-list of shareable directories and nothing checks a share against a
+  policy, so stdin must never be a network socket or anything another user can write to.
+- **`--share` publishes, it does not authorise.** A share is "private" only in the BEP 27 sense
+  — discovery is limited to the pinned trackers. Anyone who learns the info hash can download
+  the file, so treat the magnet link as a bearer credential. Stopping the share is the only
+  revocation; a copy already fetched cannot be recalled. The `.torrent` written into the store
+  directory holds the access key, so it is written `0600` and never world-readable.
+- **PCP / NAT-PMP talk to the LAN.** While a share runs, `ntx` sends UDP to port 5351 of the
+  default gateway read from `/proc/net/route` / `/proc/net/ipv6_route`, and it accepts
+  unsolicited datagrams **only** from that gateway address; every reply is checked against the
+  outstanding request (version, opcode, R bit, nonce, protocol, internal port) and a non-`SUCCESS`
+  result is never treated as a grant. A mapping is a request to a device you do not control: it
+  opens an inbound path to your machine and it advertises your listen port to the router. For
+  that reason mapping is refused together with `--proxy` / `--tunnel` (it would leak the address
+  the user is hiding and let inbound bypass the proxy), can be turned off with `--no-port-map`,
+  and is never started for the public swarm. The codec is a pure byte transformer with golden
+  vectors and no allocation, and it never reads past the declared packet length.
 - **Test fixtures.** `test/vectors/tls13/key_p256.pem` and `key_rsa.pem` are throw-away private keys
   of the test servers used for the TLS golden streams. They protect nothing; secret scanners
   will flag them.

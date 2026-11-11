@@ -34,6 +34,7 @@ Other files `ntx` may write into the store directory:
 |------|------|---------|
 | `https_tofu.bin` | Unless `--no-https-tofu` | Pinned certificate keys for HTTPS trackers and DoH, at most 32 records (host, 32-byte pin, last-seen time); written atomically (temporary file, then rename). |
 | `ntx_dht_state` | With `--dht` | The 20-byte DHT node id, so the id survives restarts. |
+| `<name>-<8 hex>.torrent` | Per `--share` | The private hybrid metainfo of the shared file, mode `0600`. See [Sharing a file](#sharing-a-file). |
 
 `ntx-verbose.log` (with `--verbose` / `--log`) is written to the working directory, not the store, and is truncated at start.
 
@@ -64,6 +65,49 @@ Behaviour of a torrent that was **already complete** when `ntx` started:
 - It sends no tracker announce at all: the `started` event is sent only when verification ends with missing pieces. Peers then find it through incoming connections, DHT and PEX, not through trackers. (The test `t3d` asserts that zero announces are sent.)
 
 A magnet link whose data already exists on disk resumes in the same way, after its metadata has been fetched. If the metadata is not received within `NTX_META_TIMEOUT_S` (120 s), the request is repeated to the peers; `ntx` does not give up.
+
+## Sharing a file
+
+`--share=PATH` (design §5) is the one case where `ntx` serves data it did not download. The
+storage side has three parts: a read-only store over a held descriptor, a metainfo built in
+memory, and one `.torrent` file written to the store directory.
+
+- **The file is never written to and never re-opened.** `ntx_session_share_add` opens it
+  `O_RDONLY | O_CLOEXEC`, checks `S_ISREG` and `st_size > 0`, and keeps the descriptor for the
+  whole life of the share. `ntx_store_open_ro_fd` builds the store on top of that
+  caller-owned descriptor: no `open`, no `ftruncate`, no `mkdir`, and the descriptor is not
+  closed by the store. Because the descriptor is held, renaming or unlinking the path does not
+  disturb the share, and no other process can substitute a file under the same name.
+- **Every piece is marked present by construction** (`have[i] = 1`, `pmap[i] = 2`) instead of
+  being read back through the verification path — the author is the only source, so re-reading
+  the file would only cost I/O. The hashes come from the streaming hasher
+  (`ntx_share_hasher`), whose footprint is `O(piece length + pieces)` and never the file.
+- **The `.torrent` is written atomically with mode `0600`** (design §5.4).
+  The name is `<store-dir>/<stem>-<8 hex of ih>.torrent`, where `stem` is the longest
+  whole-UTF-8-character prefix of the file name that still leaves room for the suffix inside
+  `NAME_MAX`; the name **inside** the torrent is never cut. The bytes are checked first: the
+  buffer's `SHA-1(info)` must equal the `ih` in the file name, because that hash is the access
+  key of a private share and a file whose contents do not match its name must never reach disk.
+  Then the target is examined — absent, or already exactly this hash, is fine (re-sharing keeps
+  its link); any other content there is the `exists` error. The write goes to
+  `<path>.tmp<pid><n>` opened `O_CREAT | O_TRUNC | O_EXCL`, `fchmod` to `0600` regardless of
+  the umask, `fsync`, then `rename`. A planted symlink or a leftover from a killed run is
+  therefore never followed. `ntx_share_write_torrent` is the only writer.
+- **Change detection.** Once the metainfo is built, `fstat` of the held descriptor is compared
+  once a second (`NTX_SHARE_FSTAT_MS`) against the saved `st_dev`, `st_ino`, `st_size`,
+  `st_mtime` and `st_ctime`. Any difference fails the share with `changed`: peers are choked,
+  a `stopped` announce is sent, and the slot stops serving (`ntx_session_share_serving` returns
+  0, so block requests are refused). The descriptor and the store stay alive so the UI can
+  still show what happened.
+- **Hashing budget.** The file is hashed inside the session tick, `pread` chunk by chunk
+  against a real monotonic deadline, so one tick cannot hash a whole file and stall the loop.
+  The phase is `hash` and `pct` is hashing progress.
+- **Ratio exemption.** A share slot never hits the ratio stop: the ratio check returns "not
+  reached" while `s->share[ti]` is set, so `--share` seeds until the file changes or the
+  process is stopped, whatever `NTX_SEED_RATIO_NUM` does to an ordinary seed.
+
+Nothing about a share is persisted: the `.torrent` file is the only artifact, and a restart
+hashes the file again ([roadmap.md](roadmap.md)).
 
 ## Seeding and the share ratio
 

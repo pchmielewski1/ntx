@@ -10,7 +10,9 @@ differ by some tens of KiB), and `make size` fails the build at 1 MiB (1048576 B
 
 It downloads `magnet:` links and `.torrent` files (single- and multi-file; BitTorrent v1, v2
 and hybrid), verifies every piece, resumes from disk on restart, and seeds after completion
-(until a 3x upload ratio). It is driven from the terminal: no GUI, no config file.
+(until a 3x upload ratio). `--share=PATH` publishes one local file: `ntx` hashes it, writes a
+private hybrid `.torrent`, announces it on pinned HTTPS trackers and prints the magnet link. It
+is driven from the terminal: no GUI, no config file.
 
 **Status:** a working client (magnet, metadata, download, seed), not a protocol sketch, and
 not a drop-in replacement for qBittorrent or Transmission. Use it only with content you have
@@ -148,6 +150,12 @@ usage: ntx [opts] <magnet|link.txt|.torrent>
   --allow-local-peers  also dial/accept loopback, link-local and other special peer addresses
                        (default: off; see SECURITY.md)
   --smooth             rate caps 128 KiB/s down, 32 KiB/s up if no explicit limits
+  --share=PATH         share one local file: hash it, write a private hybrid .torrent into
+                       the store dir, announce on the pinned HTTPS share trackers, print the
+                       magnet link (stdout)
+  --share-from=FILE.torrent  re-share under an existing link (accepted; not implemented yet)
+  --port-map           ask the gateway (PCP, then NAT-PMP) to map the listen port
+  --no-port-map        never map a port, even while sharing
   --stats-json         NDJSON session stats on stdout instead of the status line
   --verbose, -v        verbose diagnostics to ntx-verbose.log
   --log=FILE           verbose log to FILE (also enables the log file)
@@ -164,14 +172,34 @@ number, an unreadable `.torrent`, an invalid magnet link or a malformed `--proxy
 fallback, so a typo cannot quietly send traffic outside your proxy.
 
 Listen binds the first free TCP port in `[--port-lo, --port-hi]` (an ephemeral port if the
-whole range is busy). Status line tags: `trk` / `pe` / `dns…` / `@phase`. Progress counts
-**verified bytes** (after the hash check), not raw wire traffic.
+whole range is busy). Status line tags: `trk` / `pe` / `dns…` / `@phase`, plus `prv`, `shr`
+(or `shr!` when the shared file changed), `enc!`, `pin!N`, `map:<port>` / `map-` / `map!cg`
+and `inN` for a share. Progress counts **verified bytes** (after the hash check), not raw wire
+traffic.
+
+### Sharing a file
+
+```sh
+./ntx --share=photo.jpg > link.txt   # the magnet lands on stdout, the note on stderr
+```
+
+`ntx` hashes the file, writes `<store-dir>/<name>-<8 hex>.torrent` (mode `0600`), announces on
+the compiled-in pinned HTTPS share trackers and prints the magnet once a tracker answers. The
+file is opened read-only and the descriptor is held, so a rename does not break the share; a
+change to its contents or metadata ends the share (`shr!`, exit `1`). Discovery is tracker-only
+— no DHT, no PEX, no holepunch — and peers must complete MSE/PE. `--port-map` asks the gateway
+for an external port so peers can reach you (never under `--proxy` / `--tunnel`). A share is not
+private in the sense of access control: anyone who learns the magnet can download the file.
+Details: [docs/cli.md](docs/cli.md#private-shares), [docs/protocol.md](docs/protocol.md#private-torrents-bep-27),
+[docs/storage.md](docs/storage.md#sharing-a-file), [docs/network.md](docs/network.md#share-trackers-and-pinned-keys).
 
 ## Machine control (`--stats-json`)
 
-With `--stats-json`, `ntx` speaks NDJSON on stdout (`hello`/`stats`/`ack`/`err`) and, when
+With `--stats-json`, `ntx` speaks NDJSON on stdout (`hello`/`stats`/`ack`/`err`/`share`) and, when
 stdin is not a TTY, accepts one JSON command per stdin line: `ping`, `status`, `hello`, `add`,
-`pause`, `resume`, `remove`, `quit`. EOF on stdin closes the command channel while the session
+`pause`, `resume`, `remove`, `share`, `quit`. A `share` command answers an `ack` with the slot
+and later emits a `share` event with the magnet, the two info hashes and the `.torrent` path.
+EOF on stdin closes the command channel while the session
 keeps running. A torrent argument is optional in this mode (`add` can supply it). See
 [docs/json-api.md](docs/json-api.md) for the full v1 contract.
 
@@ -203,6 +231,18 @@ keeps running. A torrent argument is optional in this mode (`add` can supply it)
   HTTP(S) ones after), `numwant` is 200, connect attempts time out after 2.5 s while few peers
   work, and addresses that fail to connect are retried with a back-off. See
   [CHANGELOG.md](CHANGELOG.md) for the measurement.
+- **Private sharing (`--share`):** one local file becomes a private hybrid (v1 + v2, BEP 27
+  `private = 1`) torrent with a random salt in the info dictionary, so two shares of the same
+  bytes get two links. Announced only on the compiled-in **SPKI-pinned** HTTPS share trackers
+  (fail-closed: no TOFU, no pin file, a mismatching key is never retried), never on the DHT,
+  PEX or holepunch, and peers must complete MSE/PE. The `.torrent` is written atomically with
+  mode `0600`; the file is opened read-only and the descriptor held, so a rename does not break
+  the share and a change on disk stops it. The magnet goes to stdout, so
+  `ntx --share=f > link.txt` produces a file `ntx` itself accepts.
+- **NAT-PMP / PCP port mapping:** while a share runs, `ntx` asks the default gateway on port
+  5351 for a mapping of the listen port (PCP first, NAT-PMP after a version mismatch), passes
+  the granted external port in tracker announces and the BEP 10 `p` field, detects a CGNAT
+  grant, and refuses to map anything under `--proxy` / `--tunnel`.
 - **Privacy:** DoH-only DNS, MSE/PE peers, proxy/tunnel for peer traffic, local-only diagnostics.
 
 ## HTTPS (trackers + webseed)
@@ -234,11 +274,17 @@ Some of these are deliberate non-goals; the rest are gaps listed in
   (manual asset — Actions does not cross-build mipsel).
 - No GUI and no config file. One torrent can be given on the command line; more can be added
   at run time through the `--stats-json` control channel.
-- Not implemented: selective file download and priorities, sequential mode, torrent creation,
-  NAT-PMP / UPnP port mapping, local peer discovery (LSD), download queueing, persistence of
+- Not implemented: selective file download and priorities, sequential mode, UPnP-IGD port
+  mapping, local peer discovery (LSD), download queueing, persistence of
   the paused state, tracker scrape, following HTTP redirects from trackers.
-- **Private torrents (BEP 27):** the `private` flag is ignored; PEX is always offered and DHT
-  is used when `--dht` is set. Do not use `ntx` with torrents from private trackers.
+- **`--share` shares one regular file**, not a directory, and nothing about a share is
+  persisted — a restart hashes the file again. `--share-from=FILE.torrent` is parsed but not
+  implemented in this build. The pinned share-tracker keys are short-lived CDN certificates, so
+  `make pins-check` must be run before a release.
+- **Private torrents (BEP 27):** a non-zero `private` in the info dictionary is honoured — no
+  DHT, no PEX, no holepunch, and only tracker-sourced addresses are dialled. There is still no
+  tracker authentication, lease handling or scrape, so a torrent from a private tracker that
+  requires them is not supported.
 - PEX (BEP 11): `added` entries are used and `dropped` entries are sent, but received
   `dropped` entries are ignored (a hostile peer could otherwise evict good peers).
 - **BitTorrent v2:** the optional mid-connection v1-to-v2 handshake upgrade is not
@@ -283,6 +329,9 @@ make test-net     # smoke: listen port in --port-lo/--port-hi + JSON
 make test-ipc     # --stats-json command channel end to end
 make test-tls13   # TLS 1.3 client vs. `openssl s_server` on loopback (needs the openssl CLI)
 make probe        # optional tracker/DoH probe binary
+make pins-check   # release gate: are the pinned share-tracker keys still valid? (needs network)
+make pins-update  # absorb verified new share-tracker keys, print the diff (needs network)
+make ntx-sharetest # ./ntx-sharetest, built against the test share-tracker table
 make static       # musl static build (optional)
 make mips         # static OpenWrt mipsel binary ./ntx-mipsel (needs cross toolchain)
 make test-mipsel  # cross-compile every test/t_*.c and run under qemu-mipsel
@@ -335,7 +384,13 @@ drops only `-pie` (same precedent as `make static`).
   (a provider with a mismatching key is refused; details with `--verbose`).
 - **Tracker and web seed fetches over HTTPS:** in-tree TLS 1.3 / 1.2 with SPKI pinning (no CA
   store).
-- **Peer payload:** Mainline MSE/PE when negotiated; plaintext peers are still accepted.
+- **Share trackers:** the compiled-in HTTPS table is fail-closed — the pin comes from the
+  table only, never from TOFU or `--https-pin-file`, and a host whose key does not match is
+  never retried in the session.
+- **Peer payload:** Mainline MSE/PE when negotiated; plaintext peers are still accepted,
+  **except** for a share slot, where a plaintext peer is dropped and an inbound peer gets no
+  handshake from us until its own info hash has matched a slot (a port scanner cannot read a
+  live info hash out of `ntx`).
 
 ### Not protected (visible to the network path)
 

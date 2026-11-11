@@ -23,7 +23,8 @@ The code is the source of truth. Sources: `src/proto/` (codecs and protocol help
 | Padding files | BEP 47 | recognised when validating hybrid torrents |
 | v2 / hybrid torrents | BEP 52 | implemented; TX side of the mid-connection upgrade is not |
 | Holepunch | BEP 55 | acts as a connect target only (see `network.md`) |
-| Encryption | MSE/PE | RC4 only; plaintext fallback by default |
+| Private torrents | BEP 27 | `private` is honoured (see [Private torrents (BEP 27)](#private-torrents-bep-27)) |
+| Encryption | MSE/PE | RC4 only; plaintext fallback by default, refused for a share |
 
 ## MSE / PE (Message Stream Encryption)
 
@@ -39,7 +40,10 @@ The code is the source of truth. Sources: `src/proto/` (codecs and protocol help
   connection is handled as plaintext when `cfg.compat_peers` is set (`sp_plaintext_fallback`);
   otherwise it is dropped (`plaintext_strict`). The command-line client sets `compat_peers = 1`
   and the `--compat-peers` flag only repeats that default: there is no switch to turn the
-  fallback off from the command line.
+  fallback off from the command line. Two cases never fall back: a slot marked strict (a share,
+  see [Strict message-stream encryption for shares](#strict-message-stream-encryption-for-shares))
+  and — for an inbound peer — the reply to the plaintext handshake is withheld until the
+  initiator's own hash has matched a slot (§7.1, same section).
 - MSE/PE obfuscates traffic. It does not authenticate the remote peer and is not strong
   confidentiality (see the limitations in the top-level `README.md`).
 
@@ -103,6 +107,9 @@ Message IDs handled by `sp_process_msgs`:
   not completed after 120 seconds (`NTX_META_TIMEOUT_S`) is restarted.
 - Assembled metadata is only accepted if it hashes to the info hash: SHA-1 for v1, SHA-256
   for v2 and hybrid torrents (compared with `info_hash_v2`).
+
+Design references for the share sections below (`§`) are to
+[superpowers/specs/2026-11-08-private-share-design.md](superpowers/specs/2026-11-08-private-share-design.md).
 
 ## Rate limits and the upload queue
 
@@ -241,6 +248,58 @@ dials the given endpoint over uTP. It never sends `rendezvous` messages and does
 relay. Codec, relay and target policy, tie-break and counters are described in
 [`network.md`](network.md#holepunch-bep-55).
 
+## Private torrents (BEP 27)
+
+Sources: `src/core/ntx_session_priv.c` (policy), `ntx_session_meta.c`, `ntx_torrent.c`
+(detection). The flag is read from the `info` dictionary by `priv_info_is_private`: **any
+non-zero integer** under the key `private` means private. A missing key or a non-integer
+value is public. BEP 27 defines only `1`; the wider test errs towards treating a torrent as
+private.
+
+A torrent whose info dictionary is private:
+
+- **No DHT** (`sp_dht_allowed`): no `get_peers`, no `announce_peer`, even with `--dht`.
+- **No `ut_pex` and no `ut_holepunch`** (`sp_ext_allowed`): neither offered nor honoured.
+  Every other extension, `ut_metadata` above all, stays available.
+- **No non-tracker dials** (`sp_dial_allowed`): outbound connections go only to addresses
+  whose source is a tracker (`NTX_PSRC_TRACKER`). Addresses from PEX, the DHT or holepunch are
+  never dialled. A peer that already dialed before the flag was known stays; see below.
+- Inbound connections are not restricted — BEP 27 limits initiation, not acceptance.
+
+**A magnet that turns out to be private.** A magnet carries no `private` flag, so the session
+may already have dialled DHT or PEX addresses when the info dictionary arrives.
+`meta_assemble` reads the flag *before* applying the metainfo and then drops every
+**outbound** peer that was not tracker-sourced. It does not use the normal drop path, which
+would record a redial and retry a uTP miss over TCP and put the same address back on the wire.
+Inbound peers and tracker-sourced peers are kept.
+
+`--share` builds a torrent with `private = 1` and is the main user of this path; the same
+policy applies to any third-party private torrent you load.
+
+## Strict message-stream encryption for shares
+
+Design §7, §7.1. A torrent slot can be marked **strict** (`s->tts_enc_strict[ti]`, exposed as
+the JSON field `enc_strict` and the status tag `enc!`). `--share` sets it for its own slot.
+The policy functions live in `src/core/ntx_session_pe.c` and `src/core/ntx_session_bt_hs.c`.
+
+- **Outbound.** If a peer we dialled answers our PE start in plaintext, the plaintext
+  fallback is refused for a strict slot: `sp_drop(..., "plaintext_strict_share")`. There is no
+  compatibility path to plaintext for a share.
+- **Inbound.** If a peer we accepted completes MSE and then the inner handshake names a strict
+  slot, fine — that peer is counted in `in_ok` (`tts_in_ok`, status tag `inN`, the "we are
+  actually reachable" signal for a share). A peer that begins with a **plaintext** handshake is
+  dropped without a byte in return once its hash matches a strict slot.
+- **The plaintext hold (§7.1).** For any torrent, an inbound peer that starts in plaintext no
+  longer gets our handshake at fallback time. `sp_plaintext_fallback` sends nothing on an
+  inbound connection; `sp_bths_try` sends the reply only after the full 68-byte handshake
+  arrived **and** its `info_hash` matched a slot. Before that, a port scanner that connects and
+  sends nothing gets no response at all, so it cannot read the info hash of a live torrent out
+  of us. Handshakes for unknown hashes are dropped with no reply (`sp_build_bt_handshake`
+  zeroes the buffer when no slot is chosen).
+- MSE itself is unchanged: RC4 only, 768-bit DH, no authentication. Strict mode raises the
+  bar against passive off-path observation and against an on-path peer that simply refuses to
+  encrypt; it does not authenticate the peer.
+
 ## DHT (BEP 5, BEP 32)
 
 Enabled only with `--dht`; cannot be combined with `--proxy` or `--tunnel` (a fatal error).
@@ -353,6 +412,48 @@ The 20-byte `info_hash` used in announces and handshakes:
 
 The full 32-byte `info_hash_v2` is what the metainfo hash gate checks, both in
 `ntx_torrent_set_metainfo` and when metadata is assembled.
+
+### Randomised info_hash
+
+Two shares of the same bytes must not collide, or the second one would be the same torrent and
+the first one's peers would be handed the wrong file. `ntx_share_build_info` therefore puts a
+`ntx` key in the `info` dictionary whose value is 16 random bytes as 32 lowercase hex
+characters (`ntx_rand_bytes` at metainfo-build time), alongside `private = 1`. Because the
+`info` dictionary is hashed as a whole, the salt changes both hashes:
+
+- `info_hash` (announces, handshakes, the magnet `xt=urn:btih:`) = `SHA-1(info)`
+- `info_hash_v2` (the magnet `xt=urn:btmh:1220…`) = `SHA-256(info)`
+
+Everything else in the dictionary is deterministic for a given file, so re-sharing the same
+bytes deliberately produces a **new** link. The salt is a string, not an integer, so no parser
+in `ntx` or in a third-party client can misread it, and the key name is namespaced.
+
+### The share metainfo
+
+`ntx_share_meta.c` (hasher and builder) and `ntx_share_out.c` (magnet, file name, `.torrent`
+write) produce a **hybrid** v1 + v2 metainfo for one file — the bytes a BEP 52 client expects:
+
+- The `info` dictionary carries `name`, `piece length`, `pieces` (the v1 SHA-1 list),
+  `length`, `private = 1`, `meta version = 2`, the BEP 52 `file tree` (one entry per file name,
+  holding the property dictionary with `length` and the 32-byte `pieces root`), and the
+  `ntx salt` key described above.
+- Top level: `announce` (the first tracker), `announce-list` (one single-element tier per
+  tracker, so every one is announced to), `created by` (`ntx/<version>`), `creation date`,
+  `info`, and a `piece layers` dictionary keyed by the `pieces root` — present **only when
+  there is more than one piece**, matching `ntx_merkle_file_layer`: leaves are 16 KiB
+  (`NTX_MERKLE_LEAF`), zero-filled to the piece length.
+- **Piece length** is the smallest power of two from 16 KiB (`NTX_SHARE_PIECE_MIN`) up to
+  64 MiB (`NTX_SHARE_PIECE_MAX`) that leaves at most 2048 pieces, so a small file keeps 16 KiB
+  pieces and a large one steps up. If even 64 MiB pieces would give more than 32 768 pieces
+  (`NTX_SHARE_MAX_PIECES`, the bencode-string ceiling for the 1 MiB `pieces` limit) the file is
+  refused as `too_big`.
+- The hasher is streaming: it holds only the contexts of the piece in flight, that piece's
+  16 KiB leaf hashes and the finished hashes — `O(ps + np*52)`, never the file. The same fold
+  as `ntx_merkle.c`, so hashing a file and hashing an in-memory buffer give the same bytes.
+- The magnet is `magnet:?xt=urn:btih:<hex>&xt=urn:btmh:1220<hex>&dn=<name>&tr=<tracker>` for
+  every entry of the built-in share list, percent-encoded per RFC 3986 with uppercase escapes
+  (unreserved characters raw, `+` always escaped so `ntx_magnet_parse` cannot turn it into a
+  space).
 
 ### Hash messages (21, 22, 23)
 

@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+### Features
+- **`--share=PATH` — private sharing of one local file.** `ntx` hashes the file (streaming,
+  inside the session tick), builds a hybrid v1 + v2 metainfo with `private = 1` and a random
+  `ntx salt` in the info dictionary, writes it atomically to
+  `<store-dir>/<name>-<8 hex>.torrent` with mode `0600`, announces on the built-in HTTPS share
+  trackers and prints the magnet on stdout, so `ntx --share=f > link.txt` produces a file `ntx`
+  itself accepts. The file is opened read-only and the descriptor is held for the whole share;
+  an `fstat` once a second detects a change to `st_dev`/`st_ino`/`st_size`/`st_mtime`/`st_ctim`
+  and stops the share (`shr!`, exit `1`). A share is exempt from the 3x ratio stop. The status
+  line gains `prv`, `shr`/`shr!`, `enc!`, `pin!N`, `map:<port>`/`map-`/`map!cg`, `inN` and the
+  `@hash` phase. `--share-from=FILE.torrent` is parsed but not implemented in this build.
+- **BEP 27 is honoured.** A non-zero integer under `private` in the info dictionary disables
+  DHT `get_peers`/`announce_peer`, `ut_pex` and `ut_holepunch` for that torrent and restricts
+  outbound dials to tracker-sourced addresses; a magnet whose info dictionary turns out to be
+  private drops the outbound peers dialled before the flag was known. Inbound peers are
+  unaffected. `--share` builds such a torrent.
+- **Strict MSE/PE for share slots.** A peer that answers our PE start in plaintext, or that
+  starts in plaintext toward a share slot, is dropped with no fallback.
+- **Inbound plaintext hold (port-scan leak fixed).** `ntx` no longer answers an inbound
+  connection that starts in plaintext until the remote side's full 68-byte handshake has
+  arrived and its info hash matched a slot, so a scanner can no longer read the info hash of a
+  live torrent out of the listener.
+- **Pinned HTTPS share trackers.** A generated table of share trackers with their leaf SPKI
+  hashes is compiled in; those hosts are fail-closed — their pin comes from the table only,
+  never from TOFU or `--https-pin-file`, and a mismatching key is never retried in the session.
+  Below `NTX_SHARE_MIN_TRACKERS` (2) usable hosts the feature is not in the release: the
+  options disappear from `--help`, `--share` fails at start-up and `"share"` leaves the JSON
+  `caps`. `make pins-check` is the release gate, `make pins-update` the only writer of the
+  table, `make ntx-sharetest` the test build.
+- **NAT-PMP / PCP port mapping** for shares (`--port-map` / `--no-port-map`): a PCP `MAP`
+  (RFC 6887) to the default gateway on port 5351 with a NAT-PMP (RFC 6886) fallback after a
+  version mismatch, replies accepted only from the gateway address, a 7200 s grant renewed at
+  half its lifetime, lifetime-0 deletes on exit, CGNAT detection, and the granted external port
+  carried in tracker announces and the BEP 10 `p` field. Refused together with `--proxy` or
+  `--tunnel`.
+- **JSON control API v1 additions:** the `share` command (`path`, optional `torrent`) with an
+  `ack` carrying `i` and `state`, a separate asynchronous `share` event line carrying `ih`,
+  `ih2`, `name`, `magnet` and `torrent` (or `ok:0` with a `code` from
+  `bad_arg`/`io`/`full`/`no_trackers`/`too_big`/`exists`/`changed`), the new stats fields
+  `priv`, `share`, `enc_strict`, `trk_pin_fail`, `in_ok`, `port_map` and `ext_port`, and the
+  `magnet` limit of `add` relaxed from 511 to 2048 bytes.
+
 ### Packaging
 - Release assets now include binary **RPM** (Fedora / RHEL / openSUSE) for x86_64 and aarch64,
   plus `ntx-<version>-packaging.tar.gz` with stamped **Gentoo** ebuild, Arch `PKGBUILD`, Alpine
