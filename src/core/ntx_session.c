@@ -21,7 +21,8 @@ static struct ntx_session *sess_g_s;
 static char dht_state_path[512];
 
 /* ponytail: declared here (below in this file) because internal.h is Task 1-owned.
- * Upgrade: hoist the prototype next to ntx_session_add_peer_from_tracker. */
+ * Upgrade: hoist the prototype next to ntx_session_add_peer_from_tracker.
+ * (Hoisted to ntx_session_internal.h 2026-11-11; this copy kept until callers settle.) */
 int ntx_session_add_peer_src(struct ntx_session *s, int ti, const ntx_addr *a, uint16_t port, uint8_t src);
 int priv_info_is_private(const ntx_be *info); /* body in ntx_session_priv.c */
 

@@ -200,6 +200,8 @@ int ntx_session_add_peer_dial(struct ntx_session *s, int tts_idx, const ntx_addr
 /* force=1 skips the redial back-off (BEP55: the remote is dialling us at the same time). */
 int ntx_session_add_peer_dial_tcp(struct ntx_session *s, int tts_idx, const ntx_addr *addr, uint16_t port);
 int ntx_session_add_peer_dial_ex(struct ntx_session *s, int tts_idx, const ntx_addr *addr, uint16_t port, int force);
+/* Dial with an explicit NTX_PSRC_* origin (§6.3 dial policy; body in ntx_session.c). */
+int ntx_session_add_peer_src(struct ntx_session *s, int ti, const ntx_addr *a, uint16_t port, uint8_t src);
 void ntx_session_on_metainfo(struct ntx_session *s, int tts_idx);
 void ntx_session_tts_verify_done(struct ntx_session *s, uint32_t i);
 void ntx_session_accept_cb(struct ntx_session *s, ntx_netx *n, int peer_fd, void *ctx);
