@@ -21,7 +21,10 @@
 #include "ui/ntx_cli.h"
 #include "ui/ntx_diag.h"
 #include "proto/ntx_http.h"
+#include "proto/ntx_share_trackers.h"
+#include "core/ntx_share.h"
 #include "proto/ntx_doh.h"
+
 #include "proto/ntx_https_pin.h"
 #include "net/ntx_tls.h"
 
@@ -36,11 +39,28 @@ static int g_ipc_stash_len;
 #define NTX_IPC_TICK_LINES 64  /* §3.8: at most 64 lines per tick */
 
 #ifndef NTX_NO_MAIN
+/* ntx_share_available/ntx_share_err_msg live in ntx_share_trackers.c / ntx_share.c
+   and every shipped binary links them. test/t_cli_https.c includes this file
+   standalone with its own stub list, where a strong reference would be an
+   undefined symbol; weak references keep that TU linking and both wrappers
+   below fail closed (options hidden, --share refused) without them.
+   ponytail: ceiling = a build that lost the share objects behaves as the §6.4
+   gate. Upgrade path: drop the attributes once t_cli_https.c stubs these two
+   the way it stubs the session externs. */
+__attribute__((weak)) int ntx_share_available(void);
+__attribute__((weak)) const char *ntx_share_err_msg(ntx_share_err e);
+static int main_share_available(void) { return ntx_share_available ? ntx_share_available() : 0; }
+static const char *main_share_err_msg(ntx_share_err e) {
+    return ntx_share_err_msg ? ntx_share_err_msg(e) : "sharing is not available in this build";
+}
 static int g_stats_json;
 static volatile sig_atomic_t g_quit;
 static char g_magnet_buf[4096];
 static ntx_session *g_sess;
 static int g_cli_needs_nl;
+/* §9: --share/--share-from are main()'s business (ntx_config carries only
+   port_map); file scope so parse_args keeps the arity t_cli_https.c calls it with. */
+static const char *g_share_path, *g_share_from;
 static void on_sig(int sig) { (void)sig; g_quit = 1; }
 #endif
 
@@ -135,6 +155,35 @@ static void doh_ui_kick(void) {
     ntx_cli_status_update(&st, stderr, &g_cli_needs_nl);
 }
 
+/* §5.4/§9: share results in the CLI loop. The magnet is the deliverable — one
+   line on stdout, so `ntx --share=f > link.txt` is a file ntx accepts as input —
+   with the human note on stderr after the status line is closed. 1 = the share
+   failed and the caller must leave the loop with exit 1. */
+static int share_drain_events(ntx_session *s, int *fatal) {
+    ntx_share_event ev;
+    while (ntx_session_share_poll_event(s, &ev)) {
+        /* Called in CLI mode only: under --stats-json nothing raw may touch stdout
+           or stderr, so the queue is left to the `share` event of Task C3
+           (ntx_ipc_dispatch.c / ntx_stats.c) — polling it here would steal it. */
+        if (!ev.ok) {
+            fprintf(stderr, "ntx: share failed: %s\n", main_share_err_msg(ev.err));
+            fflush(stderr);
+            *fatal = 1;
+            return 1;
+        }
+        if (g_cli_needs_nl) {
+            fputc('\n', stderr);
+            fflush(stderr);
+            g_cli_needs_nl = 0;
+        }
+        puts(ev.magnet);
+        fflush(stdout);
+        fprintf(stderr, "ntx: shared — %s (torrent %s)\n", ev.name, ev.torrent_path);
+        fflush(stderr);
+    }
+    return 0;
+}
+
 static const char *load_magnet_file(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
@@ -156,9 +205,13 @@ static void print_usage(FILE *fp, const char *argv0) {
             "  --proxy=socks5:HOST:PORT  --tunnel=HOST:PORT\n"
             "  --dht  --compat-peers  --allow-local-peers  --utp  --smooth  --down-limit=B/s  --up-limit=B/s\n"
             "  --no-https-tofu  --https-pin-file=PATH\n"
-            "  --stats-json  --verbose  --log=FILE\n"
-            "  -h, --help  -V, --version\n",
+            "  --stats-json  --verbose  --log=FILE\n",
             argv0);
+    /* §6.4: below NTX_SHARE_MIN_TRACKERS usable hosts the feature is not in the
+       release, so the options must not be advertised either. */
+    if (main_share_available())
+        fprintf(fp, "  --share=PATH  --share-from=FILE.torrent  --port-map  --no-port-map\n");
+    fprintf(fp, "  -h, --help  -V, --version\n");
 }
 
 /* Strict unsigned decimal for numeric options: digits only (no sign, blanks, hex
@@ -183,7 +236,10 @@ static int parse_uint_opt(const char *opt, const char *s, uint64_t max, uint64_t
 static int parse_args(int argc, char **argv, ntx_config *cfg, char *proxy_buf, char *tunnel_buf,
                       const char **magnet_out, const char **torrent_out, const char **log_out) {
     uint64_t n;
+    int pm_on = 0, pm_off = 0;
     cfg->https_tofu = 1;
+    g_share_path = 0;
+    g_share_from = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) return 1;
@@ -222,6 +278,17 @@ static int parse_args(int argc, char **argv, ntx_config *cfg, char *proxy_buf, c
         else if (strcmp(a, "--allow-local-peers") == 0) cfg->allow_local_peers = 1;
         else if (strcmp(a, "--utp") == 0) cfg->utp = 1;
         else if (strcmp(a, "--smooth") == 0) cfg->smooth = 1;
+        else if (strncmp(a, "--share-from=", 13) == 0) g_share_from = a + 13;
+        else if (strncmp(a, "--share=", 8) == 0) {
+            /* §9: --share is a torrent source, so it cannot ride a magnet or a
+               .torrent argument, and it cannot be given twice. */
+            if (g_share_path) {
+                fprintf(stderr, "ntx: --share given twice\n");
+                return -1;
+            }
+            g_share_path = a + 8;
+        } else if (strcmp(a, "--port-map") == 0) pm_on = 1;
+        else if (strcmp(a, "--no-port-map") == 0) pm_off = 1;
         else if (strcmp(a, "--stats-json") == 0) g_stats_json = 1;
         else if (strcmp(a, "--verbose") == 0 || strcmp(a, "-v") == 0) cfg->verbose = 1;
         else if (strncmp(a, "magnet:", 7) == 0) *magnet_out = a;
@@ -250,6 +317,27 @@ static int parse_args(int argc, char **argv, ntx_config *cfg, char *proxy_buf, c
         fprintf(stderr, "ntx: --dht cannot be combined with --proxy/--tunnel (DHT traffic is UDP and would bypass them)\n");
         return -1;
     }
+    /* §9: the share flag combinations. Wording is a contract (test/cli_errors.sh
+       compares these lines exactly), so it is not free text. */
+    if (g_share_path && (*magnet_out || *torrent_out)) {
+        fprintf(stderr, "ntx: --share cannot be combined with a magnet or .torrent argument\n");
+        return -1;
+    }
+    if (g_share_from && !g_share_path) {
+        fprintf(stderr, "ntx: --share-from requires --share\n");
+        return -1;
+    }
+    if (pm_on && pm_off) {
+        fprintf(stderr, "ntx: --port-map and --no-port-map are mutually exclusive\n");
+        return -1;
+    }
+    /* Inbound peers would arrive through the proxy path the mapping is meant to
+       avoid, and the mapping itself announces our real address. */
+    if (pm_on && (cfg->proxy || cfg->tunnel)) {
+        fprintf(stderr, "ntx: --port-map cannot be used with --proxy or --tunnel (inbound traffic would bypass it and the mapping would reveal your address)\n");
+        return -1;
+    }
+    cfg->port_map = pm_on ? 1 : (pm_off ? -1 : 0);
     return 0;
 }
 
@@ -284,9 +372,16 @@ int main(int argc, char **argv) {
     }
     ntx_doh_verbose = cfg.verbose;
     ntx_tls_pin_stderr = cfg.verbose;
-    if (!magnet && !torrent && !g_stats_json) {
+    if (!magnet && !torrent && !g_share_path && !g_stats_json) {
         print_usage(stderr, argv[0]);
         return 2;
+    }
+    /* §6.4: with too few pinned share trackers the feature is not in the release —
+       the same no_trackers error as the JSON command, and the reason is the
+       share module's text, not ours. */
+    if (g_share_path && !main_share_available()) {
+        fprintf(stderr, "ntx: cannot share: %s\n", main_share_err_msg(NTX_SHARE_E_NO_TRACKERS));
+        return 1;
     }
     if (cfg.verbose || log_path) {
         if (!log_path) log_path = "ntx-verbose.log";
@@ -339,6 +434,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ntx: cannot load .torrent file (missing, empty or not valid metainfo): %s\n",
                 torrent);
         add_failed = 1;
+    } else if (g_share_path) {
+        /* Synchronous gate only (open, S_ISREG, size, name, slot): hashing and the
+           trackers run in the session tick, so no share here has reached the network. */
+        ntx_share_err serr = NTX_SHARE_OK;
+        if (ntx_session_share_add(s, g_share_path, g_share_from, &serr) < 0) {
+            fprintf(stderr, "ntx: cannot share %s: %s\n", g_share_path, main_share_err_msg(serr));
+            add_failed = 1;
+        }
     }
     if (add_failed) {
         ntx_http_clear_proxy();
@@ -362,11 +465,13 @@ int main(int argc, char **argv) {
     }
 
     uint64_t last_ui = 0;
-    int ui_tick = 0;
+    int ui_tick = 0, share_failed = 0;
     for (;;) {
         ntx_session_trk_pump_udp(s);
         ntx_session_trk_pump_http(s, 1);
         ntx_netx_run_once(netx, 50);
+        /* CLI mode only: under --stats-json the share event is JSON's (§9/C3). */
+        if (g_share_path && !g_stats_json && share_drain_events(s, &share_failed)) break;
         if (g_ipc_open) ipc_pump_tick(s); /* §3.6: commands first, then the snapshot */
         if (g_ipc_quit) break; /* ack already on stdout; exit code 0 (§6.2) */
         uint64_t now = ntx_mono_ms();
@@ -399,6 +504,8 @@ int main(int argc, char **argv) {
     ntx_session_free(s);
     ntx_netx_free(netx);
     ntx_diag_close();
-    return 0;
+    /* §9: a share that failed while it was the only torrent is a startup-class
+       failure — the message is already on stderr, the exit code says 1. */
+    return share_failed ? 1 : 0;
 }
 #endif /* NTX_NO_MAIN */
