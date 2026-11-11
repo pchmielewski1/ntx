@@ -204,9 +204,12 @@ static int http_get_range_tls(const char *url, uint64_t off, uint64_t len,
     if (ntx_http_url_parse(url, &up) != 0) return -1;
     ntx_tls_init(&tls);
     if (http_connect(up.host, up.port, &fd) != 0) return -1;
-    if (ntx_https_handshake_fd(up.host, up.port, fd, &tls) != 0) {
-        close(fd);
-        return -1;
+    {
+        int hs = ntx_https_handshake_fd(up.host, up.port, fd, &tls);
+        if (hs != 0) {
+            close(fd);
+            return hs == -2 ? NTX_HTTP_E_PIN : -1;
+        }
     }
     char host_hdr[320];
     if (up.port == 443)

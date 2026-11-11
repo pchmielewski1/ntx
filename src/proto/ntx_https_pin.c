@@ -1,6 +1,13 @@
 #include "ntx_https_pin.h"
 
 #include "../ui/ntx_diag.h"
+#include "ntx_share_trackers.h"
+
+/* `make probe` and the mock-handshake suites link this file without the
+   generated share-tracker table; the weak refs let them link and skip the
+   share pool (same pattern as the weak refs in ntx_tls.c). */
+__attribute__((weak)) extern int ntx_share_tracker_count(void);
+__attribute__((weak)) extern const ntx_share_tracker *ntx_share_tracker_get(int);
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -23,6 +30,21 @@ static int host_match(const char *pattern, const char *host) {
     return host[hl - sl - 1] == '.';
   }
   return strcasecmp(pattern, host) == 0;
+}
+
+/* 1 = host is in the built-in share-tracker pool. Pooled hosts are fail-closed:
+   their pin comes from the table only, never from the pin file or TOFU. */
+static int strk_pool_has_host(const char *host) {
+  int i, n;
+  if (!host || !host[0] || !ntx_share_tracker_count || !ntx_share_tracker_get)
+    return 0;
+  n = ntx_share_tracker_count();
+  for (i = 0; i < n; i++) {
+    const ntx_share_tracker *t = ntx_share_tracker_get(i);
+    if (t && t->host && host_match(t->host, host))
+      return 1;
+  }
+  return 0;
 }
 
 /* Built-in pool: a single loopback test entry (dev) — pin =
@@ -309,6 +331,8 @@ int ntx_https_tofu_test_add(const char *host, const uint8_t pin[32],
 
 /* TOFU note after the handshake — seen = unix time */
 int ntx_https_tofu_note(const char *host, const uint8_t pin[32]) {
+  if (strk_pool_has_host(host))
+    return -1; /* share trackers are fail-closed — never trusted on first sight */
   return tofu_add(host, pin, (uint32_t)time(NULL));
 }
 
@@ -396,7 +420,25 @@ int ntx_https_pin_lookup(const char *host, uint16_t port,
       *out_npins = n;
     return 0;
   }
-  /* 3. pin file */
+  /* 3. built-in share-tracker pool (exact host, fail-closed: a pooled host
+     never falls through to the pin file or TOFU, even with npins == 0) */
+  if (strk_pool_has_host(host)) {
+    n = 0;
+    {
+      int m = ntx_share_tracker_count();
+      for (i = 0; i < m; i++) {
+        const ntx_share_tracker *t = ntx_share_tracker_get(i);
+        if (!t || !t->host || !host_match(t->host, host))
+          continue;
+        for (k = 0; k < t->npins && n < max_pins; k++)
+          memcpy(out_pins[n++], t->pins[k], 32);
+      }
+    }
+    if (out_npins)
+      *out_npins = n;
+    return n > 0 ? 0 : -1;
+  }
+  /* 4. pin file */
   n = 0;
   for (i = 0; i < n_pin_file; i++) {
     if (!host_match(pin_file[i].host, host))
@@ -409,7 +451,7 @@ int ntx_https_pin_lookup(const char *host, uint16_t port,
       *out_npins = n;
     return 0;
   }
-  /* 4. TOFU (only when neither the pool nor the file gave a pin) */
+  /* 5. TOFU (only when neither the pools nor the file gave a pin) */
   if (ntx_https_tofu_enabled()) {
     for (i = 0; i < n_tofu && n < max_pins; i++)
       if (memcmp(tofu[i].host, host, strlen(host) + 1) == 0)
