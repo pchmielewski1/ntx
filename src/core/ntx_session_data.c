@@ -507,6 +507,10 @@ static int data_serve(struct ntx_session *s, int pi, int i, uint32_t idx, uint32
     uint8_t buf[NTX_PEER_REQ_LEN];
     int n = ntx_store_read(&t->store, idx, off, buf, len);
     if (n <= 0) {
+        /* §5.6: for a share this is a short pread or EIO on the file we hold open —
+         * refuse the request AND stop calling it a live share (FAILED/IO). Plain
+         * torrents are untouched: the hook is a no-op when s->share[i] == NULL. */
+        if (s->share[i]) ntx_session_share_io_failed(s, i);
         data_refuse(s, pi, idx, off, len);
         return -1;
     }

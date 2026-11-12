@@ -49,6 +49,9 @@ int ntx_session_share_poll_event(ntx_session *s, ntx_share_event *ev); /* 1 = on
 ntx_share_state ntx_session_share_state(const ntx_session *s, int ti);
 uint32_t ntx_session_share_pct(const ntx_session *s, int ti); /* 0..100 while HASHING */
 int ntx_session_share_serving(const ntx_session *s, int ti);  /* 0 = refuse block requests */
+/* §5.6: a failed pread while serving (short read or EIO) — data_serve refuses the
+ * request and parks the share in FAILED/IO through here. No-op for plain torrents. */
+void ntx_session_share_io_failed(struct ntx_session *s, int ti);
 void ntx_session_share_tick(struct ntx_session *s);           /* every session tick */
 void ntx_session_share_on_remove(struct ntx_session *s, int ti);
 void ntx_session_share_free(struct ntx_session *s);

@@ -21,7 +21,7 @@
 #include "../proto/ntx_tracker.h"
 #include "../ui/ntx_diag.h"
 
-/* --share lifecycle (design §5.1..§5.5). §5.6 (--share-from) is Task A6. */
+/* --share lifecycle (design §5.1..§5.6). */
 
 /* One tick of hashing costs at most this much wall time: the loop budget of
  * §5.3, well inside the ~50 ms per-iteration ceiling of the plan. */
@@ -31,6 +31,10 @@
 #define NTX_SHARE_FSTAT_MS 1000u   /* §5.5: change detection once per second */
 #define NTX_SHARE_REV_BASE_MS 300000u
 #define NTX_SHARE_REV_MAX_MS 3600000u
+/* Reading a .torrent for --share-from (§5.6). ntx's own builds stay far below
+ * this (both hash lists are capped by the parser's 1 MiB string limit), so
+ * anything larger is not a metainfo this module was asked to re-share. */
+#define NTX_SHARE_FROM_MAX (4u * 1024u * 1024u)
 
 struct ntx_share_slot {
     int fd; /* the only handle to the file: never re-opened by path (§5.1) */
@@ -45,6 +49,12 @@ struct ntx_share_slot {
     char magnet[NTX_SHARE_MAGNET_MAX];
     char torrent_path[NTX_SHARE_PATH_MAX];
     uint8_t ih2[32], sess_ih[20];
+    /* §5.6: the validated .torrent, kept until the hash phase proves the bytes
+     * match; then it becomes s->tts[ti] and this is emptied. NULL for --share.
+     * sess_ih/ih2 stay ZERO while hashing (§5.3), so the two hashes the .torrent
+     * claims — known from the moment it is read — live here instead. */
+    ntx_torrent *src;
+    uint8_t src_ih[20], src_ih2[32];
     int ev_full; /* one share event per slot, however it ends */
     int started_pending; /* §5.5: wait for the port mapping before `started` */
     uint64_t added_at, warn_at, fstat_at;
@@ -136,6 +146,32 @@ static void share_evq_push(struct ntx_share_slot *sl) {
     sl->ev_full = 1;
 }
 
+/* The validated copy of a --share-from .torrent holds exactly what
+ * ntx_torrent_validate_metainfo allocated; ntx_torrent.c keeps the matching
+ * free static (tt_free), so release the same fields here. The store of this
+ * copy is never opened, so there is no fd to close. */
+static void share_src_release(ntx_torrent *t) {
+    if (!t) return;
+    free(t->phash);
+    t->phash = NULL;
+    free(t->have);
+    t->have = NULL;
+    free(t->rarity);
+    t->rarity = NULL;
+    free(t->info_raw);
+    t->info_raw = NULL;
+    free(t->piece_layer);
+    t->piece_layer = NULL;
+    t->piece_layer_n = 0;
+    t->info_raw_n = 0;
+}
+
+static void share_src_free(ntx_torrent *t) {
+    if (!t) return;
+    share_src_release(t);
+    free(t);
+}
+
 static void share_free_slot(struct ntx_session *s, int ti) {
     struct ntx_share_slot *sl = s->share[ti];
     if (!sl) return;
@@ -143,6 +179,7 @@ static void share_free_slot(struct ntx_session *s, int ti) {
     if (sl->fd >= 0) close(sl->fd);
     ntx_share_hasher_free(sl->h);
     free(sl->buf);
+    share_src_free(sl->src);
     free(sl);
     s->share[ti] = NULL;
     s->tts_enc_strict[ti] = 0; /* session-level, set by share_add: ours to clear */
@@ -224,9 +261,109 @@ static void share_revive_trackers(struct ntx_session *s, struct ntx_share_slot *
 
 static int share_hash_tick(struct ntx_session *s, struct ntx_share_slot *sl);
 
+/* §5.5 readiness tail: the fd snapshot the 1 s fstat compares against, then
+ * ANNOUNCING with `started` held back for the mapping. */
+static void share_announce(struct ntx_session *s, struct ntx_share_slot *sl) {
+    s->tts[sl->ti].state = NTX_TTS_DONE;
+    sl->st = NTX_SHARE_ANNOUNCING;
+    sl->started_pending = 1; /* §5.5: only after the port mapping settled */
+    sl->warn_at = share_now_ms() + NTX_SHARE_WARN_MS;
+    sl->fstat_at = share_now_ms() + NTX_SHARE_FSTAT_MS;
+}
+
+/* §5.6.3: the piece hashes the file produced, against the two lists the
+ * .torrent claims. A short read, a truncated or rewritten file lands here with
+ * bytes that do not match — that is the `changed` of §5.6, never a share. */
+static int share_verify_cmp(const struct ntx_share_slot *sl) {
+    const ntx_torrent *src = sl->src;
+    size_t ln = 0;
+    const uint8_t *lay = ntx_share_hasher_layer(sl->h, &ln);
+    const uint8_t *want = src->piece_layer;
+    if (!lay != !want || ln != src->piece_layer_n) return -1;
+    if (ln && memcmp(lay, want, ln) != 0) return -1;
+    const uint8_t *sh = ntx_share_hasher_sha1(sl->h);
+    return sh && src->phash && memcmp(sh, src->phash, (size_t)src->np * 20) == 0 ? 0 : -1;
+}
+
+/* §5.6: --share-from. The bytes were compared with the .torrent in the hash
+ * phase, so the metainfo is not rebuilt — it IS the one read at share_add and
+ * the link therefore cannot change. The .torrent is NOT rewritten (§5.6.5) and
+ * the magnet is rebuilt from the CURRENT pinned list (§5.6.4); the tracker list
+ * is not part of `info`, so that changes nothing about the hash. */
+static int share_finish_from(struct ntx_session *s, struct ntx_share_slot *sl) {
+    ntx_torrent *t = &s->tts[sl->ti];
+    ntx_torrent *src = sl->src;
+
+    if (share_verify_cmp(sl) != 0) return share_fail(s, sl, NTX_SHARE_E_CHANGED), -1;
+
+    /* Review focus 5: one info-hash may live in exactly one slot, because
+     * sp_match_tts returns the FIRST match and a second slot with the same hash
+     * could never be reached by an incoming handshake. Checked before anything
+     * is published, so the share that got there first is untouched. */
+    for (int j = 0; j < NTX_SESSION_MAX_TTS; j++) {
+        if (j == sl->ti || !s->share[j] || s->share[j]->st == NTX_SHARE_FAILED) continue;
+        if (s->tts[j].np && memcmp(s->tts[j].info_hash, sl->src_ih, 20) == 0)
+            return share_fail(s, sl, NTX_SHARE_E_EXISTS), -1;
+    }
+
+    const char *trks[NTX_SESSION_MAX_TRK];
+    int ntrk = share_trk_list(trks, NTX_SESSION_MAX_TRK);
+    if (ntrk < 1) return share_fail(s, sl, NTX_SHARE_E_NO_TRACKERS), -1;
+
+    /* Publish the metainfo on the slot. The hash gate is the verification that
+     * just ran, so the gate passes by construction; validate fills phash/ps/np/
+     * size/name from the very bytes the file matched. `have`/`rarity`/`phash`
+     * are fresh allocations, freed with the slot. */
+    ntx_torrent_init_meta(t, sl->src_ih);
+    memcpy(t->info_hash_v2, sl->src_ih2, 32);
+    t->meta_version = 2;
+    t->priv = 1;
+    s->tts_enc_strict[sl->ti] = 1;
+    /* NULL layers: hybrid, so the v1 SHA-1 list in `info` is the gate's own
+     * check; the BEP 52 layers were just compared against the file itself. */
+    int rc = ntx_torrent_validate_metainfo(t, src->info_raw, src->info_raw_n, NULL, 0);
+    if (rc == 0 && src->piece_layer_n) {
+        /* keep the layers: ntx_torrent_piece_complete_from and the BEP 52 hash
+         * exchange (msgs 21..23) both answer from them */
+        t->piece_layer = malloc(src->piece_layer_n);
+        if (!t->piece_layer) rc = -1;
+        else {
+            memcpy(t->piece_layer, src->piece_layer, src->piece_layer_n);
+            t->piece_layer_n = src->piece_layer_n;
+        }
+    }
+    share_src_free(sl->src);
+    sl->src = NULL;
+    if (rc != 0) return share_fail(s, sl, NTX_SHARE_E_CHANGED), -1;
+    if (t->np == 0 || t->size != sl->size || t->ps != sl->ps)
+        return share_fail(s, sl, NTX_SHARE_E_CHANGED), -1;
+
+    if (ntx_store_open_ro_fd(&t->store, sl->fd, sl->size, sl->ps) != 0)
+        return share_fail(s, sl, NTX_SHARE_E_IO), -1;
+    for (uint32_t i = 0; i < t->np; i++) {
+        t->have[i] = 1;
+        t->store.pmap[i] = 2;
+    }
+    t->have_n = t->np;
+    t->verified_B = t->size;
+    t->pre_complete = 1;
+    t->have_meta = 1; /* trk_left (left=0 of §5.5) and ntx_torrent_done read it */
+
+    if (ntx_share_magnet(sl->magnet, sizeof sl->magnet, sl->src_ih, sl->src_ih2, sl->name, trks, ntrk) != 0)
+        return share_fail(s, sl, NTX_SHARE_E_BAD_ARG), -1;
+    memcpy(sl->sess_ih, sl->src_ih, 20);
+    memcpy(sl->ih2, sl->src_ih2, 32);
+    if (fstat(sl->fd, &sl->saved) != 0) return share_fail(s, sl, NTX_SHARE_E_IO), -1;
+    share_announce(s, sl);
+    if (s->cfg && s->cfg->verbose)
+        ntx_diag("ntx: share %s verified against %s\n", sl->name, sl->torrent_path);
+    return 0;
+}
+
 /* §5.2 + §5.4: info dict (random salt) -> hash gate through the same validator
  * as a download -> read-only store over the held fd -> atomic .torrent. */
 static int share_finish(struct ntx_session *s, struct ntx_share_slot *sl) {
+    if (sl->src) return share_finish_from(s, sl);
     ntx_torrent *t = &s->tts[sl->ti];
     const char *trks[NTX_SESSION_MAX_TRK];
     int ntrk = share_trk_list(trks, NTX_SESSION_MAX_TRK);
@@ -337,11 +474,7 @@ static int share_finish(struct ntx_session *s, struct ntx_share_slot *sl) {
         ntx_store_close(&t->store);
         return share_fail(s, sl, NTX_SHARE_E_IO), -1;
     }
-    t->state = NTX_TTS_DONE;
-    sl->st = NTX_SHARE_ANNOUNCING;
-    sl->started_pending = 1; /* §5.5: only after the port mapping settled */
-    sl->warn_at = share_now_ms() + NTX_SHARE_WARN_MS;
-    sl->fstat_at = share_now_ms() + NTX_SHARE_FSTAT_MS;
+    share_announce(s, sl); /* §5.5: the same readiness tail as --share-from */
     return 0;
 }
 
@@ -382,10 +515,91 @@ static int share_stat_differs(const struct stat *a, const struct stat *b) {
            a->st_ctim.tv_sec != b->st_ctim.tv_sec || a->st_ctim.tv_nsec != b->st_ctim.tv_nsec;
 }
 
+/* §5.6.1: read and accept the .torrent a --share-from must match. Everything
+ * that can be decided before a single file byte is hashed is decided here, so a
+ * mismatch is a synchronous BAD_ARG and never a share that dies later. The
+ * metainfo is filled into *out (heap fields owned by the caller) together with
+ * both halves of the hybrid hash, exactly as share_finish derives them. */
+static ntx_share_err share_from_read(const char *path, uint64_t fsize, ntx_torrent *out, uint8_t ih[20],
+                                     uint8_t ih2[32]) {
+    ntx_share_err e = NTX_SHARE_E_BAD_ARG;
+    FILE *f = fopen(path, "rb");
+    if (!f) return e;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return e; }
+    long sz = ftell(f);
+    if (sz <= 0 || (uint64_t)sz > NTX_SHARE_FROM_MAX) { fclose(f); return e; }
+    rewind(f);
+    uint8_t *buf = malloc((size_t)sz);
+    if (!buf) { fclose(f); return e; }
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    if (rd != (size_t)sz) { free(buf); return e; }
+
+    ntx_be top;
+    size_t consumed = 0;
+    if (ntx_be_parse(buf, rd, &top, &consumed, 32, (size_t)1 << 20) != 0) { free(buf); return e; }
+    const ntx_be *info = ntx_be_dict_get(&top, "info");
+    const ntx_be *layers = ntx_be_dict_get(&top, "piece layers");
+    if (!info || info->t != NTX_BE_DICT || info->end <= info->start) {
+        ntx_be_free(&top);
+        free(buf);
+        return e;
+    }
+    const uint8_t *ib = buf + info->start;
+    size_t ibn = info->end - info->start;
+
+    /* §5.6.1: private, one file, and the length is the file's length. */
+    const ntx_be *pv = ntx_be_dict_get(info, "private");
+    if (!pv || pv->t != NTX_BE_INT || pv->i == 0) {
+        ntx_be_free(&top);
+        free(buf);
+        return e;
+    }
+    const ntx_be *psbe = ntx_be_dict_get(info, "piece length");
+    const ntx_be *pieces = ntx_be_dict_get(info, "pieces");
+    const ntx_be *lenbe = ntx_be_dict_get(info, "length");
+    if (!psbe || psbe->t != NTX_BE_INT || !lenbe || lenbe->t != NTX_BE_INT || (uint64_t)lenbe->i != fsize ||
+        !pieces || pieces->t != NTX_BE_STR || pieces->sn == 0 || pieces->sn % 20 != 0) {
+        ntx_be_free(&top);
+        free(buf);
+        return e;
+    }
+    uint64_t ps64 = (uint64_t)psbe->i;
+    if (ps64 < NTX_SHARE_PIECE_MIN || ps64 > NTX_SHARE_PIECE_MAX || (ps64 & (ps64 - 1)) != 0 ||
+        (fsize + ps64 - 1) / ps64 != pieces->sn / 20) {
+        ntx_be_free(&top);
+        free(buf);
+        return e;
+    }
+    /* The hybrid pair: SHA-1(info) is the wire/announce hash, SHA-256(info) the
+     * v2 root, and the validator's gate wants both before it parses. */
+    ntx_sha1(ib, ibn, ih);
+    ntx_sha256(ib, ibn, ih2);
+    ntx_torrent_init_meta(out, ih);
+    memcpy(out->info_hash_v2, ih2, 32);
+    out->meta_version = 2;
+    int ok = ntx_torrent_validate_metainfo(out, ib, ibn,
+                                           layers && layers->t == NTX_BE_DICT ? buf + layers->start : NULL,
+                                           layers && layers->t == NTX_BE_DICT ? layers->end - layers->start : 0) == 0;
+    ntx_be_free(&top);
+    free(buf);
+    /* Hybrid, one file, both hash lists: the hash phase compares the file against
+     * the v1 SHA-1 list AND the BEP 52 layers, so a .torrent that carries only
+     * one of them (or a second file) is not something ntx was asked to re-share.
+     * A whole-file root needs no top-level "piece layers" (np == 1), exactly as
+     * share_finish builds its own. */
+    if (!ok || out->priv == 0 || out->hybrid != 1 || out->v2_nfiles != 1 || out->size != fsize ||
+        out->np == 0 || !out->phash || out->ps != (uint32_t)ps64 || !ntx_share_name_ok(out->name) ||
+        (out->np > 1 && !out->piece_layer)) {
+        share_src_release(out);
+        return e;
+    }
+    return NTX_SHARE_OK;
+}
+
 int ntx_session_share_add(ntx_session *s, const char *path, const char *from_torrent, ntx_share_err *err) {
     if (err) *err = NTX_SHARE_E_BAD_ARG;
     if (!s || !path || !path[0]) return -1;
-    if (from_torrent) return -1; /* §5.6 belongs to Task A6 */
 
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
@@ -400,25 +614,48 @@ int ntx_session_share_add(ntx_session *s, const char *path, const char *from_tor
     }
     const char *bn = strrchr(path, '/');
     bn = bn ? bn + 1 : path;
-    if (!ntx_share_name_ok(bn)) {
+    /* §5.6.1: with --share-from the name on disk may differ — the name inside
+     * the .torrent is the one that stays, and it is validated there. */
+    if (!from_torrent && !ntx_share_name_ok(bn)) {
         close(fd);
         if (err) *err = NTX_SHARE_E_BAD_NAME;
         return -1;
     }
+    /* §5.6: everything decidable about the metainfo is decided before a byte of
+     * the file is hashed, so a wrong .torrent is a synchronous BAD_ARG. */
+    ntx_torrent *src = NULL;
+    uint8_t src_ih[20] = {0}, src_ih2[32] = {0};
     uint32_t ps = 0;
-    if (smeta_piece_len((uint64_t)sb.st_size, &ps) != 0) { /* > 32 768 pieces */
+    if (from_torrent) {
+        src = calloc(1, sizeof *src);
+        if (!src) {
+            close(fd);
+            if (err) *err = NTX_SHARE_E_IO;
+            return -1;
+        }
+        ntx_share_err fe = share_from_read(from_torrent, (uint64_t)sb.st_size, src, src_ih, src_ih2);
+        if (fe != NTX_SHARE_OK) {
+            share_src_free(src);
+            close(fd);
+            if (err) *err = fe;
+            return -1;
+        }
+        ps = src->ps; /* the piece length comes from the .torrent, never re-picked */
+    } else if (smeta_piece_len((uint64_t)sb.st_size, &ps) != 0) { /* > 32 768 pieces */
         close(fd);
         if (err) *err = NTX_SHARE_E_TOO_BIG;
         return -1;
     }
     if (!ntx_share_available()) {
         close(fd);
+        share_src_free(src);
         if (err) *err = NTX_SHARE_E_NO_TRACKERS;
         return -1;
     }
     int ti = ntx_session_free_slot(s);
     if (ti < 0) {
         close(fd);
+        share_src_free(src);
         if (err) *err = NTX_SHARE_E_FULL;
         return -1;
     }
@@ -428,6 +665,7 @@ int ntx_session_share_add(ntx_session *s, const char *path, const char *from_tor
         ntx_share_hasher_free(h);
         free(rbuf);
         close(fd);
+        share_src_free(src);
         if (err) *err = NTX_SHARE_E_IO;
         return -1;
     }
@@ -437,6 +675,7 @@ int ntx_session_share_add(ntx_session *s, const char *path, const char *from_tor
         ntx_share_hasher_free(h);
         free(rbuf);
         close(fd);
+        share_src_free(src);
         if (err) *err = NTX_SHARE_E_IO;
         return -1;
     }
@@ -448,7 +687,15 @@ int ntx_session_share_add(ntx_session *s, const char *path, const char *from_tor
     sl->size = (uint64_t)sb.st_size;
     sl->ps = ps;
     sl->added_at = share_now_ms();
-    snprintf(sl->name, sizeof sl->name, "%s", bn);
+    if (src) { /* §5.6: the name and the path stay the ones of the .torrent */
+        sl->src = src;
+        memcpy(sl->src_ih, src_ih, 20);
+        memcpy(sl->src_ih2, src_ih2, 32);
+        snprintf(sl->name, sizeof sl->name, "%s", src->name);
+        snprintf(sl->torrent_path, sizeof sl->torrent_path, "%s", from_torrent);
+    } else {
+        snprintf(sl->name, sizeof sl->name, "%s", bn);
+    }
 
     ntx_session_hash_reset(s, ti);
     uint8_t zeros[20] = {0};
@@ -504,6 +751,21 @@ int ntx_session_share_serving(const ntx_session *s, int ti) {
     const struct ntx_share_slot *sl = s->share[ti];
     if (!sl) return 1;
     return sl->st == NTX_SHARE_ANNOUNCING || sl->st == NTX_SHARE_READY;
+}
+
+/* §5.6: a pread that came back short or with EIO *while serving*. data_serve has
+ * already refused the request; the share itself must not keep advertising itself
+ * as serving, so it parks in FAILED/IO. No-op for plain torrents (sl == NULL),
+ * which is what keeps the call free for the download path.
+ * ponytail: no choke/stopped here, unlike share_changed — §5.6 asks only for the
+ * refusal plus FAILED/IO, and ntx_session_share_serving gates every later
+ * request. Upgrade path: route this through share_changed if a read error should
+ * also send `stopped`. */
+void ntx_session_share_io_failed(struct ntx_session *s, int ti) {
+    if (!s || ti < 0 || ti >= NTX_SESSION_MAX_TTS) return;
+    struct ntx_share_slot *sl = s->share[ti];
+    if (!sl) return;
+    share_fail(s, sl, NTX_SHARE_E_IO);
 }
 
 void ntx_session_share_tick(struct ntx_session *s) {
