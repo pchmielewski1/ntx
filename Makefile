@@ -13,7 +13,7 @@ VERSION_DEFINE := $(if $(NTX_VERSION),-DNTX_VERSION='"$(NTX_VERSION)"')
 MIPS_CC ?= $(HOME)/toolchains/mipsel-linux-musl/bin/mipsel-linux-musl-gcc
 RISCV_CC ?= riscv64-linux-gnu-gcc
 
-.PHONY: all test test-net test-mipsel native-check test-cli test-interop test-ipc interop_ipc size static clean probe test-live test-tls13 riscv size-riscv test-riscv test-riscv-shell pins-check pins-update
+.PHONY: all test test-net test-mipsel native-check test-cli test-interop test-ipc interop_ipc size static clean probe test-live test-tls13 riscv size-riscv test-riscv test-riscv-shell pins-check pins-update test-share
 
 # Share-tracker key gate (design §6.2). The only targets allowed to reach the
 # network: `make` and `make test` never call them. pins-update is the sole writer
@@ -52,6 +52,10 @@ test-tls13: ; @rm -f .tls_probe.tmp; ./test/tls13_interop.sh ./.tls_probe.tmp; r
 test-cli: ntx ; ./test/cli_errors.sh && ./test/pins_tool.sh
 interop_ipc: ntx ; ./test/interop/ipc/interop_ipc.sh
 test-ipc: interop_ipc
+# Private-share end-to-end (Task I1): the script renders trackers.inc from the
+# ephemeral HTTPS tracker's port + SPKI and compiles its own pinned .sharetest_e2e.tmp,
+# so this target stays thin; ntx-sharetest keeps the share-test build in the gate.
+test-share: ntx-sharetest ; ./test/interop/share/share_e2e.sh
 test-interop: ; \
   mkdir -p test/.scratch && \
   CTX=$$(mktemp -d test/.scratch/interop-ctx.XXXXXX) && \

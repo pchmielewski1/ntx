@@ -1,0 +1,30 @@
+/* Rendered by test/interop/share/share_e2e.sh from this template — never
+ * compiled as it stands. @PORT@ is the port the ephemeral HTTPS tracker bound,
+ * @SPKI@ the 64 lowercase hex digits of SHA-256 over the leaf certificate's
+ * SubjectPublicKeyInfo (openssl x509 -pubkey | openssl pkey -pubin -outform
+ * DER | openssl dgst -sha256). Rows keep the exact strk_raw shape of
+ * scripts/pins/sharetest_trackers.inc (see src/proto/ntx_share_trackers.c).
+ *
+ * Two rows because NTX_SHARE_MIN_TRACKERS is 2, both served by the one tracker
+ * process on the same port: the magnet is rebuilt from this whole table
+ * (share_trk_list in src/core/ntx_share.c), so a second, unreachable host would
+ * make the leech fail its first announce while the real one already has the
+ * peer. 127.0.0.1 is deliberately NOT one of them — the built-in HTTPS pin pool
+ * (ntx_https_pin_pool in src/proto/ntx_https_pin.c) pins that host to the dev
+ * test leaf and is consulted before the share-tracker table, so a generated
+ * certificate could never pin-match there; nor localhost, which would need a
+ * DNS reply. Loopback aliases keep every host literal-IP, i.e. no resolver. */
+static const strk_raw strk_raw_tab[] = {
+    {"https://@IP_A@:@PORT@/announce", "@IP_A@",
+     {"@SPKI@", 0, 0, 0}},
+    {"https://@IP_B@:@PORT@/announce", "@IP_B@",
+     {"@SPKI@", 0, 0, 0}},
+};
+/* Test-only table: this banner marks the binary (release.yml greps for it) and
+ * is printed at start so a stray test build cannot be mistaken for a release.
+ * Same constructor as scripts/pins/sharetest_trackers.inc — gcc/clang-only and
+ * never compiled into a release. */
+#include <stdio.h>
+__attribute__((constructor)) static void strk_e2e_banner(void) {
+    fputs("NTX-TEST-TRACKERS: built with -DNTX_SHARE_TRACKERS_INC\n", stderr);
+}
