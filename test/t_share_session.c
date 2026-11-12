@@ -92,6 +92,40 @@
 #define SCRATCH "test/.scratch/a5"
 #define BIG_MIB 64
 
+/* Sanitizer detection: GCC defines __SANITIZE_ADDRESS__ for -fsanitize=address,
+ * clang needs __has_feature (nested #if: GCC's #if expands an undefined
+ * function-like macro instead of short-circuiting it). Only the tick-budget
+ * gate below cares. */
+#if defined(__SANITIZE_ADDRESS__)
+#define NTX_TEST_SANITIZED 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define NTX_TEST_SANITIZED 1
+#else
+#define NTX_TEST_SANITIZED 0
+#endif
+#else
+#define NTX_TEST_SANITIZED 0
+#endif
+
+/* Absolute per-tick ceiling for the 64 MiB hash (§5.3 budget check). The
+ * production budget is NTX_SHARE_HASH_BUDGET_MS and ntx_session_share_add /
+ * share_hash_tick re-checks that deadline inside the tick, so the gate is only
+ * a "the budget is actually being honoured" tripwire. Under ASAN every memcpy,
+ * pread and SHA round costs many times more, so a tick can blow the 20 ms
+ * budget long before the next deadline check lands: 256..272 ms observed for
+ * one tick on this aarch64 box with the CI flags (-fsanitize=address,undefined
+ * -O1, x86_64 CI still fits under 50, which is why CI with detect_leaks=0
+ * never flagged it). 50 x 16 = 800 ms is ~3x that worst observed figure and
+ * still ~40x the production budget, so it catches a genuinely unbounded tick
+ * (a regression would cost seconds per 64 MiB tick) without faulting on
+ * sanitizer overhead. */
+#if NTX_TEST_SANITIZED
+#define NTX_TEST_TICK_GATE_MS 800
+#else
+#define NTX_TEST_TICK_GATE_MS 50
+#endif
+
 static int fail(const char *m) {
     printf("FAIL %s\n", m);
     fflush(stdout);
@@ -509,6 +543,15 @@ static void sess_open(sess *x, const char *tag) {
 static void sess_close(sess *x) {
     ntx_session_free(x->s);
     ntx_netx_free(x->n);
+    /* sess_open strdups store_dir. Nothing keeps the pointer past teardown:
+     * ntx_session_init/ntx_netx_init only store the address of the caller's
+     * ntx_config and read store_dir during their own lifetime (dht state path,
+     * ntx_torrent_set_metainfo, ntx_share_torrent_path), each snprintf-ing it
+     * into a fixed buffer; ntx_store holds fds/pmap only and ntx_torrent /
+     * ntx_share_slot hold char[] copies. Free it after both frees, which is
+     * also why the test's own x.cfg.store_dir reads must stay before this. */
+    free((void *)x->cfg.store_dir);
+    x->cfg.store_dir = NULL;
 }
 
 /* Pins the driver without letting it talk to a gateway: the B5 hook pattern —
@@ -625,9 +668,9 @@ static void test_hash_and_results(void) {
 
     int ticks = 0;
     uint64_t max_ms = pump_until_hashed(&x, ti, 6000, &ticks);
-    printf("MEASURE 64MiB ticks=%d max_tick_ms=%llu (budget %d ms, gate 50 ms)\n", ticks,
-           (unsigned long long)max_ms, NTX_SHARE_HASH_BUDGET_MS);
-    if (max_ms > 50) fail("tick_over_50ms");
+    printf("MEASURE 64MiB ticks=%d max_tick_ms=%llu (budget %d ms, gate %d ms)\n", ticks,
+           (unsigned long long)max_ms, NTX_SHARE_HASH_BUDGET_MS, NTX_TEST_TICK_GATE_MS);
+    if (max_ms > NTX_TEST_TICK_GATE_MS) fail("tick_over_50ms");
     ntx_share_state sh = ntx_session_share_state(x.s, ti);
     if (sh != NTX_SHARE_ANNOUNCING && sh != NTX_SHARE_READY) fail("hash_did_not_finish");
     if (x.s->tts[ti].state != NTX_TTS_DONE) fail("tts_not_done");
