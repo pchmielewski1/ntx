@@ -133,7 +133,15 @@ int ntx_torrent_init_meta(ntx_torrent *t, const uint8_t info_hash[20]) {
     return 0;
 }
 
-static void tt_free(ntx_torrent *t) {
+/* Ownership contract: ntx_torrent_validate_metainfo / ntx_torrent_set_metainfo
+ * allocate phash, have, rarity, info_raw and piece_layer and hand them to the
+ * caller on success — the failure paths free them, the success path does not.
+ * Every owner (session slot teardown, the detached --share-from copy) releases
+ * them through this one function. NULL-safe and idempotent: every pointer is
+ * cleared, so a second release is a no-op. Does NOT touch the store, which the
+ * session closes on its own schedule. */
+void ntx_torrent_release(ntx_torrent *t) {
+    if (!t) return;
     free(t->phash);
     free(t->have);
     free(t->rarity);
@@ -146,6 +154,10 @@ static void tt_free(ntx_torrent *t) {
     t->piece_layer = NULL;
     t->piece_layer_n = 0;
     t->info_raw_n = 0;
+}
+
+static void tt_free(ntx_torrent *t) {
+    ntx_torrent_release(t);
     ntx_store_close(&t->store);
 }
 

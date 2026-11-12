@@ -103,6 +103,12 @@ void ntx_session_free(ntx_session *s) {
     }
     for (int i = 0; i < NTX_SESSION_MAX_TTS; i++) {
         if (s->tts[i].state != NTX_TTS_DEAD) ntx_store_close(&s->tts[i].store);
+        /* A slot that never went through ntx_session_remove still owns the
+         * validator's field set (phash/have/rarity/info_raw/piece_layer).
+         * info_raw is the ownership marker — it is only ever allocated by
+         * validate_metainfo/set_metainfo (and cleared by their tt_free), so a
+         * slot whose fields a caller owns some other way is left alone. */
+        if (s->tts[i].info_raw) ntx_torrent_release(&s->tts[i]);
         free(s->piece_bytes[i]);
         free(s->hash_scratch[i]);
         s->hash_scratch[i] = NULL;
@@ -310,6 +316,12 @@ void ntx_session_remove(ntx_session *s, int i) {
     ntx_torrent *t = &s->tts[i];
     if (t->state != NTX_TTS_DEAD) ntx_session_trk_stop(s, i);
     ntx_store_close(&t->store);
+    /* The metainfo field set (phash/have/rarity/info_raw/piece_layer) is owned
+     * by the slot from validate_metainfo/set_metainfo onwards; tt_free only runs
+     * on the validator's failure paths, so this is its only release. Idempotent,
+     * so the DEAD-slot reuse in add_magnet/add_torrent_file/share_add (which
+     * init_meta over) can never leak or double-free the previous generation. */
+    ntx_torrent_release(t);
     free(s->piece_bytes[i]);
     s->piece_bytes[i] = 0;
     if (s->piece_blk_map[i]) {

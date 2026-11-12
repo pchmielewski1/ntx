@@ -147,23 +147,12 @@ static void share_evq_push(struct ntx_share_slot *sl) {
 }
 
 /* The validated copy of a --share-from .torrent holds exactly what
- * ntx_torrent_validate_metainfo allocated; ntx_torrent.c keeps the matching
- * free static (tt_free), so release the same fields here. The store of this
- * copy is never opened, so there is no fd to close. */
+ * ntx_torrent_validate_metainfo allocated, so it is released with the same
+ * public contract the session slot teardown uses. The store of this copy is
+ * never opened, so there is no fd to close. */
 static void share_src_release(ntx_torrent *t) {
     if (!t) return;
-    free(t->phash);
-    t->phash = NULL;
-    free(t->have);
-    t->have = NULL;
-    free(t->rarity);
-    t->rarity = NULL;
-    free(t->info_raw);
-    t->info_raw = NULL;
-    free(t->piece_layer);
-    t->piece_layer = NULL;
-    t->piece_layer_n = 0;
-    t->info_raw_n = 0;
+    ntx_torrent_release(t);
 }
 
 static void share_src_free(ntx_torrent *t) {

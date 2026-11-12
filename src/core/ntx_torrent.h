@@ -88,6 +88,11 @@ int ntx_torrent_metainfo_hash(const uint8_t *info, size_t n, uint8_t out20[20],
  * on disk. On failure the torrent is back to its init_meta state. */
 int ntx_torrent_validate_metainfo(ntx_torrent *t, const uint8_t *info, size_t info_n,
                                   const uint8_t *layers, size_t layers_n);
+/* Release the field set that validate_metainfo/set_metainfo allocate on
+ * success (phash, have, rarity, info_raw, piece_layer) and clear the pointers,
+ * so the torrent goes back to an init_meta shape. NULL-safe and idempotent: a
+ * second release is a no-op. The store is NOT touched — its owner closes it. */
+void ntx_torrent_release(ntx_torrent *t);
 /* Write half: mkdir + open the store an already-validated torrent describes.
  * On failure the validated fields are freed. */
 int ntx_torrent_open_store(ntx_torrent *t, const char *store_dir);
