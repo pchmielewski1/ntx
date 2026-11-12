@@ -100,6 +100,9 @@ void ntx_session_free(ntx_session *s) {
         }
         free(s->peer_buf[pi]);
         free(s->peer_out[pi]);
+        /* Releases the peer struct's five heap arrays (phave/req_*). Unconditional:
+         * ntx_peer_free is idempotent and a never-allocated slot holds only NULLs. */
+        ntx_peer_free(&s->peers[pi]);
     }
     for (int i = 0; i < NTX_SESSION_MAX_TTS; i++) {
         if (s->tts[i].state != NTX_TTS_DEAD) ntx_store_close(&s->tts[i].store);
@@ -502,6 +505,10 @@ void ntx_session_peer_free(struct ntx_session *s, int pi) {
     s->peer_plain[pi] = 0;
     s->peer_hello_sent[pi] = 0;
     memset(&s->pe[pi], 0, sizeof s->pe[pi]);
+    /* Releases the peer struct's five heap arrays (phave/req_*). Must stay before
+     * the fd reset below: ntx_peer_free memsets the struct, which would leave a
+     * stale slot looking live with fd 0 if the reset ran first. */
+    ntx_peer_free(&s->peers[pi]);
     s->peers[pi].fd = -1;
     s->peer_tts[pi] = -1;
     s->peer_phase[pi] = 0;
