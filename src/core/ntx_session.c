@@ -337,20 +337,15 @@ void ntx_session_remove(ntx_session *s, int i) {
     }
     free(s->piece_blk_n[i]);
     s->piece_blk_n[i] = NULL;
+    /* Single teardown path: ntx_session_peer_free also releases the peer struct's
+     * five heap arrays (ntx_peer_free) and clears the per-peer scratch the old
+     * duplicated body left behind (peer_bf_pending, pe[], peer_plain,
+     * peer_hello_sent, peer_outbound, peer_tcp_fb, meta/bf/upq counters). Its
+     * own fd == -1 guard matches the loop condition below, and every field it
+     * additionally zeroes is per-peer state of a peer that is going away. */
     for (int pi = 0; pi < NTX_SESSION_MAX_PEERS; pi++) {
-        if (s->peer_tts[pi] == i && s->peers[pi].fd != -1) {
-            ntx_netx_del(s->netx, s->peers[pi].fd);
-            if (s->peers[pi].fd >= 0) close(s->peers[pi].fd);
-            free(s->peer_buf[pi]);
-            s->peer_buf[pi] = 0;
-            free(s->peer_out[pi]);
-            s->peer_out[pi] = 0;
-            s->peer_out_len[pi] = 0;
-            s->peer_out_off[pi] = 0;
-            s->peers[pi].fd = -1;
-            s->peer_tts[pi] = -1;
-            s->peer_phase[pi] = 0;
-        }
+        if (s->peer_tts[pi] == i && s->peers[pi].fd != -1)
+            ntx_session_peer_free(s, pi);
     }
     ntx_session_hash_reset(s, i); /* drop scratch/outstanding 21s so a reused slot is clean */
     t->state = NTX_TTS_DEAD;
@@ -580,6 +575,13 @@ static int dial_impl(struct ntx_session *s, int tts_idx, const ntx_addr *addr, u
         s->peer_buf[pi] = 0;
         free(s->peer_out[pi]);
         s->peer_out[pi] = 0;
+        /* Releases the five arrays ntx_session_peer_alloc just calloc'd. Must stay
+         * above the fd reset: ntx_peer_free memsets the struct, which would leave
+         * the slot looking live with fd 0 if the reset ran first. The remaining
+         * fields need no extra clearing here — peer_alloc memsets the struct and
+         * re-inits every per-peer field on the fd == -1 reuse, so a stale
+         * peer_bf_pending/pe[] cannot survive into the next generation. */
+        ntx_peer_free(&s->peers[pi]);
         s->peers[pi].fd = -1;
         s->peer_tts[pi] = -1;
         s->peer_phase[pi] = 0;
