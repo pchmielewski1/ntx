@@ -96,6 +96,7 @@ static int test_bep6_ignore(void) {
     s->tts[0].state = NTX_TTS_DL;
     s->tts[0].have_meta = 1;
     s->tts[0].np = 1;
+    free(s->peers[pi].phave);
     s->peers[pi].phave = calloc(1, 1);
     s->peers[pi].phave_n = 1;
 
@@ -140,6 +141,7 @@ static int test_coalesced_ka_piece(void) {
     s->tts[0].state = NTX_TTS_DL;
     s->tts[0].have_meta = 1;
     s->tts[0].np = 1;
+    free(s->peers[pi].phave);
     s->peers[pi].phave = calloc(1, 1);
     s->peers[pi].phave_n = 1;
 
@@ -182,8 +184,14 @@ static int test_interest_after_bitfield(void) {
     s->tts[0].phash = calloc(8 * 20, 1);
     s->tts[0].have = calloc(8, 1);
     s->tts[0].rarity = calloc(8, sizeof(uint32_t));
+    /* Ownership marker: ntx_torrent_validate_metainfo always allocates info_raw
+     * with phash/have/rarity, and ntx_session_free releases a slot's field set
+     * only when info_raw is set. A hand-built slot must set it or those three
+     * arrays leak (ntx_session_free, not this test, owns them from here). */
+    s->tts[0].info_raw = calloc(1, 1);
     s->tts[0].store.ps = 16384;
     s->tts[0].store.size = 8 * 16384ULL;
+    free(s->peers[pi].phave);
     s->peers[pi].phave = calloc(8, 1);
     s->peers[pi].phave_n = 8;
     ntx_peer_set_we_int(&s->peers[pi], 1);
@@ -204,9 +212,6 @@ static int test_interest_after_bitfield(void) {
     if (!s->peers[pi].we_int) return fail("interest_not_restored");
     if (!ntx_peer_has(&s->peers[pi], 0)) return fail("bitfield_not_applied");
     printf("PASS interest_after_bitfield\n");
-    free(s->tts[0].phash);
-    free(s->tts[0].have);
-    free(s->tts[0].rarity);
     ntx_session_free(s);
     ntx_netx_free(n);
     return 0;
