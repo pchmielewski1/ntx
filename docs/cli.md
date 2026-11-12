@@ -46,7 +46,7 @@ Defaults are those of `ntx_main.c`. `ntx --help` prints the same list.
 | `--compat-peers` | on | Allow plaintext BitTorrent when message-stream encryption (MSE/PE) fails. The flag is accepted for explicitness; it is already on by default and there is no option to turn it off. |
 | `--allow-local-peers` | off | Also dial peer addresses that are normally refused: `0.0.0.0/8`, loopback, link-local (`169.254.0.0/16`, includes the cloud metadata address), multicast / reserved (`224.0.0.0` and above) and the IPv6 equivalents (`::`, `::1`, `fe80::/10`, `ff00::/8`, IPv4-mapped forms of the above). The filter applies to outbound dials, whatever the source of the address (tracker, PEX, DHT, holepunch). Private LAN ranges (RFC 1918, IPv6 ULA) are never blocked. |
 | `--share=PATH` | none | Share a single regular file. `ntx` hashes it, writes a private hybrid `.torrent` into the store directory, announces on the built-in pinned HTTPS share trackers, seeds and prints the magnet link on stdout. `PATH` may be a symlink; the target must be a regular file of size > 0. `--share` is a torrent source, so it cannot be combined with a magnet, a `.torrent` or a link file, and it cannot be given twice. The file is opened read-only, kept open for the whole share and never written to. Details: [storage.md](storage.md), [network.md](network.md#share-trackers-and-pinned-keys). |
-| `--share-from=FILE.torrent` | none | Re-share under an existing link: take the metainfo (name, piece length, hashes) from `FILE.torrent` and verify the file against it instead of hashing it fresh. Only valid together with `--share=`. **Not implemented in this build** — the parser accepts the flag and `ntx_session_share_add` rejects any non-NULL value, so the session exits `1` with `ntx: cannot share <path>: invalid share argument`. |
+| `--share-from=FILE.torrent` | none | Re-share under an existing link: the name, piece length and both hash lists are taken from `FILE.torrent` and the file is hashed and compared against them instead of producing a new metainfo, so the magnet does not change. Only valid together with `--share=`. The name on disk may differ — the name **inside** `FILE.torrent` is the one the share keeps. `FILE.torrent` must be readable, non-empty and at most 4 MiB, must parse as bencode, and must describe a private, single-file **hybrid** (v1 + v2) torrent whose `length` equals the file's size, whose `piece length` is a power of two in `16 KiB`-`64 MiB` with exactly `ceil(size / piece length)` SHA-1 `pieces` hashes, and — above one piece — which carries the BEP 52 `piece layers`. Anything else, a v1-only or multi-file `.torrent` included, is a synchronous failure: `ntx: cannot share <path>: invalid share argument`, exit `1`. The bytes are only compared once the file has been hashed, so file/metainfo mismatch surfaces later as `changed`. The `.torrent` is read and never rewritten, and the magnet is rebuilt from the currently pinned tracker list, so a re-share follows key rotation. |
 | `--port-map` | automatic with a share | Ask the default gateway for a NAT-PMP/PCP port mapping of the listen port (PCP first, NAT-PMP after a version mismatch). Mapping already runs automatically while a share is live; this flag turns it on for a session without one too. Refused together with `--proxy` or `--tunnel`. |
 | `--no-port-map` | off | Never map a port, even while sharing. Mutually exclusive with `--port-map`. |
 | `--no-https-tofu` | TOFU on | Disable trust-on-first-use pinning for HTTPS hosts. Hosts without a built-in or file pin are then refused. |
@@ -111,6 +111,15 @@ Behaviour worth knowing:
 - `--port-map` / `--no-port-map` decide whether `ntx` asks the gateway for an external
   port while the share runs (design §8); the public swarm is never mapped. Port
   mapping is on by default whenever a share is live and off otherwise.
+- With `--share-from` the sequence above changes in two places. Step 1 additionally reads and
+  accepts or rejects the `.torrent` (see the option row), and step 3 neither builds nor
+  writes a metainfo — the `.torrent` on disk is kept exactly as it is and only the magnet
+  is rebuilt, from the currently pinned tracker list. The file is hashed either way; under
+  `--share-from` the hashes are compared instead of published, and a mismatch is the
+  `changed` failure, never a share under a wrong link. Under `--stats-json`, where two shares can
+  live in one session, sharing the same `.torrent` twice fails the second attempt with
+  `this file is already shared` — one info hash may live in exactly one slot — and leaves the
+  first share untouched.
 
 ## Validation and exit codes
 
@@ -147,7 +156,7 @@ Start-up failures (exit `1`):
 | magnet without a valid `xt=urn:btih:` / `urn:btmh:` | `ntx: invalid magnet link (needs xt=urn:btih:... or urn:btmh:...): ...` |
 | `.torrent` missing, empty or not valid metainfo | `ntx: cannot load .torrent file (missing, empty or not valid metainfo): ...` |
 | `--share` in a build with too few pinned share trackers | `ntx: cannot share: no HTTPS share trackers are pinned in this build` |
-| `--share` whose synchronous checks fail (unreadable, not a regular file, empty, bad name, `--share-from`, no slot) | `ntx: cannot share <path>: <reason>` where `<reason>` is the share module's text — `invalid share argument`, `cannot read the file`, `too many shared files`, `file too large to share`, `this file is already shared`, `the file changed while sharing`, `invalid file name` |
+| `--share` whose synchronous checks fail (unreadable, not a regular file, empty, bad name, a rejected `--share-from`, no slot) | `ntx: cannot share <path>: <reason>` where `<reason>` is the share module's text — `invalid share argument`, `cannot read the file`, `too many shared files`, `file too large to share`, `this file is already shared`, `the file changed while sharing`, `invalid file name` |
 | a `--share` that fails after it was added (CLI mode only — under `--stats-json` the failure is a JSON `share` event instead) | `ntx: share failed: <reason>`, same table of reasons |
 
 The tests for these cases live in `test/cli_errors.sh` (`make test-cli`).

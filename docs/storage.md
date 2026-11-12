@@ -93,12 +93,25 @@ memory, and one `.torrent` file written to the store directory.
   `<path>.tmp<pid><n>` opened `O_CREAT | O_TRUNC | O_EXCL`, `fchmod` to `0600` regardless of
   the umask, `fsync`, then `rename`. A planted symlink or a leftover from a killed run is
   therefore never followed. `ntx_share_write_torrent` is the only writer.
+- **With `--share-from` nothing is written at all.** The `.torrent` on disk is read once
+  (`ntx_session_share_add` → `share_from_read`), accepted or rejected before the first byte is
+  hashed, and then never touched again — the name, piece length and both hash lists of the share
+  are the ones that file carries. The comparison happens when hashing ends (`share_verify_cmp`):
+  the streaming hasher's SHA-1 list and its BEP 52 layers must both equal what the `.torrent`
+  claims, or the share fails with `changed`. Only the magnet is rebuilt, from the currently
+  pinned tracker list, so a re-share follows key rotation without touching the link.
 - **Change detection.** Once the metainfo is built, `fstat` of the held descriptor is compared
   once a second (`NTX_SHARE_FSTAT_MS`) against the saved `st_dev`, `st_ino`, `st_size`,
   `st_mtime` and `st_ctime`. Any difference fails the share with `changed`: peers are choked,
   a `stopped` announce is sent, and the slot stops serving (`ntx_session_share_serving` returns
   0, so block requests are refused). The descriptor and the store stay alive so the UI can
   still show what happened.
+- **A read that fails while serving stops the share.** Serving reads the file through `pread` on
+  the held descriptor. When one comes back short or with `EIO`, `data_serve` refuses the request
+  (BEP 6 `reject_request`) and calls `ntx_session_share_io_failed`, which fails the share with
+  `io`: `ntx_session_share_serving` returns `0` from then on, so no further request is served and
+  the row shows `shr!`. An ordinary torrent gets only the one refusal — the hook is a no-op while
+  `s->share[i]` is `NULL`, so nothing else about it changes.
 - **Hashing budget.** The file is hashed inside the session tick, `pread` chunk by chunk
   against a real monotonic deadline, so one tick cannot hash a whole file and stall the loop.
   The phase is `hash` and `pct` is hashing progress.

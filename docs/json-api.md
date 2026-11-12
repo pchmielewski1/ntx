@@ -60,12 +60,12 @@ always `ack` first, then `share`, then the `stats` snapshot.
 |-----|---------|
 | `type` | `"share"` |
 | `i` | The torrent slot the share holds — the same `i` as in the `ack`. `remove` with this `i` releases the share. |
-| `ok` | `1` ready (the file is hashed, the `.torrent` written and at least one share tracker answered), `0` failed. |
+| `ok` | `1` ready (the file is hashed, the `.torrent` written — or, for a re-share, accepted as it is — and at least one share tracker answered), `0` failed. |
 | `ih` | On success, the 40-hex wire info hash (SHA-1 of the `info` dictionary, the v1 half of the hybrid). |
 | `ih2` | On success, the full 64-hex v2 info hash (SHA-256 of the same `info` dictionary). |
-| `name` | Torrent name: the base name of `path`. Escaped like every string in this document. |
+| `name` | Torrent name: the base name of `path`, or the name inside `torrent` when that key was sent. Escaped like every string in this document. |
 | `magnet` | The magnet link, with `xt=urn:btih:`, `xt=urn:btmh:`, `dn=` and one `tr=` per built-in share tracker. Write it to a file and `ntx` accepts it as input. |
-| `torrent` | Path of the `.torrent` written for this share, inside `--store-dir` (mode `0600`). |
+| `torrent` | Path of the `.torrent` for this share. Without a `torrent` in the request, the file `ntx` wrote inside `--store-dir` (mode `0600`); with one, the path that was passed in, which `ntx` reads and leaves untouched. |
 | `code` | On failure only; one of the share codes below. |
 
 Exactly one `share` event exists per `share` command. If the torrent is `remove`d before
@@ -201,7 +201,7 @@ Each command is a single JSON object with a `cmd` string.
 | `pause` | `i` | Sets the torrent to `PAUSED` (a state, not a toggle: repeating it is fine). Tracker announces and piece requests stop; connections stay open. Not persisted across restarts. |
 | `resume` | `i` | Restores the state held before the pause. On a torrent that is not paused it does nothing and still replies `ok`. A torrent that was paused during `VERIFY` resumes in `DL` if pieces are missing. |
 | `remove` | `i` | Frees the slot: sends a best-effort `stopped` announce (synchronous, bounded to about 3 seconds), closes the torrent's connections and files. **Data on disk is kept.** |
-| `share` | `path`, optional `torrent` | Shares one local file. `path`: the file to seed — it must exist, be a regular file and be non-empty; the base name becomes the torrent name. `torrent`: re-share under an existing `.torrent` (the `--share-from` equivalent) — accepted by the parser, **not implemented in this build**, answered `bad_arg`. The reply is the synchronous verdict only (open, `S_ISREG`, size, name, tracker table, free slot); hashing, the `.torrent` file and the announces happen later and are reported by the `share` event. The ack carries `i` and `state` but **no `ih`** — while hashing the hash is not known yet and is `40` zeros in the stats. |
+| `share` | `path`, optional `torrent` | Shares one local file. `path`: the file to seed — it must exist, be a regular file and be non-empty; its base name becomes the torrent name unless `torrent` is given. `torrent`: re-share under an existing `.torrent` (the `--share-from` equivalent) — the name, piece length and both hash lists come from that file and the bytes are compared against them, so the link does not change; the `.torrent` itself is never rewritten. Anything it rejects (unreadable, empty, over 4 MiB, not bencode, not a private single-file hybrid, `length` other than the file size, `piece length` not a power of two in `16 KiB`-`64 MiB`, a `pieces` count that does not match, missing BEP 52 `piece layers`) is `bad_arg`. The reply is the synchronous verdict only (open, `S_ISREG`, size, name, the `.torrent`, tracker table, free slot); hashing, the `.torrent` file and the announces happen later and are reported by the `share` event. The ack carries `i` and `state` but **no `ih`** — while hashing the hash is not known yet and is `40` zeros in the stats. |
 | `quit` | | Reply `ack`, then the process exits with status `0`. The `ack` is the last line on stdout. |
 
 Request syntax (everything else is rejected with `bad_json`):
@@ -238,7 +238,7 @@ Keys appear in this order: `type`, `seq` (if sent), `cmd`, `i` (if applicable), 
 | `unknown_cmd` | `cmd` is not one of the commands above. |
 | `bad_i` | `i` missing or outside `0`-`15`. |
 | `no_slot` | The slot is free (never used, or removed). |
-| `bad_arg` | `add` with both or neither of `magnet` / `path`, an empty value, or a magnet link without a valid `xt=`. Also `share` with no `path`, an empty `path`, or a `torrent` value (re-share under an existing link is not implemented in this build). |
+| `bad_arg` | `add` with both or neither of `magnet` / `path`, an empty value, or a magnet link without a valid `xt=`. Also `share` with no `path`, an empty `path`, or a `torrent` value that `ntx` will not re-share under (see the `share` row and the share codes below). |
 | `io` | `add` with a `path` longer than 511 bytes, or a file that is missing, empty or not valid metainfo (or whose storage cannot be opened). Also `share` with a `path` or `torrent` longer than 511 bytes, or a `path` that cannot be opened, is not a regular file or is empty. |
 | `full` | `add` while all 16 slots are in use. Also `share` while all 16 slots are in use. |
 | `no_trackers` | `share` while the build has too few pinned HTTPS share trackers to announce on (`NTX_SHARE_MIN_TRACKERS`). `hello` then omits `"share"` from `caps`. |
@@ -254,13 +254,13 @@ table, `ntx_share_err_code()` in `src/core/ntx_share.c`:
 
 | `code` | Cause |
 |--------|-------|
-| `"bad_arg"` | No `path`, an empty `path`, an unusable file name, or a `torrent` value (not implemented in this build). |
-| `"io"` | The file cannot be opened, is not a regular file, is empty, or the hash / metainfo / store / `.torrent` write failed. |
+| `"bad_arg"` | No `path`, an empty `path`, an unusable file name, or a `torrent` that does not pass the re-share gate: unreadable, empty or over 4 MiB, not valid bencode, no `info` dictionary, `private` missing or zero, more than one file, `length` other than the size of `path`, `piece length` not a power of two in `16 KiB`-`64 MiB`, a `pieces` count that does not match the size, missing BEP 52 `piece layers` above one piece, or a v1-only metainfo (a share is always published as hybrid, so a v1 link would mislabel the wire protocol). |
+| `"io"` | The file cannot be opened, is not a regular file, is empty, or the hash / metainfo / store / `.torrent` write failed. A `pread` that comes back short or with `EIO` while the share is serving parks it in `failed` with this code too, but it is not a second event: one `share` command gets exactly one event, so the failure is only visible as `share: 2` in the stats. |
 | `"full"` | No free torrent slot (all 16 in use). |
 | `"no_trackers"` | Too few pinned HTTPS share trackers in this build. |
-| `"too_big"` | The file would need more than 32 768 pieces, so no piece length in the supported range fits the metainfo limits. |
-| `"exists"` | `<store-dir>/<name>-<8 hex>.torrent` already exists on disk and its bytes do not hash to this info hash. |
-| `"changed"` | The shared file changed after hashing: `st_dev`, `st_ino`, `st_size`, `st_mtime` or `st_ctime` differ from the values recorded at open (checked once per second). |
+| `"too_big"` | The file would need more than 32 768 pieces, so no piece length in the supported range fits the metainfo limits. Only on the `--share` path; with a `torrent` the piece length comes from that file, and one outside the supported range is `bad_arg`. |
+| `"exists"` | `<store-dir>/<name>-<8 hex>.torrent` already exists on disk and its bytes do not hash to this info hash. On the `torrent` path, the same info hash is already shared from another slot — one hash may live in exactly one slot, and the share that got there first is untouched. |
+| `"changed"` | The shared file changed after hashing: `st_dev`, `st_ino`, `st_size`, `st_mtime` or `st_ctime` differ from the values recorded at open (checked once per second). On the `torrent` path also when the hashes the file produced do not match the `pieces` list and the BEP 52 layers it claims. |
 
 `"changed"` and `"exists"` can only arrive on the asynchronous `share` event; the
 synchronous `err` ack only ever carries `"bad_arg"`, `"io"`, `"full"` or `"no_trackers"`.

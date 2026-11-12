@@ -12,7 +12,11 @@
   an `fstat` once a second detects a change to `st_dev`/`st_ino`/`st_size`/`st_mtime`/`st_ctim`
   and stops the share (`shr!`, exit `1`). A share is exempt from the 3x ratio stop. The status
   line gains `prv`, `shr`/`shr!`, `enc!`, `pin!N`, `map:<port>`/`map-`/`map!cg`, `inN` and the
-  `@hash` phase. `--share-from=FILE.torrent` is parsed but not implemented in this build.
+  `@hash` phase. `--share-from=FILE.torrent` re-shares a file under an existing link: the name,
+  piece length and both hash lists come from the `.torrent` (which must be a private, single-file
+  hybrid, at most 4 MiB), the file is hashed and compared against its SHA-1 `pieces` and BEP 52
+  `piece layers`, and a mismatch ends the share as `changed`. The `.torrent` is never rewritten and
+  the magnet is rebuilt from the currently pinned tracker list.
 - **BEP 27 is honoured.** A non-zero integer under `private` in the info dictionary disables
   DHT `get_peers`/`announce_peer`, `ut_pex` and `ut_holepunch` for that torrent and restricts
   outbound dials to tracker-sourced addresses; a magnet whose info dictionary turns out to be

@@ -153,7 +153,8 @@ usage: ntx [opts] <magnet|link.txt|.torrent>
   --share=PATH         share one local file: hash it, write a private hybrid .torrent into
                        the store dir, announce on the pinned HTTPS share trackers, print the
                        magnet link (stdout)
-  --share-from=FILE.torrent  re-share under an existing link (accepted; not implemented yet)
+  --share-from=FILE.torrent  re-share under an existing link: verify the file against the
+                             hashes of an existing .torrent instead of making a new one
   --port-map           ask the gateway (PCP, then NAT-PMP) to map the listen port
   --no-port-map        never map a port, even while sharing
   --stats-json         NDJSON session stats on stdout instead of the status line
@@ -278,9 +279,11 @@ Some of these are deliberate non-goals; the rest are gaps listed in
   mapping, local peer discovery (LSD), download queueing, persistence of
   the paused state, tracker scrape, following HTTP redirects from trackers.
 - **`--share` shares one regular file**, not a directory, and nothing about a share is
-  persisted — a restart hashes the file again. `--share-from=FILE.torrent` is parsed but not
-  implemented in this build. The pinned share-tracker keys are short-lived CDN certificates, so
-  `make pins-check` must be run before a release.
+  persisted — a restart hashes the file again. `--share-from=FILE.torrent` re-shares under an
+  existing link, but only for a private, single-file **hybrid** (v1 + v2) `.torrent` whose
+  `piece length` is a power of two in `16 KiB`-`64 MiB` and whose bytes still match; a v1-only
+  or multi-file `.torrent` is refused. The pinned share-tracker keys are short-lived CDN
+  certificates, so `make pins-check` must be run before a release.
 - **Private torrents (BEP 27):** a non-zero `private` in the info dictionary is honoured — no
   DHT, no PEX, no holepunch, and only tracker-sourced addresses are dialled. There is still no
   tracker authentication, lease handling or scrape, so a torrent from a private tracker that
