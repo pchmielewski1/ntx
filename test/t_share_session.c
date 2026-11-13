@@ -89,6 +89,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "tscale.h" /* the tick gate below is widened by NTX_TEST_TIMEOUT_SCALE */
+
 #define SCRATCH "test/.scratch/a5"
 #define BIG_MIB 64
 
@@ -110,20 +112,25 @@
 
 /* Absolute per-tick ceiling for the 64 MiB hash (§5.3 budget check). The
  * production budget is NTX_SHARE_HASH_BUDGET_MS and ntx_session_share_add /
- * share_hash_tick re-checks that deadline inside the tick, so the gate is only
- * a "the budget is actually being honoured" tripwire. Under ASAN every memcpy,
- * pread and SHA round costs many times more, so a tick can blow the 20 ms
- * budget long before the next deadline check lands: 256..272 ms observed for
- * one tick on this aarch64 box with the CI flags (-fsanitize=address,undefined
- * -O1, x86_64 CI still fits under 50, which is why CI with detect_leaks=0
- * never flagged it). 50 x 16 = 800 ms is ~3x that worst observed figure and
- * still ~40x the production budget, so it catches a genuinely unbounded tick
- * (a regression would cost seconds per 64 MiB tick) without faulting on
- * sanitizer overhead. */
+ * share_hash_tick re-checks that deadline inside the tick, so this gate is a
+ * "the budget is actually being honoured" tripwire, never a throughput
+ * assertion: what it has to catch is an unbounded tick (seconds for 64 MiB),
+ * not a slow host. Worst tick observed — native aarch64 34..45 ms, under
+ * qemu-riscv64 TCG 66..68 ms, under ASAN on this aarch64 box 256..272 ms
+ * (x86_64 CI with the same sanitizer flags still fits under 50, which is why
+ * CI with detect_leaks=0 never flagged it), all against the 20 ms budget —
+ * which is only sampled at tick granularity, so an emulator that overshoots
+ * gets more, shorter ticks (32 native vs 64 under TCG). 100 ms is 2x the worst
+ * native tick, so the native path gets a real margin instead of the 50 ms coin
+ * flip that only x86_64 CI survived by being faster, and it still dwarfs an
+ * unbounded tick. The ASAN branch pins 800 unscaled (~3x its worst figure, its
+ * 16x headroom built in); the plain gate is ts_ms(100), so
+ * scripts/{riscv,mips}/run-suite.sh buy the emulator headroom via
+ * NTX_TEST_TIMEOUT_SCALE (4 -> 400 ms, ~6x the TCG figure). */
 #if NTX_TEST_SANITIZED
 #define NTX_TEST_TICK_GATE_MS 800
 #else
-#define NTX_TEST_TICK_GATE_MS 50
+#define NTX_TEST_TICK_GATE_MS 100
 #endif
 
 static int fail(const char *m) {
@@ -668,9 +675,13 @@ static void test_hash_and_results(void) {
 
     int ticks = 0;
     uint64_t max_ms = pump_until_hashed(&x, ti, 6000, &ticks);
-    printf("MEASURE 64MiB ticks=%d max_tick_ms=%llu (budget %d ms, gate %d ms)\n", ticks,
-           (unsigned long long)max_ms, NTX_SHARE_HASH_BUDGET_MS, NTX_TEST_TICK_GATE_MS);
-    if (max_ms > NTX_TEST_TICK_GATE_MS) fail("tick_over_50ms");
+    /* ts_ms() is a runtime value, so the gate that is actually compared has to
+     * be computed here; the ASAN branch keeps its own built-in 16x headroom. */
+    long gate_ms = NTX_TEST_SANITIZED ? (long)NTX_TEST_TICK_GATE_MS
+                                      : ts_ms(NTX_TEST_TICK_GATE_MS);
+    printf("MEASURE 64MiB ticks=%d max_tick_ms=%llu (budget %d ms, gate %ld ms)\n", ticks,
+           (unsigned long long)max_ms, NTX_SHARE_HASH_BUDGET_MS, gate_ms);
+    if (max_ms > (uint64_t)gate_ms) fail("tick_over_budget_gate");
     ntx_share_state sh = ntx_session_share_state(x.s, ti);
     if (sh != NTX_SHARE_ANNOUNCING && sh != NTX_SHARE_READY) fail("hash_did_not_finish");
     if (x.s->tts[ti].state != NTX_TTS_DONE) fail("tts_not_done");

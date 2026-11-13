@@ -11,7 +11,15 @@
 # printed at the end and the script exits nonzero if any test failed, or
 # prints ALL PASS and exits 0 when the whole suite is green.
 #
-# NTX_TEST_TIMEOUT_SCALE is exported to the tests (test/tscale.h).
+# NTX_TEST_TIMEOUT_SCALE is exported to the tests (test/tscale.h) and defaults
+# to 4 here, NOT to the native 1: this script only ever runs the suite under
+# qemu-riscv64 TCG (native is `make test`, a different target), so native parity
+# is the wrong floor for it. TCG measured ~1.5x native on the tick-budget case
+# (66..68 ms vs 34..45 ms against the 100 ms reference in t_share_session.c);
+# 4 leaves headroom of the same kind the ASAN branch takes. Only ts_ms() users
+# are affected — no test sleeps behind it, so the 300 s hang guard is untouched.
+# Set NTX_TEST_TIMEOUT_SCALE=1 explicitly to get native parity.
+#
 # NTX_TEST_TIMEOUT (default 300 s) bounds each test, so a hang fails instead of
 # blocking; exit 124 (TERM) or 137 (KILL after -k 10) is a timeout failure.
 # NTX_TEST_GLOB overrides the test file glob (debugging aid).
@@ -28,7 +36,7 @@ RISCV_CC="${RISCV_CC:-riscv64-linux-gnu-gcc}"
 CFLAGS="${CFLAGS:--O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -ffunction-sections}"
 LDFLAGS="${LDFLAGS:--Wl,--gc-sections}"
 LDLIBS="${LDLIBS:--lm}"
-export NTX_TEST_TIMEOUT_SCALE="${NTX_TEST_TIMEOUT_SCALE:-1}"
+export NTX_TEST_TIMEOUT_SCALE="${NTX_TEST_TIMEOUT_SCALE:-4}"
 NTX_TEST_TIMEOUT="${NTX_TEST_TIMEOUT:-300}"
 TEST_GLOB="${NTX_TEST_GLOB:-test/t_*.c}"
 

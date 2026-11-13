@@ -13,7 +13,15 @@
 # exits 0 when the whole suite is green.
 #
 # NTX_TEST_TIMEOUT_SCALE is propagated into the qemu environment so guests
-# can scale their internal timing windows (Task 5).
+# can scale their internal timing windows (Task 5). It defaults to 4 here, NOT
+# to the native 1: this script only ever runs the suite under qemu-mipsel TCG
+# (native is `make test`, a different target), so native parity is the wrong
+# floor for it. The tick-budget case in t_share_session.c is measured at
+# 34..45 ms native and 66..68 ms under qemu-riscv64 TCG against a 100 ms
+# reference; nothing here measures qemu-mipsel, so 4 keeps headroom of the same
+# kind the ASAN branch takes. Only ts_ms() users are affected — no test sleeps
+# behind it, so the 300 s hang guard is untouched. Set
+# NTX_TEST_TIMEOUT_SCALE=1 explicitly to get native parity.
 #
 # Hang guard (Task 5, controller ruling): every qemu invocation is wrapped in
 # a coreutils `timeout` so a hanging test FAILS instead of blocking the suite
@@ -37,7 +45,7 @@ MIPS_CC="${MIPS_CC:-$HOME/toolchains/mipsel-linux-musl/bin/mipsel-linux-musl-gcc
 CFLAGS="${CFLAGS:--O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -ffunction-sections}"
 LDFLAGS="${LDFLAGS:--Wl,--gc-sections}"
 LDLIBS="${LDLIBS:--lm}"
-export NTX_TEST_TIMEOUT_SCALE="${NTX_TEST_TIMEOUT_SCALE:-1}"
+export NTX_TEST_TIMEOUT_SCALE="${NTX_TEST_TIMEOUT_SCALE:-4}"
 NTX_TEST_TIMEOUT="${NTX_TEST_TIMEOUT:-300}"
 TEST_GLOB="${NTX_TEST_GLOB:-test/t_*.c}"
 

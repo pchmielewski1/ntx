@@ -4,7 +4,10 @@
  * NTX_TEST_TIMEOUT_SCALE environment variable on first use (getenv + strtol,
  * fully parsed). A missing, empty, non-numeric, or <1 value yields scale 1,
  * so native runs are neutral. Tests that need TCG headroom wrap their
- * sleeps/waits/windows in ts_ms(...); assertions themselves stay unscaled. */
+ * sleeps/waits/windows in ts_ms(...). Value assertions stay unscaled; the one
+ * deliberate exception is a wall-clock tripwire window — the per-tick budget
+ * gate in t_share_session.c, which measures elapsed time to catch an unbounded
+ * tick and is not an assertion about a number. */
 #ifndef NTX_TEST_TSCALE_H
 #define NTX_TEST_TSCALE_H
 
