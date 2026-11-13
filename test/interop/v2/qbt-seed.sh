@@ -129,17 +129,45 @@ fi
 # libtorrent 2.0.8): [BitTorrent] Session\Encryption, Session\DHTEnabled,
 # Session\PeXEnabled, Session\LSDEnabled. The [Preferences] BitTorrent\*
 # spellings are ignored by this version — they read back as the defaults.
-# Session\Encryption is the value the plan calls for (`encryption=1`,
-# "wymuszone"). What matters is not qbt's label for the enum but what the seed's
-# MSE state machine observes, and that is asserted by the cell from ntx's own
-# log: the peer is promoted through the encrypted handshake (`via=pe_promote`,
-# `plain=0`). 2 (qbt's "require") does NOT work against ntx — measured A/B on
-# this pair: with 2 the ntx initiator gets `pe_fail st=RECV_DH inn=0` (qbt
-# answers the DH request with nothing) and qbt's own inbound MSE stalls in
-# RECV_DH, so no peer ever forms; with 1 the exchange runs SEND_PE3 -> SEND_HS
-# -> RECV_VC, peers_ok=1 and the file lands byte-identical. So 1 is both what
-# the plan asks for and the only value that actually pairs, and the "forced"
-# claim rests on the seed-side MSE proof, not on the enum name.
+# Session\Encryption is the value the plan calls for (`encryption=1`). What
+# decides the cell is not qbt's label for the enum but what the seed's MSE state
+# machine observes on the wire, asserted by the cell from ntx's own log: the
+# peer is promoted through the encrypted handshake on a non-plaintext socket
+# (`peer_ok ... plain=0 ... via=pe_promote`).
+#
+# That comment also got the ENUM wrong: 0=plaintext / 1=allow / 2=require is
+# libtorrent's own peer_encryption_t, and qbt's Session\Encryption preference is
+# NOT that enum (the value is mapped before it reaches libtorrent, and this
+# image ships no WebUI strings to read the labels from). So the values were
+# measured, not named — A/B against this seed, one direction at a time (the
+# share tracker answers the other peer with an empty peer list, so exactly one
+# side can dial), `cmp` of the 1 MiB share as the verdict:
+#
+#   ENC  qbt dials (seed blinded)                  seed dials (qbt blinded)
+#    0   first bytes 13 42 69 74 54.. = plaintext   full MSE: SEND_DH->..->DONE,
+#       BT handshake, dropped plaintext_strict_share  byte-identical
+#    1   first bytes opaque (MSE DHKey offer),      full MSE: same walk,
+#       seed accepts MSE, byte-identical            byte-identical
+#    2   plaintext BT handshake, dropped            closes the socket right
+#                                                    after ntx's DHKey:
+#                                                    pe_fail st=RECV_DH inn=0
+#
+# Read the table by what it measures, not by anybody's enum name: 1 is the only
+# value that opens with MSE in both directions, 0 accepts MSE but opens in
+# plaintext, 2 speaks plaintext one way and refuses MSE the other. That is
+# consistent with qbt 4.5.2's own ordering (0=allow, 1=require, 2=plaintext),
+# which is NOT libtorrent's peer_encryption_t — the 0/1/2 = plaintext/allow/
+# require mapping this file used to document is libtorrent's, and applying it
+# here put "require" and "plaintext" on swapped values.
+#
+# Hence: ENC=1 is kept (the plan's value, and by measurement the MSE-only one),
+# and the cell proves the handshake in BOTH directions separately using the
+# tracker's --blind knob, because in the unblinded run the two sides dial each
+# other simultaneously and only the winner is observable. The old failure trace
+# (`pe_fail st=RECV_DH inn=0` + `plaintext_strict_share`) is the trace of ENC=2,
+# i.e. of a client with encryption turned off — it was never evidence about
+# ntx's MSE initiator or responder, and ntx behaved correctly in both of its
+# places in that trace (it offered MSE, and it refused plaintext on a share).
 if [ "$MODE" = qbt-share-leech ]; then
     TOR="$SRC"                     # single .torrent, not a fixture dir
     WEBUI="${6:-8080}"

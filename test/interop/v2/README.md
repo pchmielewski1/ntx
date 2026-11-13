@@ -53,7 +53,7 @@ The cells that do not depend on a third-party BEP52 implementation (reserved bit
 - `magnet_uri.py`: derives a magnet URI from a `.torrent`. The `btih` value is SHA-1 of the info dict for v1 and hybrid torrents and the truncated SHA-256 for pure v2 (BEP52); the `btmh` value is the `1220`-prefixed SHA-256 and is emitted only when the torrent has piece layers.
 - `qbt-seed.sh`: in-container driver with the modes `probe`, `transmission-seed`, `transmission-leech`, `qbt-seed` and `qbt-share-leech`.
 - `share_cert.py`: mints the share tracker's P-256 certificate and the SPKI pin table (`sharetest.inc`) for the seeder build, and with `--verify-torrent` asserts a metainfo is private, single-file and hybrid.
-- `share_registry_tracker.py`: the qualified HTTPS share tracker of design §6.3, faked — pinned TLS, peers remembered per info_hash and answered `compact=1`, `/scrape` without `info_hash` → 400, and a JSON summary of what it saw on SIGTERM. `--self-check` verifies its byte-exact query decode.
+- `share_registry_tracker.py`: the qualified HTTPS share tracker of design §6.3, faked — pinned TLS, peers remembered per info_hash and answered `compact=1`, `/scrape` without `info_hash` → 400, `--blind <peer_id prefix>` to answer one peer with an EMPTY peer list (so the cell can force which side dials), and a JSON summary of what it saw, dumped atomically every 2 s and again on SIGTERM. `--self-check` verifies its byte-exact query decode.
 - `Dockerfile`: `debian:bookworm` with transmission, qBittorrent-nox and Xvfb.
 
 ## Private share
@@ -85,22 +85,49 @@ What it stands up, and why each piece has to be there:
   `Session\DefaultSavePath` — 4.5.2 ignores the `save_path` field of
   `torrents/add`, so without it the download lands in the profile's default
   directory and the harness cannot read it back.
-- **Why `1`, when qbt calls `2` "require".** Measured A/B against this seed, not
-  inferred from the enum's name. With `2`, no peer ever forms: ntx's MSE
-  initiator reaches `pe_fail st=RECV_DH inn=0` (qbt returns nothing for the DH
-  request) and qbt's own inbound MSE stalls in `RECV_DH`. With `1` the exchange
-  runs `SEND_PE3 → SEND_HS → RECV_VC`, the seed reports `peers_ok=1`, and the
-  file lands byte-identical. So `2` is unusable against `ntx` today, and the
-  "forced" property the plan asks for is established by the seed-side proof below
-  rather than by qbt's label.
+- **Why `1`, when qbt calls `2` "require".** `Session\Encryption` is *not*
+  libtorrent's `peer_encryption_t` (0=plaintext / 1=allow / 2=require); qbt maps the
+  value before it reaches libtorrent, and this image ships no WebUI strings to read
+  the labels from. So the three values were measured A/B against this seed, one dial
+  direction at a time (`--blind`, below), with `cmp` of the 1 MiB share as the verdict:
+
+  | `Session\Encryption` | qbt dials (seed blinded) | seed dials (qbt blinded) |
+  | --- | --- | --- |
+  | `0` | `13 42 69 74 54..` plaintext BT handshake → `plaintext_strict_share` | full MSE, byte-identical |
+  | `1` | opaque MSE DHKey offer, byte-identical | full MSE, byte-identical |
+  | `2` | plaintext BT handshake → `plaintext_strict_share` | `FIN` after ntx's DHKey → `pe_fail st=RECV_DH inn=0` |
+
+  i.e. qbt's own ordering is 0=allow, 1=require, 2=disabled — `1` is "require" and
+  `2` is "plaintext only", the reverse of the names in libtorrent's enum. Every
+  `2` cell therefore failed because the *client* had encryption off, which is why
+  `1` is the value the plan uses and the value the cell sets. The "forced" property
+  is still not taken from qbt's label: it is proven from the seed's log (below).
 - **Peer discovery is real.** BEP 27 forbids DHT, PEX and LSD, so the only way qbt
   can learn the seeder's address is the tracker. The cell therefore asserts the
   announce arrived over https on both rows, that no scrape happened, and
   `dht_nodes=0` from `sync/maindata`.
-- **Encryption is asserted positively.** The seeder's peer log must show the peer
-  promoted through MSE (`via=pe_promote`) on a non-plaintext socket (`plain=0`).
-  A share is MSE-only in `ntx`: a plaintext handshake is dropped with
-  `plaintext_strict_share` (`src/core/ntx_session_bt_hs.c`).
+- **Both MSE directions are proven, one per pass.** The seed and qbt announce
+  `started` within milliseconds of each other, so unblinded they dial
+  SIMULTANEOUSLY and only the winner of that race shows up in the seed's log — one
+  run can therefore only ever observe one of ntx's two MSE roles. The cell runs the
+  exchange twice and `share_registry_tracker.py --blind` forces the direction: the
+  blinded peer still announces (so discovery stays real) but is answered an EMPTY
+  peer list, so it can only ever be reached. `seed-dials` blinds `-qB4520-` and must
+  show `pe_ok ... role=0` plus `peer_ok ... out=1 plain=0 via=pe_promote`;
+  `qbt-dials` blinds `-NT0100-` and must show `role=1` / `out=0`. Each pass has its
+  own source, store, tracker state and `cmp`.
+- **Encryption is asserted positively.** In both passes the seeder's peer log must
+  show the peer promoted through MSE (`via=pe_promote`) on a non-plaintext socket
+  (`plain=0`), and must contain no `via=bths` peer at all — `via=bths` is the only
+  route a plaintext handshake can take, so a byte-identical download cannot be
+  earned unencrypted. A share is MSE-only in `ntx`: a plaintext handshake is dropped
+  with `plaintext_strict_share` (`src/core/ntx_session_bt_hs.c`).
+- **Environment failure vs wire failure.** `trk.state.json` is dumped atomically
+  every 2 s, so a tracker killed by host OOM still reports what it saw, and liveness
+  of the seed and tracker is sampled *before* the cell stops them. A missing seed or
+  tracker, an `oom_kill` delta in `/proc/vmstat`, or a docker rc of 124/137 is
+  reported as a cause in the FAIL reason. Those notes only ever add a cause — no
+  wire assert is relaxed by them.
 - **Bytes, not a hash echo.** `cmp` of the downloaded file against the source, plus
   `--verify-torrent` so the cell cannot pass on a metainfo that is not actually
   private, single-file and hybrid.

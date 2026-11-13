@@ -42,6 +42,12 @@ import time
 LOCK = threading.Lock()
 PEERS = {}  # info_hash hex -> {peer_id hex: {"ip","port","left","events","scheme"}}
 STATS = {"requests": 0, "scrape_no_hash": 0, "other_paths": 0}
+# --blind: peer_id prefixes that get an EMPTY peer list (see --blind's help).
+# Discovery is still real — the blinded peer simply is not told where the other
+# one lives — so the cell can force exactly ONE direction of the MSE handshake
+# to be the one that happens, and prove both of them rather than trusting
+# whichever won the simultaneous-open race.
+BLIND = []
 
 
 def benc(n):
@@ -85,6 +91,10 @@ def compact(entries):
     for ip, port in entries:
         out += socket.inet_aton(ip) + struct.pack(">H", port)
     return out
+
+def blinded(peer_id):
+    """True if this announcer must be answered an empty peer list."""
+    return any(peer_id.startswith(p.encode("latin1")) for p in BLIND)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -136,6 +146,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ent.update(ip=ip, port=port, left=left, scheme=scheme)
                 ent["events"].append(event)
             others = [v for k, v in table.items() if k != pid.hex()]
+            if blinded(pid):
+                others = []
             body = (b"d"
                     + bstr("complete") + benc(sum(1 for v in others if v["left"] == "0"))
                     + bstr("incomplete") + benc(len([v for v in others if v["left"] != "0"]))
@@ -230,10 +242,16 @@ def main():
     ap.add_argument("--state")
     ap.add_argument("--harness-pid", type=int, default=0,
                     help="exit when this pid (the matrix script) goes away; 0 disables the guard")
+    ap.add_argument("--blind", default="",
+                    help="comma-separated peer_id prefixes that are answered an EMPTY peer list, so "
+                         "the swarm can only be discovered in one direction. Lets the cell force "
+                         "which side dials and prove each MSE direction on its own.")
     a = ap.parse_args()
 
     if a.self_check:
         return self_check()
+    global BLIND
+    BLIND = [x for x in a.blind.split(",") if x]
     missing = [o for o, v in (("--https-port", a.https_port), ("--https-port2", a.https_port2),
                               ("--cert", a.cert), ("--key", a.key), ("--log", a.log),
                               ("--state", a.state)) if not v]
@@ -244,10 +262,18 @@ def main():
 
     def dump():
         with LOCK:
-            with open(a.state, "w") as f:
-                json.dump({"requests": STATS["requests"],
-                           "scrape_no_hash": STATS["scrape_no_hash"],
-                           "other_paths": STATS["other_paths"], "peers": PEERS}, f, sort_keys=True)
+            blob = json.dumps({"requests": STATS["requests"],
+                               "scrape_no_hash": STATS["scrape_no_hash"],
+                               "other_paths": STATS["other_paths"], "peers": PEERS},
+                              sort_keys=True)
+        # Atomic replace, so a dump in flight can never leave half a file for the
+        # cell to read as "no announces".
+        tmp = a.state + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(blob)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, a.state)
 
     def on_term(_sig, _frm):
         dump()
@@ -262,6 +288,22 @@ def main():
         serve(a.http_bind, a.http_port, a.log)
     if a.harness_pid:
         threading.Thread(target=watch_harness, args=(a.harness_pid,), daemon=True).start()
+
+    # Keep the state file live, not just SIGTERM-fresh. The cell reads it to prove
+    # the announces happened; if it were only written by the signal handler, a
+    # tracker reaped by host OOM (this box runs ~95/121 GB) would take the whole
+    # run's evidence with it and the cell could not tell "the tracker died" apart
+    # from "nobody announced". Dumping every 2 s costs nothing and the asserts
+    # below are unchanged -- they read the same numbers.
+    def keep_state():
+        while True:
+            time.sleep(2)
+            try:
+                dump()
+            except OSError:
+                pass
+
+    threading.Thread(target=keep_state, daemon=True).start()
     threading.Event().wait()  # daemon threads; SIGTERM is the stop button
 
 

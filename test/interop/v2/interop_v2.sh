@@ -52,6 +52,19 @@ declare -a MATRIX
 log_cell() { MATRIX+=("$1|$2|$3"); }
 next_cell() { CELL=$((CELL + 1)); printf 'c%02d' "$CELL"; }
 
+# Opt-in cell filter for iterating on ONE cell without paying for the matrix.
+# Unset (the default) => run_cell always returns 0 and nothing changes at all.
+# Set => run <name> ... runs, everything else is skipped, but CELL still ticks
+# so the surviving rows keep their usual cNN ids (NTX_V2_ONLY=qbt_share_leech
+# must still report as c20). Space-separated list of cell names.
+ONLY="${NTX_V2_ONLY:-}"
+run_cell() {
+    [ -z "$ONLY" ] && return 0
+    case " $ONLY " in *" $1 "*) return 0;; esac
+    CELL=$((CELL + 1))   # keep the numbering of the cells that do run
+    return 1
+}
+
 # ------------------------------------------------------------------ cleanup --
 kill_pids() {
     local p
@@ -632,145 +645,224 @@ cell_qbt_share_leech() {
         log_cell "$id" "FAIL" "ntx-sharetest build failed rc=$brc; $S/build.log"; return
     fi
 
-    timeout -k 5 240 python3 test/interop/v2/share_registry_tracker.py \
-        --bind 127.0.0.2 --bind2 127.0.0.3 --https-port "$TP1" --https-port2 "$TP2" \
-        --cert "$S/cert/cert.pem" --key "$S/cert/key.pem" \
-        --harness-pid $$ \
-        --log "$S/trk.log" --state "$S/trk.state.json" >"$S/trk.out" 2>&1 &
-    spawn; local TRKP=$!
-    sleep 1
-    if grep -qi "Address already in use" "$S/trk.out" 2>/dev/null; then
-        stop_job "$TRKP"
-        log_cell "$id" "FAIL" "share tracker could not bind 127.0.0.2:$TP1 / 127.0.0.3:$TP2 (stale listener?); $S/trk.out"
-        return
-    fi
+    # The cell runs TWO passes, one per handshake direction, and the tracker
+    # forces the direction with --blind: it answers the peer whose peer_id starts
+    # with the given prefix with an EMPTY compact list, so that peer can only be
+    # REACHED, never reach anybody. DHT/PeX/LSD are off and the .torrent names no
+    # peers, so the tracker list is the only way either side can learn the other's
+    # port — blinding one side therefore isolates one dial direction completely.
+    #
+    # Why two passes and not one run: the seed and qbt both announce `started`
+    # within milliseconds of each other, so unblinded they dial SIMULTANEOUSLY and
+    # only the winner of that race is observable in the seed's log. One pass can
+    # then only ever prove one of ntx's two MSE roles. Passes:
+    #   seed-dials  blind -qB4520-  -> ntx is the MSE INITIATOR  (peer_ok out=1)
+    #   qbt-dials   blind -NT0100-  -> ntx is the MSE RESPONDER  (peer_ok out=0)
+    # Each pass has its own 1 MiB source, store, logs, tracker state and a
+    # byte-identical cmp of its own download, so neither can borrow the other's
+    # bytes and neither depends on which side wins a race.
+    #
+    # "<tag>:<blinded peer_id prefix>:<peer_ok out=>:<pe_ok role=>:<ntx role word>"
+    # out= is ntx's own view (1 = we dialled) and role= is NTX_PE_INITIATOR(0) /
+    # NTX_PE_RESPONDER(1), so the pair is (1,0) when the seed dials and (0,1)
+    # when qbt dials. Both are asserted, so a log line cannot be relabelled.
+    local passes="seed-dials:-qB4520-:1:0:initiator qbt-dials:-NT0100-:0:1:responder"
+    local pass tag blind pout prole role PS TOR name qrc seed_alive trk_alive
+    local oom0 oom1 reason="" envnote=""
+    oom0=$(awk '/^oom_kill /{print $2}' /proc/vmstat 2>/dev/null)
 
-    # Run the binary THIS cell just built, at $SB — not ./ntx-sharetest, which
-    # was just restored to whatever the sibling stream's build left there. A
-    # stale seeder carries a stale compiled-in tracker list (the tracker URLs are
-    # baked in at build time), and then announces to some other run's ports.
-    timeout -k 5 240 "$SB" --share="$S/sharefile.bin" --store-dir="$S/A" \
-        --port-lo=$AP --port-hi=$AP --allow-local-peers --no-port-map \
-        --verbose --log="$S/seed.log" --stats-json >"$S/seed.ndjson" 2>"$S/seed.err" &
-    spawn; local SEEDP=$!
+    for pass in $passes; do
+        IFS=: read -r tag blind pout prole role <<<"$pass"
+        PS="$S/$tag"
+        fresh_dir "$PS"; mkdir -p "$PS/A"
+        head -c 1048576 /dev/urandom >"$PS/sharefile.bin" || {
+            reason="pass $tag: could not create the share source; $PS"; break; }
 
-    local TOR="" i=0
-    until TOR=$(ls "$S"/A/*.torrent 2>/dev/null | head -1) && [ -n "$TOR" ] || [ "$i" -ge 30 ]
-    do sleep 1; i=$((i + 1)); done
-    if [ -z "$TOR" ]; then
-        stop_job "$SEEDP"; stop_job "$TRKP"
-        log_cell "$id" "FAIL" "seed A published no .torrent in 30 s; $S/seed.err"
-        return
-    fi
-    chmod 644 "$TOR" 2>/dev/null || true
-
-    # Gate the cell on the metainfo really being the private single-file hybrid
-    # --share is supposed to publish, so it cannot pass by accident.
-    timeout -k 5 60 python3 test/interop/v2/share_cert.py --out "$S/verify" \
-        --https-port "$TP1" --https-port2 "$TP2" --verify-torrent "$TOR" \
-        >"$S/verify.log" 2>&1
-    if [ $? -ne 0 ]; then
-        stop_job "$SEEDP"; stop_job "$TRKP"
-        log_cell "$id" "FAIL" "share metainfo is not private/single-file/hybrid: $(tr '\n' ';' <"$S/verify.log"); $S/verify.log"
-        return
-    fi
-
-    local name="ntx-v2-$t"; CONTAINERS="$CONTAINERS $name"
-    timeout -k 5 200 docker run --rm --network=host --name "$name" \
-        -v "$S:/share:rw" ntx-interop-v2-qbt \
-        qbt-seed.sh qbt-share-leech "/share/A/$(basename "$TOR")" "/share/dl" \
-        "$QP" "https://127.0.0.2:$TP1/announce" "$WP" 120 "/share/cert/cert.pem" 1 \
-        >"$S/qbt.log" 2>&1
-    local qrc=$?
-    timeout -k 5 30 docker rm -f "$name" >/dev/null 2>&1 || true
-
-    # Seed first, then the tracker: the tracker's SIGTERM handler writes the
-    # peer state the asserts below read.
-    stop_job "$SEEDP"; stop_job "$TRKP"
-
-    local dl="$S/dl/sharefile.bin" reason=""
-    # Cheap pre-check, before the asserts: the tracker writes its state only from
-    # its SIGTERM handler, so a tracker that never ran (or was SIGKILLed by host
-    # OOM mid-cell) leaves no state at all. Without this the cell's only symptom
-    # is "qbt exited rc=5", which blames qbt for a tracker that never answered.
-    # The two sub-cases are NOT the same failure and are reported apart: no state
-    # file at all means the tracker process died before its handler ran (host OOM
-    # under memory pressure, or it never bound -- trk.out says which), while a
-    # state file that says "requests": 0 means it was healthy and nothing ever
-    # reached it, which IS the wire failure. Nothing here can excuse a wire assert:
-    # both paths still have to fall through to the asserts below on any rerun that
-    # does see announces.
-    if [ ! -s "$S/trk.state.json" ] || ! grep -q '"requests": [1-9]' "$S/trk.state.json" 2>/dev/null; then
-        local trk_why=""
-        if [ ! -s "$S/trk.state.json" ]; then
-            trk_why="no state file at all, so the tracker never reached its SIGTERM handler - killed mid-cell (this host runs ~95/121 GB, OOM is plausible) or never bound; $S/trk.out"
-        else
-            trk_why="state says requests=0, so the tracker was alive and nothing announced to it (wire, not environment)"
+        timeout -k 5 240 python3 test/interop/v2/share_registry_tracker.py \
+            --bind 127.0.0.2 --bind2 127.0.0.3 --https-port "$TP1" --https-port2 "$TP2" \
+            --cert "$S/cert/cert.pem" --key "$S/cert/key.pem" \
+            --harness-pid $$ --blind="$blind" \
+            --log "$PS/trk.log" --state "$PS/trk.state.json" >"$PS/trk.out" 2>&1 &
+        spawn; local TRKP=$!
+        sleep 1
+        if grep -qi "Address already in use" "$PS/trk.out" 2>/dev/null; then
+            stop_job "$TRKP"
+            reason="pass $tag: share tracker could not bind 127.0.0.2:$TP1 / 127.0.0.3:$TP2 (stale listener?); $PS/trk.out"
+            break
         fi
-        # Evidence-only, never gates the verdict: the kernel's own word on whether
-        # memory pressure reaped something during this cell. dmesg is often
-        # root-only, hence the silent fallback.
-        local oom="" n=""
-        n=$(dmesg 2>/dev/null | tail -n 300 | grep -aci "Killed process" || true)
-        [ -n "$n" ] && [ "$n" != 0 ] && oom=" kernel OOM kills seen recently=$n"
-        # 124 = the outer timeout killed qbt (a hang), 137 = SIGKILL: both are
-        # environment, an rc of 4/5 from the driver itself is the wire.
-        local qbt_why=""
+
+        # Run the binary THIS cell just built, at $SB — not ./ntx-sharetest, which
+        # was just restored to whatever the sibling stream's build left there. A
+        # stale seeder carries a stale compiled-in tracker list (the tracker URLs
+        # are baked in at build time), and then announces to some other run's ports.
+        timeout -k 5 240 "$SB" --share="$PS/sharefile.bin" --store-dir="$PS/A" \
+            --port-lo=$AP --port-hi=$AP --allow-local-peers --no-port-map \
+            --verbose --log="$PS/seed.log" --stats-json >"$PS/seed.ndjson" 2>"$PS/seed.err" &
+        spawn; local SEEDP=$!
+
+        TOR=""; local i=0
+        until TOR=$(ls "$PS"/A/*.torrent 2>/dev/null | head -1) && [ -n "$TOR" ] || [ "$i" -ge 30 ]
+        do sleep 1; i=$((i + 1)); done
+        if [ -z "$TOR" ]; then
+            stop_job "$SEEDP"; stop_job "$TRKP"
+            reason="pass $tag: seed A published no .torrent in 30 s; $PS/seed.err"
+            break
+        fi
+        chmod 644 "$TOR" 2>/dev/null || true
+
+        # Gate the pass on the metainfo really being the private single-file hybrid
+        # --share is supposed to publish, so it cannot pass by accident.
+        timeout -k 5 60 python3 test/interop/v2/share_cert.py --out "$PS/verify" \
+            --https-port "$TP1" --https-port2 "$TP2" --verify-torrent "$TOR" \
+            >"$PS/verify.log" 2>&1
+        if [ $? -ne 0 ]; then
+            stop_job "$SEEDP"; stop_job "$TRKP"
+            reason="pass $tag: share metainfo is not private/single-file/hybrid: $(tr '\n' ';' <"$PS/verify.log"); $PS/verify.log"
+            break
+        fi
+
+        # /share is THIS pass's directory, but the tracker certificate is shared by
+        # both passes and lives one level up at $S/cert. Mount it in as well, or the
+        # "/share/cert/cert.pem" argument below names a file that does not exist in
+        # the container: qbt-seed.sh then silently skips update-ca-certificates (its
+        # `[ -f "$CA_PEM" ]` guard is false), libtorrent cannot verify the pinned
+        # tracker cert, qbt never announces, and the pass dies as "stalledDL /
+        # total_peer_connections=0" with a tracker log that only ever saw ntx.
+        name="ntx-v2-$t-$tag"; CONTAINERS="$CONTAINERS $name"
+        timeout -k 5 150 docker run --rm --network=host --name "$name" \
+            -v "$PS:/share:rw" -v "$S/cert:/share/cert:ro" ntx-interop-v2-qbt \
+            qbt-seed.sh qbt-share-leech "/share/A/$(basename "$TOR")" "/share/dl" \
+            "$QP" "https://127.0.0.2:$TP1/announce" "$WP" 90 "/share/cert/cert.pem" 1 \
+            >"$PS/qbt.log" 2>&1
+        qrc=$?
+        timeout -k 5 30 docker rm -f "$name" >/dev/null 2>&1 || true
+
+        # Liveness, sampled BEFORE the jobs are stopped: a seed or tracker reaped
+        # by host OOM mid-cell is an environment failure, not a wire failure, and
+        # this is the only moment that can still tell them apart.
+        seed_alive=1; trk_alive=1
+        kill -0 "$SEEDP" 2>/dev/null || seed_alive=0
+        kill -0 "$TRKP" 2>/dev/null || trk_alive=0
+        # Passes share ports; the next one must not inherit this one's peer.
+        stop_job "$SEEDP"; stop_job "$TRKP"
+        sleep 1
+
+        # --- asserts, this pass only -------------------------------------------------
+        # Environment first, and it never excuses a wire assert: these only add a
+        # cause to the FAIL, they cannot turn a FAIL into a RUN.
+        envnote=""
         case "$qrc" in
-            124) qbt_why=" qbt hit the outer docker timeout (124)";;
-            137) qbt_why=" qbt was SIGKILLed (137)";;
+            124) envnote=" qbt hit the outer docker timeout (rc=124, a hang)";;
+            137) envnote=" qbt was SIGKILLed (rc=137)";;
         esac
-        log_cell "$id" "FAIL" "share tracker saw no announces (${trk_why}${qbt_why}${oom}); $S/trk.state.json $S/trk.out $S/seed.err $S/qbt.log"
+        [ "$seed_alive" = 0 ] && envnote="$envnote seed A was gone before qbt finished"
+        [ "$trk_alive" = 0 ] && envnote="$envnote share tracker was gone before qbt finished"
+        oom1=$(awk '/^oom_kill /{print $2}' /proc/vmstat 2>/dev/null)
+        [ -n "$oom0" ] && [ -n "$oom1" ] && [ "$oom1" != "$oom0" ] \
+            && envnote="$envnote host OOM kills +$((oom1 - oom0)) since cell start"
+
+        # The tracker writes its state every 2 s and atomically, so a tracker that
+        # died still says what it saw; requests=0 really means nothing announced.
+        if [ ! -s "$PS/trk.state.json" ] || ! grep -q '"requests": [1-9]' "$PS/trk.state.json" 2>/dev/null; then
+            local tw="state file absent, so the tracker never even wrote its first dump"
+            [ -s "$PS/trk.state.json" ] && tw='state says requests=0, so the tracker was healthy and nothing announced'
+            reason="pass $tag: ENVIRONMENT-or-wire: share tracker saw no announces ($tw;$envnote); $PS/trk.state.json $PS/trk.out $PS/seed.err $PS/qbt.log"
+            break
+        fi
+        if [ "$qrc" -ne 0 ]; then
+            reason="pass $tag: qbt exited rc=$qrc without completing;$envnote $PS/qbt.log"; break
+        fi
+        if ! cmp -s "$PS/sharefile.bin" "$PS/dl/sharefile.bin" 2>/dev/null; then
+            reason="pass $tag: downloaded file is not byte-identical (or absent);$envnote $PS/qbt.log"; break
+        fi
+        if ! grep -aq '"phase":"seed"' "$PS/seed.ndjson" 2>/dev/null \
+            || ! grep -aq '"priv":1,"share":1,"enc_strict":1' "$PS/seed.ndjson" 2>/dev/null; then
+            reason="pass $tag: seed A never reached phase=seed with priv/share/enc_strict set;$envnote $PS/seed.ndjson"; break
+        fi
+        if ! grep -aq '"trk_pin_fail":0' "$PS/seed.ndjson" 2>/dev/null; then
+            reason="pass $tag: seed A's pinned announce failed (trk_pin_fail!=0);$envnote $PS/seed.ndjson"; break
+        fi
+        if ! grep -aq 'QBT-PREFS encryption=1' "$PS/qbt.log" 2>/dev/null; then
+            # Read back from qbt's own /api/v2/app/preferences, not from our conf, so
+            # a key this version ignores cannot pass for one it honours. 1 is the
+            # value the plan specifies and, by the measurement recorded in
+            # qbt-seed.sh, the only one under which qbt opens with MSE at all.
+            reason="pass $tag: qbt did not report the encryption policy the plan sets (encryption=1);$envnote $PS/qbt.log"; break
+        fi
+        if ! grep -aq 'QBT-SESSION dht_nodes=0' "$PS/qbt.log" 2>/dev/null; then
+            reason="pass $tag: qbt reported DHT activity on a private torrent (BEP 27 broken);$envnote $PS/qbt.log"; break
+        fi
+        if ! grep -aq 'scheme=https' "$PS/trk.log" 2>/dev/null \
+            || grep -q 'scheme=http ' "$PS/trk.log" 2>/dev/null; then
+            reason="pass $tag: not every announce reached the share tracker over https;$envnote $PS/trk.log"; break
+        fi
+        if ! grep -aq '"scrape_no_hash": 0' "$PS/trk.state.json" 2>/dev/null; then
+            reason="pass $tag: share tracker saw a scrape, which §6.3 forbids;$envnote $PS/trk.state.json"; break
+        fi
+        # Both sides really used this tracker, and only this one: the blinded peer
+        # still announced (it just got an empty list), so the swarm was formed by
+        # discovery in the one direction the pass allows.
+        if ! grep -aq 'peer_id=2d4e54303130302d' "$PS/trk.log" \
+            || ! grep -aq 'peer_id=2d7142' "$PS/trk.log"; then
+            reason="pass $tag: the share tracker did not see both peers announce (ntx -NT0100- and qBittorrent -qB4520-);$envnote $PS/trk.log"; break
+        fi
+        # The MSE proof, per direction. Positive, not an absence: the peer that
+        # reached PH_OK got there through the MSE state machine (sp_pe_finish ->
+        # sp_promote_peer_ok prints via=pe_promote, which the plaintext path can
+        # never print — it goes through via=bths) on a socket the seed recorded as
+        # non-plaintext (sp_vlog_peer prints plain=0 only when the peer is not
+        # plaintext). out= is the direction this pass forced.
+        if ! grep -Eq "hs pe_ok .*role=$prole( |\$)" "$PS/seed.log" 2>/dev/null; then
+            reason="pass $tag: no MSE handshake completed as ntx $role (no pe_ok role=$prole);$envnote $PS/seed.log"; break
+        fi
+        if ! grep -Eq "hs peer_ok .*out=$pout plain=0 .*via=pe_promote" "$PS/seed.log" 2>/dev/null; then
+            reason="pass $tag: seed A's peer was not MSE-promoted in this direction (no peer_ok out=$pout plain=0 via=pe_promote);$envnote $PS/seed.log"; break
+        fi
+        # A plaintext peer could only ever arrive via bths. Rejecting that path
+        # outright is what makes "byte-identical" impossible to earn unencrypted,
+        # whatever any future enum says.
+        if grep -aq 'via=bths' "$PS/seed.log" 2>/dev/null; then
+            reason="pass $tag: seed A accepted a peer through the plaintext handshake (via=bths);$envnote $PS/seed.log"; break
+        fi
+        # Isolation, so the label on the direction above is not a guess.
+        if [ "$(grep -ac 'hs peer_ok' "$PS/seed.log")" != "1" ]; then
+            reason="pass $tag: expected exactly one promoted peer in a blinded pass, saw $(grep -ac 'hs peer_ok' "$PS/seed.log");$envnote $PS/seed.log"; break
+        fi
+    done
+
+    if [ -n "$reason" ]; then
+        log_cell "$id" "FAIL" "$reason"
         return
     fi
-    if [ "$qrc" -ne 0 ]; then
-        reason="qbt exited rc=$qrc without completing; $S/qbt.log"
-    elif ! cmp -s "$S/sharefile.bin" "$dl" 2>/dev/null; then
-        reason="downloaded file is not byte-identical (or absent); $S/qbt.log"
-    elif ! grep -aq '"phase":"seed"' "$S/seed.ndjson" 2>/dev/null \
-        || ! grep -aq '"priv":1,"share":1,"enc_strict":1' "$S/seed.ndjson" 2>/dev/null; then
-        reason="seed A never reached phase=seed with priv/share/enc_strict set; $S/seed.ndjson"
-    elif ! grep -aq '"trk_pin_fail":0' "$S/seed.ndjson" 2>/dev/null; then
-        reason="seed A's pinned announce failed (trk_pin_fail!=0); $S/seed.ndjson"
-    elif ! grep -aq 'QBT-PREFS encryption=1' "$S/qbt.log" 2>/dev/null; then
-        # Read back from qbt's own /api/v2/app/preferences, not from our conf, so
-        # a key this version ignores cannot pass for one it honours. 1 = the value
-        # the plan specifies; MSE itself is enforced by ntx (a share drops plaintext
-        # with plaintext_strict_share) and proven seed-side by the peer_ok assert.
-        reason="qbt did not report the encryption policy the plan sets (encryption=1); $S/qbt.log"
-    elif ! grep -aq 'QBT-SESSION dht_nodes=0' "$S/qbt.log" 2>/dev/null; then
-        reason="qbt reported DHT activity on a private torrent (BEP 27 broken); $S/qbt.log"
-    elif ! grep -aq 'scheme=https' "$S/trk.log" 2>/dev/null \
-        || grep -q 'scheme=http ' "$S/trk.log" 2>/dev/null; then
-        reason="not every announce reached the share tracker over https; $S/trk.log"
-    elif ! grep -aq '"scrape_no_hash": 0' "$S/trk.state.json" 2>/dev/null; then
-        reason="share tracker saw a scrape, which §6.3 forbids; $S/trk.state.json"
-    elif ! grep -Eq 'hs peer_ok .*plain=0' "$S/seed.log" 2>/dev/null \
-        || ! grep -aq 'via=pe_promote' "$S/seed.log" 2>/dev/null; then
-        # Positive proof, not an absence, and the real weight of the "forced MSE"
-        # claim: the peer that reached PH_OK got there through the MSE/PE handshake
-        # and on a socket the seed recorded as non-plaintext
-        # (sp_vlog_peer prints plain=0 only for a non-plaintext peer).
-        reason="seed A's peer was not MSE-promoted (no peer_ok with plain=0 via=pe_promote); $S/seed.log"
-    fi
-    if [ -z "$reason" ]; then
-        log_cell "$id" "RUN" "private share (BEP27 hybrid single-file) from ntx --share, byte-identical cmp, qbt leech with Session\\Encryption=1 and MSE forced by the seed (a share drops plaintext: plaintext_strict_share), MSE proven seed-side (peer_ok plain=0 via=pe_promote); $((SECONDS - t_start))s; $S/qbt.log"
-    else
-        log_cell "$id" "FAIL" "$reason"
-    fi
+    # Independent re-check of the bytes after both passes, each against the source
+    # that pass generated for itself, so neither pass can borrow the other's file
+    # and the matrix line cannot claim a cmp that is not on disk right now.
+    for pass in $passes; do
+        IFS=: read -r tag _ _ _ <<<"$pass"
+        if ! cmp -s "$S/$tag/sharefile.bin" "$S/$tag/dl/sharefile.bin" 2>/dev/null; then
+            log_cell "$id" "FAIL" "final cmp: pass $tag is not byte-identical; $S/$tag/qbt.log"
+            return
+        fi
+    done
+    log_cell "$id" "RUN" "private share (BEP27 hybrid single-file) from ntx --share: qbt-nox leeches the share's own .torrent byte-identical (cmp) in TWO forced passes -- seed-dials proves ntx's MSE INITIATOR (peer_ok out=1 plain=0 via=pe_promote), qbt-dials proves ntx's MSE RESPONDER (peer_ok out=0 plain=0 via=pe_promote) -- with Session\\Encryption=1 read back from qbt's own API, discovery only via pinned-https announces on both rows, scrape_no_hash=0, dht_nodes=0, and no via=bths plaintext peer; $((SECONDS - t_start))s; $S/seed-dials/seed.log $S/qbt-dials/seed.log"
 }
 
 # --------------------------------------------------------------------- run ---
+# cell_gen stays ungated: it is cheap and build_image() copies $FIXTURES into the
+# docker context, so a filtered run must still be able to (re)build the image.
 cell_gen
-cell_vectors
-for f in single_16k multi_v2 hybrid_ok; do cell_seed_verify "$f"; done
-for f in single_16k hybrid_ok; do cell_hs_reserved "$f"; done
-for f in single_16k hybrid_ok; do cell_meta_exchange "$f"; done
-for f in single_16k multi_v2 hybrid_ok; do cell_magnet_verify "$f"; done
+run_cell vectors && cell_vectors
+for f in single_16k multi_v2 hybrid_ok; do run_cell seed_verify && cell_seed_verify "$f"; done
+for f in single_16k hybrid_ok; do run_cell hs_reserved && cell_hs_reserved "$f"; done
+for f in single_16k hybrid_ok; do run_cell meta_exchange && cell_meta_exchange "$f"; done
+for f in single_16k multi_v2 hybrid_ok; do run_cell magnet_verify && cell_magnet_verify "$f"; done
 
 if [ "$DOCKER_OK" = 1 ]; then
     CELL=$((CELL + 1)); id=$(printf "c%02d" "$CELL")
-    if build_image; then
+    if [ -n "$ONLY" ] && timeout -k 5 20 docker image inspect ntx-interop-v2-qbt >/dev/null 2>&1; then
+        # Filtered run and the image is already there: do not pay for a rebuild.
+        log_cell "$id" "RUN" "reference-client image (transmission + qbt-nox) present, not rebuilt (NTX_V2_ONLY set)"
+    elif build_image; then
         log_cell "$id" "RUN" "reference-client image (transmission + qbt-nox) built; $WORK/build.log"
         DOCKER_OK=1
     else
@@ -778,10 +870,10 @@ if [ "$DOCKER_OK" = 1 ]; then
         DOCKER_OK=0
     fi
 fi
-for f in single_16k hybrid_ok; do cell_qbt_seed_dl "$f"; done
-for f in hybrid_ok; do cell_qbt_leech "$f"; done
-for f in single_16k multi_v2 hybrid_ok; do cell_qbt_meta_dl "$f"; done
-cell_qbt_share_leech
+for f in single_16k hybrid_ok; do run_cell qbt_seed_dl && cell_qbt_seed_dl "$f"; done
+for f in hybrid_ok; do run_cell qbt_leech && cell_qbt_leech "$f"; done
+for f in single_16k multi_v2 hybrid_ok; do run_cell qbt_meta_dl && cell_qbt_meta_dl "$f"; done
+run_cell qbt_share_leech && cell_qbt_share_leech
 
 # ----------------------------------------------------------------- matrix ----
 mkdir -p "$(dirname "$MIRROR")"
