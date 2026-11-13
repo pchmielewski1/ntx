@@ -34,13 +34,14 @@ There is no `PASS` status: a cell only reports `RUN` when it saw the result itse
 | Magnet leech | A magnet-only `ntx` leech over loopback: the info dict arrives only through BEP9, is checked against the magnet's `xt`, and the downloaded file is SHA-256-identical to the fixture |
 | Reference image | The container image (transmission and qBittorrent-nox) builds |
 | Reference clients | Seed, leech and metadata cells against the containerised engines. Each is preceded by a probe that asks the engine to load the fixture and quotes its verdict |
+| Private share | `ntx --share` seeds a private (BEP 27) hybrid (BEP 52) single-file share and qBittorrent-nox (`Session\Encryption=1`) downloads it byte-identically, with the MSE proven from the seed's own handshake log. See [Private share](#private-share) |
 
 ### Reference clients
 
 The Dockerfile's own notes record what was observed when the harness was written (this documentation did not re-run the container cells):
 
 - `transmission-daemon` (Debian bookworm) is a v1-only engine. It rejects every BEP52 fixture with `invalid or corrupt torrent file`, so the cells that need it to load a v2 or hybrid torrent are recorded as `FAIL` with that message.
-- `qBittorrent-nox` (libtorrent) speaks BEP52, but the packaged binary never opens a listening socket when run head-less under Xvfb, so it cannot act as a loopback peer.
+- `qBittorrent-nox` (libtorrent) speaks BEP52. The note above records what was observed when the harness was written: under Xvfb it never bound a socket. It does bind one head-less *without* Xvfb (the private-share cell below drives it through the WebAPI), but it still cannot stand in for the transmission probe above, which is what gates the cells that need the engine to load a fixture.
 
 The cells that do not depend on a third-party BEP52 implementation (reserved bit, `ut_metadata`, magnet-only download for single-file v2, multi-file v2 and hybrid) run against `ntx` itself on loopback.
 
@@ -50,8 +51,59 @@ The cells that do not depend on a third-party BEP52 implementation (reserved bit
 - `gen_torrents.py`: generates the `single_16k`, `multi_v2` and `hybrid_ok` fixtures for the matrix (it calls `test/scripts/bep52_gen.py`).
 - `hs_capture.py`: an MSE responder. It completes the DH exchange and RC4 setup with `ntx`'s MSE/PE initiator and decrypts the handshake. The initiator's padding length is random and its reply is coalesced with the next message, so fixed offsets do not work; the capture searches for the padding length at which the keystream turns the stream into the 20-byte `19` + `BitTorrent protocol` magic. It prints `HS_OK ... m27=<hex> ...` or `HS_ERR <reason>`.
 - `magnet_uri.py`: derives a magnet URI from a `.torrent`. The `btih` value is SHA-1 of the info dict for v1 and hybrid torrents and the truncated SHA-256 for pure v2 (BEP52); the `btmh` value is the `1220`-prefixed SHA-256 and is emitted only when the torrent has piece layers.
-- `qbt-seed.sh`: in-container driver with the modes `probe`, `transmission-seed`, `transmission-leech` and `qbt-seed`.
+- `qbt-seed.sh`: in-container driver with the modes `probe`, `transmission-seed`, `transmission-leech`, `qbt-seed` and `qbt-share-leech`.
+- `share_cert.py`: mints the share tracker's P-256 certificate and the SPKI pin table (`sharetest.inc`) for the seeder build, and with `--verify-torrent` asserts a metainfo is private, single-file and hybrid.
+- `share_registry_tracker.py`: the qualified HTTPS share tracker of design §6.3, faked — pinned TLS, peers remembered per info_hash and answered `compact=1`, `/scrape` without `info_hash` → 400, and a JSON summary of what it saw on SIGTERM. `--self-check` verifies its byte-exact query decode.
 - `Dockerfile`: `debian:bookworm` with transmission, qBittorrent-nox and Xvfb.
+
+## Private share
+
+The `ntx --share` cell is the only one that needs the pinned HTTPS share list,
+because `--share` announces *only* to the compiled-in share trackers (design §6).
+What it stands up, and why each piece has to be there:
+
+- **Seeder build.** `make ntx-sharetest SHARETEST_INC=<generated>` — the recipe
+  already exists in the `Makefile`; the cell passes its own `.inc`. The checked-in
+  `scripts/pins/sharetest_trackers.inc` carries all-zero pins and fails closed, so
+  it cannot stand in. The binary is built on the host and bind-mounted into the
+  container, exactly like `src/` is copied into the docker context, so no `scripts/`
+  is needed in the image.
+- **Tracker endpoints.** Two rows on `127.0.0.2` / `127.0.0.3`, never `127.0.0.1`:
+  that address has a hard-coded pin in `ntx_https_pin.c`'s built-in dev pool, which
+  is consulted *before* the share table and would reject the harness certificate.
+  Numeric literals also keep the announce path free of DNS/DoH. Two rows because
+  `NTX_SHARE_MIN_TRACKERS` is 2.
+- **Trust.** ntx pins; plain libtorrent does not. The certificate is installed as a
+  system CA inside the container so qBittorrent can use the `.torrent` exactly as
+  `--share` wrote it, with no rewritten announce.
+- **qBittorrent, head-less.** `qbittorrent-nox` binds its peer socket within seconds
+  without Xvfb, so the WebAPI (no auth needed with `LocalHostAuth=false` plus a
+  loopback/bridge `AuthSubnetWhitelist`) is the control channel. Only the
+  `[BitTorrent] Session\*` spellings are read by 4.5.2 — the `[Preferences]
+  BitTorrent\*` ones read back as defaults. The two that matter and are easy to get
+  wrong: `Session\Encryption=1`, the value the plan specifies, and
+  `Session\DefaultSavePath` — 4.5.2 ignores the `save_path` field of
+  `torrents/add`, so without it the download lands in the profile's default
+  directory and the harness cannot read it back.
+- **Why `1`, when qbt calls `2` "require".** Measured A/B against this seed, not
+  inferred from the enum's name. With `2`, no peer ever forms: ntx's MSE
+  initiator reaches `pe_fail st=RECV_DH inn=0` (qbt returns nothing for the DH
+  request) and qbt's own inbound MSE stalls in `RECV_DH`. With `1` the exchange
+  runs `SEND_PE3 → SEND_HS → RECV_VC`, the seed reports `peers_ok=1`, and the
+  file lands byte-identical. So `2` is unusable against `ntx` today, and the
+  "forced" property the plan asks for is established by the seed-side proof below
+  rather than by qbt's label.
+- **Peer discovery is real.** BEP 27 forbids DHT, PEX and LSD, so the only way qbt
+  can learn the seeder's address is the tracker. The cell therefore asserts the
+  announce arrived over https on both rows, that no scrape happened, and
+  `dht_nodes=0` from `sync/maindata`.
+- **Encryption is asserted positively.** The seeder's peer log must show the peer
+  promoted through MSE (`via=pe_promote`) on a non-plaintext socket (`plain=0`).
+  A share is MSE-only in `ntx`: a plaintext handshake is dropped with
+  `plaintext_strict_share` (`src/core/ntx_session_bt_hs.c`).
+- **Bytes, not a hash echo.** `cmp` of the downloaded file against the source, plus
+  `--verify-torrent` so the cell cannot pass on a metainfo that is not actually
+  private, single-file and hybrid.
 
 ## Behaviour this harness depends on
 
