@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.5 - 2026-11-13
 
 ### Features
 - **`--share=PATH` — private sharing of one local file.** `ntx` hashes the file (streaming,
@@ -47,11 +47,60 @@
   `bad_arg`/`io`/`full`/`no_trackers`/`too_big`/`exists`/`changed`), the new stats fields
   `priv`, `share`, `enc_strict`, `trk_pin_fail`, `in_ok`, `port_map` and `ext_port`, and the
   `magnet` limit of `add` relaxed from 511 to 2048 bytes.
+- **A share works against qBittorrent.** The BEP 52 interop matrix has a cell where containerised
+  qBittorrent-nox 4.5.2 downloads an `ntx --share` byte-identically, with a local pinned HTTPS
+  tracker as the only address source — no DHT, PEX or holepunch, as BEP 27 demands — and never a
+  `/scrape` without `info_hash`. It runs two passes that blind one dial side each, so the `ntx` MSE
+  initiator and the responder are observed separately instead of strict encryption being taken on
+  trust. Manual: `bash test/interop/v2/interop_v2.sh` (needs Docker and `python3`), verdict in
+  `test/.scratch/9/interop-v2/matrix.txt`.
+
+### Fixed
+- **`--share` dialled nothing on a host with no usable IPv6 route.** The hostname resolver the
+  HTTPS paths share preferred AAAA whenever the host published one and only tried A when the AAAA
+  lookup itself failed, and every built-in share tracker publishes AAAA, so such a host got
+  addresses it could not reach and announced to none of them. The family is now picked from
+  `/proc/net/ipv6_route` — one cached read per process, where a `::/0` line counts only if it is
+  `RTF_UP` with a usable metric — and the A record is used directly otherwise. Literal IPv4 and
+  IPv6 addresses are unaffected.
+- **Dial and teardown paths leaked memory.** A SOCKS5 dial left its ~632 B connect context behind
+  on every path that drops the fd without a terminal proxy result — dial, connect and handshake
+  timeouts, torrent `remove`, session teardown, a full peer table, `ntx_netx_free` with a dial in
+  flight — so traffic through `--proxy` grew the heap without bound. A peer still attached at slot
+  or session teardown never released the five arrays allocated per peer, and a torrent that finished
+  hashing never released the `phash`, `have`, `rarity`, `info_raw` and `piece_layer` fields the
+  metainfo validator hands to its caller; those are now freed through the new public
+  `ntx_torrent_release()`.
+- **The PCP/NAT-PMP address classifier misread IPv6 addresses.** It tested octets 10–11 only, so
+  any global IPv6 address carrying `ff ff` there (a 6to4 or NAT64 prefix, a link-local) was read
+  as an IPv4-mapped private or CGNAT address, and a ULA was read as public. The ten leading zero
+  octets of an IPv4-mapped address are now required before the marker. That classifier decides
+  both whether a mapping is requested at all and whether a granted external port is reported as
+  `map!cg`.
+- **A build without usable pinned share trackers no longer touches the caller's file.** Below
+  `NTX_SHARE_MIN_TRACKERS` qualified hosts the tracker gate ran after the file had been opened and
+  `fstat`ed and, for `--share-from`, after its `.torrent` had been parsed, so a share of an
+  unreadable path answered `io` and a binary without the feature reported whether a path exists
+  and is readable. The gate is now the first decision after argument validation, so every attempt
+  answers `no_trackers` as `docs/json-api.md` promises, and the JSON path agrees with the earlier
+  refusal the CLI already made.
+- **Share-tracker keys rotated, and two hosts left the table.** The community HTTPS trackers
+  rolled their Cloudflare edge keys; each verified new key is pinned beside the survey key of its
+  host, so a binary accepts the old and the new certificate during the rollover. `tracker.nekomi.cn`
+  and `004430.xyz` were dropped for answering a bare `/scrape` with the full peer list
+  (~143 MB, a real `files` dictionary), which fails the no-full-scrape criterion of the survey.
+  Five hosts remain, above `NTX_SHARE_MIN_TRACKERS`.
 
 ### Packaging
 - Release assets now include binary **RPM** (Fedora / RHEL / openSUSE) for x86_64 and aarch64,
   plus `ntx-<version>-packaging.tar.gz` with stamped **Gentoo** ebuild, Arch `PKGBUILD`, Alpine
   `APKBUILD`, Nix flake and source RPM `.spec`. Install matrix documented in README and release notes.
+- The release workflow gained two blocking gates before packaging: `make pins-check` (every
+  built-in share-tracker key still verifies against the system CA store, no host answers a full
+  `/scrape`, at least `NTX_SHARE_MIN_TRACKERS` hosts qualify) and a `strings` check that the test
+  tracker table never reaches a published binary. New targets: `make test-share` runs the
+  private-share end-to-end against `make ntx-sharetest`, and `make test-cli` additionally runs the
+  offline gate for the pins tool (skipped when `python3` is absent).
 
 ### Platforms
 - OpenWrt **mipsel** (`mipsel_24kc`, MIPS32r2 soft-float, static musl): `make mips` /
