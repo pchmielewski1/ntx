@@ -590,6 +590,15 @@ int ntx_session_share_add(ntx_session *s, const char *path, const char *from_tor
     if (err) *err = NTX_SHARE_E_BAD_ARG;
     if (!s || !path || !path[0]) return -1;
 
+    /* §6.4: a build with no usable pinned share-tracker table does not have this
+     * feature, so it is decided before the caller's path is touched — nothing is
+     * opened, stat'd or read, which keeps docs/json-api.md's "every attempt answers
+     * no_trackers" true and mirrors the CLI's early refusal (src/ntx_main.c). */
+    if (!ntx_share_available()) {
+        if (err) *err = NTX_SHARE_E_NO_TRACKERS;
+        return -1;
+    }
+
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         if (err) *err = NTX_SHARE_E_IO;
@@ -633,12 +642,6 @@ int ntx_session_share_add(ntx_session *s, const char *path, const char *from_tor
     } else if (smeta_piece_len((uint64_t)sb.st_size, &ps) != 0) { /* > 32 768 pieces */
         close(fd);
         if (err) *err = NTX_SHARE_E_TOO_BIG;
-        return -1;
-    }
-    if (!ntx_share_available()) {
-        close(fd);
-        share_src_free(src);
-        if (err) *err = NTX_SHARE_E_NO_TRACKERS;
         return -1;
     }
     int ti = ntx_session_free_slot(s);

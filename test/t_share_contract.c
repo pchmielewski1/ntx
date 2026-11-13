@@ -147,6 +147,15 @@ int main(void) {
     if (ntx_session_share_add(s, "test/t_share_contract.c", NULL, &e) != -1 ||
         e != NTX_SHARE_E_NO_TRACKERS)
         fail("add_no_trackers");
+    /* The gate is decided before the filesystem: with the gate closed a path that
+     * does not exist must still answer no_trackers, never the open()'s io. */
+    e = NTX_SHARE_OK;
+    if (ntx_session_share_add(s, "test/.scratch/no-such-share-target.bin", NULL, &e) != -1 ||
+        e != NTX_SHARE_E_NO_TRACKERS) {
+        printf("add_no_trackers_before_io err=%s\n", ntx_share_err_code(e));
+        fail("add_no_trackers_before_io");
+    }
+    printf("PASS add_no_trackers_before_io\n");
 
     if (strcmp(ntx_share_err_code(NTX_SHARE_E_BAD_NAME), "bad_arg") != 0) fail("code_bad_name");
     if (strcmp(ntx_share_err_code(NTX_SHARE_E_NO_TRACKERS), "no_trackers") != 0) fail("code_no_trk");
