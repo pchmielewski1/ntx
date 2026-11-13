@@ -119,8 +119,9 @@ expect valid-options-run 124 - -- --port-lo=0 --port-hi=0 --max-peers=0 --down-l
   --up-limit=4096 --proxy=socks5:127.0.0.1:9 --tunnel=127.0.0.1:9 --smooth "$MAG"
 
 # ── --help suppression when the share gate is closed (design §6.4) ───────────
-# ntx_share_available() is driven by the built-in tracker table, which holds 7
-# hosts on this build (pinned by test/t_share_contract.c), so the hidden path
+# ntx_share_available() is driven by the built-in tracker table, which holds
+# well above NTX_SHARE_MIN_TRACKERS hosts on this build (the count is derived
+# from the generated block by test/t_share_contract.c), so the hidden path
 # needs a build whose table falls below NTX_SHARE_MIN_TRACKERS. The table is
 # replaceable through -DNTX_SHARE_TRACKERS_INC (the Task 1 hook) — the built-in
 # table is never edited here. Skipped when the tree or a compiler is missing,

@@ -185,13 +185,39 @@ int main(void) {
     }
     ntx_share_trackers_test_set(NULL, -1); /* built-in list restored */
 
-    /* The built-in list IS the Task 0 survey (7 hosts, docs/network.md) and the
-     * hex decoder must accept it: the fail-closed truncation in strk_builtin_init
-     * means a rejected pin drops every row from that point on. */
-    if (ntx_share_tracker_count() != 7) fail("builtin_count");
-    if (!ntx_share_available()) fail("builtin_gate");
-    printf("builtin count=%d available=%d\n", ntx_share_tracker_count(), ntx_share_available());
-    if (!ntx_share_tracker_get(6) || !ntx_share_tracker_get(6)->npins) fail("builtin_row6");
+    /* The built-in list is the Task 0 survey (docs/network.md) minus the hosts
+     * dropped by the 2026-11-13 key rotation, and the hex decoder must accept
+     * it. The expected count is DERIVED from the generated block, on purpose:
+     * `make pins-update` rewrites strk_raw_tab at every rotation, so a literal
+     * host count here would break again on the next one. What these asserts
+     * guard is the *shape* of that block — the fail-closed truncation in
+     * strk_builtin_init drops every row from the first rejected pin on, so a
+     * count below the table size, or a row without a usable pin, is exactly
+     * the signature of a malformed generated block. */
+    {
+        size_t gen = sizeof strk_raw_tab / sizeof strk_raw_tab[0];
+        int nb = ntx_share_tracker_count();
+        /* lower bound: an empty or truncated table must fail even before the
+         * gate, and the generator may not exceed the static it decodes into. */
+        if (gen < NTX_SHARE_MIN_TRACKERS || gen > STRK_MAX) fail("builtin_gen_rows");
+        if ((size_t)nb != gen) fail("builtin_count");
+        if (!ntx_share_available()) fail("builtin_gate");
+        printf("builtin count=%d available=%d\n", nb, ntx_share_available());
+        for (int i = 0; i < nb; i++) {
+            const ntx_share_tracker *t = ntx_share_tracker_get(i);
+            if (!t || !t->url || !t->host || t->npins < 1 || t->npins > NTX_HTTPS_PIN_MAX) {
+                fprintf(stderr, "  builtin row %d: url=%s host=%s npins=%d\n", i,
+                        (t && t->url) ? t->url : "(null)",
+                        (t && t->host) ? t->host : "(null)", t ? t->npins : -1);
+                fail("builtin_rows");
+            }
+        }
+        /* last row, by count - 1 rather than a fixed index: pins-update may
+         * grow or shrink the table. */
+        if (!ntx_share_tracker_get(nb - 1) || ntx_share_tracker_get(nb - 1)->npins < 1)
+            fail("builtin_last_row");
+        if (ntx_share_tracker_get(nb) != NULL) fail("builtin_get_oob");
+    }
     {
         uint8_t pin[32];
         /* strk_hex32 is visible here: this test includes ntx_share_trackers.c. */
