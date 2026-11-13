@@ -22,19 +22,15 @@ typedef struct {
 /* BEGIN GENERATED (make pins-update) — survey 2026-11-08, docs/network.md */
 static const strk_raw strk_raw_tab[] = {
     {"https://tracker.pmman.tech:443/announce", "tracker.pmman.tech",
-     {"2f7626b32aeffb4442ce9253fd9fffbe037408da90e6f2bbc7d89a77b16cc5f2", 0, 0, 0}},
-    {"https://tracker.nekomi.cn:443/announce", "tracker.nekomi.cn",
-     {"ea5a2911ef5dec9974a4ec7827a53e0e6f7271e52eec9d6c813b54f4cad3951c", 0, 0, 0}},
-    {"https://004430.xyz:443/announce", "004430.xyz",
-     {"28a92d93877090215d4fd55236f2a35f01137adb3fa5e4ec5f45701df94473d3", 0, 0, 0}},
+     {"2f7626b32aeffb4442ce9253fd9fffbe037408da90e6f2bbc7d89a77b16cc5f2", "8a219385c7334700275ece920c3753bda8450637c04241ece7b5c09e14a54251", 0, 0}},
     {"https://tracker.7471.top:443/announce", "tracker.7471.top",
-     {"c9c26afbf190405d98a328c6fb758ddb92d0e6697f4b3ca6aed8c9a6a13478ef", 0, 0, 0}},
+     {"c9c26afbf190405d98a328c6fb758ddb92d0e6697f4b3ca6aed8c9a6a13478ef", "2830ed22c79e6ca1e066fe0dd79997c3f9646d83eca106d40c070de3354a6023", 0, 0}},
     {"https://tracker.zhuqiy.com:443/announce", "tracker.zhuqiy.com",
-     {"1e96051cb0cb3bdd8486d18997e2336d06b58235dc2b341c82384bceaa85c079", 0, 0, 0}},
+     {"1e96051cb0cb3bdd8486d18997e2336d06b58235dc2b341c82384bceaa85c079", "dc85dd79e42a13eb7f0e0dd0e264f42c4291a86a26ee303e623e930b04176386", 0, 0}},
     {"https://1337.abcvg.info:443/announce", "1337.abcvg.info",
-     {"e1e5e48f542eee53816db2bba6c398c867d9e755ff615956763fa7dc8b8bf332", 0, 0, 0}},
+     {"e1e5e48f542eee53816db2bba6c398c867d9e755ff615956763fa7dc8b8bf332", "7d57ae6ebdd6015aaad6f04b56c86f789a6c7949930ca405ce07f3684e20c1e3", 0, 0}},
     {"https://tracker.yume-hatsuyuki.moe:443/announce", "tracker.yume-hatsuyuki.moe",
-     {"8c30b82302fe1b70a8007ae1ed5cbb0b256e5ae4185880d22ecd78466c67b956", 0, 0, 0}},
+     {"8c30b82302fe1b70a8007ae1ed5cbb0b256e5ae4185880d22ecd78466c67b956", "5bfc4a4a6371a802d59ce90d8fe0f3c79da1695f5faddb10ca368df6a8c48939", 0, 0}},
 };
 /* END GENERATED */
 #endif

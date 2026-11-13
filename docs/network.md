@@ -387,8 +387,9 @@ shipped mechanism. Sources: `src/proto/ntx_share_trackers.c`, `ntx_https_pin.c`,
 ### The table
 
 `src/proto/ntx_share_trackers.c` holds a generated table of `{url, host, pins[]}` rows —
-seven hosts on the current build, each with one pin (up to `NTX_HTTPS_PIN_MAX` = 4 are
-possible while a key is being rolled over). The block between `/* BEGIN GENERATED
+five hosts on the current build, each with two pins — the key of the 2026-11-08 survey plus
+the key rotated in on 2026-11-13 (up to `NTX_HTTPS_PIN_MAX` = 4 are possible while a key is
+being rolled over). The block between `/* BEGIN GENERATED
 (make pins-update) */` and `/* END GENERATED */` is machine output and is never hand
 edited. `NTX_SHARE_TRACKERS_INC` replaces the whole block at compile time, which is how
 `make ntx-sharetest` and the `test/cli_errors.sh` gate build a build with a different table.
@@ -439,6 +440,32 @@ every row without a network — see [`testing.md`](testing.md).
 roughly monthly. Because every accepted host is behind one CDN, one key rotation or one CDN
 outage removes all share trackers at once; read the survey table as "one CDN, seven
 hostnames", not as diversity.
+
+**Rotation of 2026-11-13 (maintainer decision).** The community trackers rotated their TLS
+keys and `make pins-check` came back `QUALIFIED 0 minimum 2` with five hosts on `NEW-KEY` and
+two on `FULL-SCRAPE`. The maintainer approved the rotation and ran `make pins-update`, which
+absorbed the verified new key into the free slot of every row (the survey pin is kept beside
+it, so a binary published before this rotation still reaches every host that kept its old
+key). `make pins-check` now passes with **5 qualified hosts**: `tracker.pmman.tech`,
+`tracker.7471.top`, `tracker.zhuqiy.com`, `1337.abcvg.info` and `tracker.yume-hatsuyuki.moe`,
+all `OK`. Two of the seven surveyed hosts were dropped by hand, because `update` never removes
+a host and `FULL-SCRAPE` blocks it:
+
+| Dropped host | Verbatim report row | Reason |
+|--------------|---------------------|--------|
+| `tracker.nekomi.cn` | `tracker.nekomi.cn FULL-SCRAPE 143786195 bytes from /scrape` | serves the full peer list on a bare `/scrape` (re-checked: `200 application/octet-stream`, `cf-cache-status: DYNAMIC`, body starts `d5:filesd20:…d8:completei3e…`, so not the zhuqiy cached-landing-page case) — fails C4 |
+| `004430.xyz` | `004430.xyz FULL-SCRAPE 143807328 bytes from /scrape` | same: full `files` dict on a bare `/scrape` — fails C4 |
+
+Both were accepted on 2026-11-08 with `/scrape` answering `400 Invalid Request`; the behaviour
+changed since, so they are out of the table and out of the `pins.txt` share rows until their
+operators fix `/scrape` and a fresh survey re-accepts them. Five hosts remain, above
+`NTX_SHARE_MIN_TRACKERS` (2).
+
+The standing consequence from the design doc §6.2 is unchanged by this rotation: the `ntx` TLS
+client checks only the leaf key, so **a binary published before a future rotation loses that
+tracker** until it is updated — a distro package that updates late sees the tracker disappear,
+not degrade. The partner accepts this because releases are regular. Pinning the CA instead would
+need chain validation in the TLS client and is out of scope.
 
 ## Shared UDP socket and demultiplexing
 
