@@ -71,6 +71,15 @@ typedef struct {
     void *ctx;
     ntx_cbs cbs;
     uint32_t ev;
+    /* ctx is an in-flight ntx_connect_ctx (SOCKS CONNECT not finished): this
+     * entry owns it, so ntx_netx_del() must release it. Lives in the entry —
+     * not in the ctx — because the handover that installs the app ctx rewrites
+     * the entry, which is what takes the claim away. */
+    int proxy_pending;
+    /* Bumped on every registration: lets a caller that returned into this file
+     * from a callback tell "still my proxy fd" from "the same fd number, handed
+     * to a fresh socket while I was out". */
+    unsigned gen;
 } ntx_fd_entry;
 
 typedef struct ntx_connect_ctx {
@@ -79,6 +88,11 @@ typedef struct ntx_connect_ctx {
     void *app_ctx;
     ntx_cbs app_cbs;
 } ntx_connect_ctx;
+
+/* Connect ctxs allocated and not yet released. Every drop path must bring this
+ * back to 0; test/t_netx_route.c (#includes this file, so the symbol is visible
+ * there) asserts it, which catches the leak in a plain build without LSan. */
+static int g_proxy_cc_live;
 
 struct ntx_netx {
     int epfd;
@@ -239,13 +253,56 @@ static void utp_accept_fwd(ntx_netx *n, int virt_fd, void *ctx) {
     if (netx->accept_cb) netx->accept_cb(netx, virt_fd, netx->accept_ctx);
 }
 
+/* Release the in-flight connect ctx that the fd entry at fd owns. The entry is
+ * the ONE owner — ntx_fd_entry.proxy_pending is the claim — so this is reached
+ * only from ntx_netx_del (every drop path: dial/conn timeout, torrent removal,
+ * session teardown, the proxy's own terminal failure) and from the ntx_netx_free
+ * backstop. It never closes the fd and never calls back into the app: closing
+ * and notifying stay with whoever asked for the drop, exactly as before. */
+static void proxy_ctx_release(ntx_netx *n, int fd) {
+    ntx_fd_entry *f = &n->fds[fd];
+    ntx_connect_ctx *cc = f->ctx;
+    f->proxy_pending = 0;
+    f->ctx = NULL;
+    f->used = 0;
+    epoll_ctl(n->epfd, EPOLL_CTL_DEL, fd, NULL);
+    free(cc);
+    g_proxy_cc_live--;
+}
+
+/* Terminal SOCKS failure (handshake error, or EPOLLERR/EPOLLHUP on the proxy
+ * socket). Same shape as before — notify the app, drop the entry, close the
+ * socket — but with the ownership made explicit: cc/netx are read BEFORE the
+ * callback, because the app's own teardown (a session peer drop runs
+ * ntx_netx_del + close) releases the fd entry, which is what frees cc. If the
+ * entry is still carrying exactly this cc afterwards nobody took the fd, so we
+ * release it and close it here. Exactly one owner frees cc and exactly one
+ * closer closes fd either way.
+ * ponytail: fd/gen/ctx must all still match, so an app callback that drops the
+ * peer or re-dialls (which bumps gen) cannot be mistaken for us. What is NOT
+ * covered is the case the old code did not cover either: a callback that closes
+ * this fd and hands the same number to a socket this file does not own. */
+static void proxy_fail_fd(ntx_connect_ctx *cc, int fd) {
+    ntx_netx *n = cc->netx;
+    ntx_cb_close cl = cc->app_cbs.cl;
+    void *app_ctx = cc->app_ctx;
+    unsigned gen = (fd >= 0 && fd < n->cap) ? n->fds[fd].gen : 0;
+    if (cl) cl(app_ctx);
+    if (fd < 0 || fd >= n->cap) return;
+    ntx_fd_entry *f = &n->fds[fd];
+    /* Still our registration? The callback may have dropped the peer (which
+     * frees cc) or re-dialled and got the same fd number back — gen rules that
+     * out, so this is never a double free or a close of somebody else's socket. */
+    if (!f->used || !f->proxy_pending || f->ctx != cc || f->gen != gen) return;
+    ntx_netx_del(n, fd);
+    close(fd);
+}
+
 static void proxy_io_cb(int fd, void *ctx) {
     ntx_connect_ctx *cc = ctx;
     int rc = ntx_proxy_step(&cc->proxy, 1);
     if (rc < 0) {
-        if (cc->app_cbs.cl) cc->app_cbs.cl(cc->app_ctx);
-        ntx_netx_del(cc->netx, fd);
-        free(cc);
+        proxy_fail_fd(cc, fd);
         return;
     }
     if (rc == 1) {
@@ -253,22 +310,17 @@ static void proxy_io_cb(int fd, void *ctx) {
         ntx_fd_entry *f = &netx->fds[fd];
         void *app_ctx = cc->app_ctx;
         ntx_cbs app_cbs = cc->app_cbs;
-        free(cc);
+        f->proxy_pending = 0; /* handover: the entry owns no cc any more */
         f->ctx = app_ctx;
         f->cbs = app_cbs;
+        free(cc);
+        g_proxy_cc_live--;
         ntx_netx_mod(netx, fd, EPOLLIN | EPOLLOUT);
         if (f->cbs.w) f->cbs.w(fd, f->ctx);
     }
 }
 
-static void proxy_fail_close(void *ctx) {
-    ntx_connect_ctx *cc = ctx;
-    int fd = cc->proxy.fd;
-    if (cc->app_cbs.cl) cc->app_cbs.cl(cc->app_ctx);
-    ntx_netx_del(cc->netx, fd);
-    if (fd >= 0) close(fd);
-    free(cc);
-}
+static void proxy_fail_close(void *ctx) { proxy_fail_fd(ctx, ((ntx_connect_ctx *)ctx)->proxy.fd); }
 
 
 static int route_connect_raw(ntx_netx *n, const ntx_addr *addr, uint16_t port, void *ctx, const ntx_cbs *cbs) {
@@ -306,6 +358,15 @@ static int route_connect_proxy(ntx_netx *n, const ntx_addr *addr, uint16_t port,
     ntx_proxy_init(&cc->proxy, fd, addr, port, cc, proxy_io_cb, proxy_io_cb, proxy_fail_close);
     ntx_cbs pcbs = {proxy_io_cb, proxy_io_cb, proxy_fail_close};
     ntx_netx_add(n, fd, EPOLLIN | EPOLLOUT, cc, &pcbs);
+    if (fd >= n->cap || n->fds[fd].ctx != cc) {
+        /* ensure_fd OOM (the entry was never written): nothing can reach cc
+         * any more, so this call site stays its only owner. */
+        close(fd);
+        free(cc);
+        return -1;
+    }
+    n->fds[fd].proxy_pending = 1; /* the entry now owns cc */
+    g_proxy_cc_live++;
     return fd;
 }
 
@@ -424,6 +485,11 @@ void ntx_netx_free(ntx_netx *n) {
     if (!n) return;
     if (n->tunnel) ntx_tunnel_free(n->tunnel);
     if (n->utp) ntx_utp_free(n->utp);
+    /* A SOCKS dial still in flight when the loop dies owns a cc that nothing
+     * else can reach any more; release the claim before the table goes. */
+    for (int fd = 0; fd < n->cap; fd++)
+        if (n->fds && n->fds[fd].used && n->fds[fd].proxy_pending)
+            proxy_ctx_release(n, fd);
     free(n->fds);
     free(n->hdue);
     free(n->hcb);
@@ -516,7 +582,13 @@ void ntx_netx_add(ntx_netx *n, int fd, uint32_t ev, void *ctx, const ntx_cbs *cb
     }
     if (ensure_fd(n, fd) != 0) return; /* OOM: the fd stays unregistered (handshake timeout reaps it) */
     ntx_fd_entry *f = &n->fds[fd];
+    /* Re-registering a slot that still claims an in-flight connect ctx means its
+     * previous owner closed the fd without ntx_netx_del: release the claim here
+     * rather than orphan the cc under the new ctx. */
+    if (f->used && f->proxy_pending) proxy_ctx_release(n, fd);
     f->used = 1;
+    f->gen++;
+    f->proxy_pending = 0; /* a fresh registration owns no connect ctx */
     f->ctx = ctx;
     f->cbs = *cbs;
     f->ev = ev;
@@ -549,6 +621,14 @@ void ntx_netx_del(ntx_netx *n, int fd) {
     if (fd >= n->cap) return;
     ntx_fd_entry *f = &n->fds[fd];
     if (!f->used) return;
+    /* A SOCKS dial that is dropped before its handshake completed (dial/conn
+     * timeout, torrent removal, session teardown) still owns its cc: release it
+     * here, the single path every drop goes through. No app close cb — every
+     * caller of del() IS the app dropping the connection. */
+    if (f->proxy_pending) {
+        proxy_ctx_release(n, fd);
+        return;
+    }
     f->used = 0;
     f->ctx = NULL;
     epoll_ctl(n->epfd, EPOLL_CTL_DEL, fd, NULL);

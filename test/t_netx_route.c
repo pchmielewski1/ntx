@@ -668,6 +668,117 @@ static void cell_i_utp_off_proxy_still_serves(void) {
     close(hold);
 }
 
+/* J — ownership of the SOCKS connect ctx (ntx_connect_ctx).
+ *
+ * route_connect_proxy allocates a cc (~632 B, it embeds the 512 B SOCKS buffer)
+ * and hands it to the fd entry as ctx with the proxy callbacks. Historically it
+ * was freed ONLY by proxy_io_cb/proxy_fail_close, so any path that drops the fd
+ * before the handshake completes — the session's dial/conn timeout, torrent
+ * removal, session teardown (all of them ntx_netx_del + close), or ntx_netx_free
+ * with a dial still in flight — lost the whole cc. LSan on HEAD: 632 B per dial
+ * "in route_connect_proxy".
+ *
+ * The guard is the netx-internal live-ctx counter (this TU #includes
+ * ntx_netx.c, so the static is visible; on a tree without the single-owner
+ * release there is no such counter at all and this file does not even build)
+ * plus the per-entry claim. A plain build therefore fails loudly — no LSan
+ * needed — and the handover leg catches a stale claim (cc freed while the entry
+ * still says it owns it) as a double free under the sanitizer build. */
+static int j_cl_fired;
+static void mark_cl(void *ctx) { (void)ctx; j_cl_fired++; }
+/* app ctx for the handover leg; mark_w (the file's existing app write cb) writes
+ * 1 into it, which is also how the handshake completion is observed. */
+static int j_app_ctx;
+
+static void cell_j_proxy_connect_ctx_ownership(void) {
+    reset_recorders();
+    /* Mute SOCKS5 server: accepts, swallows the greeting, never replies — the
+     * handshake can never complete, so the dial is still in flight when dropped. */
+    fake_proxy fp = { -1, 0 };
+    fp.lfd = listen_v4(&fp.port);
+    check(fp.lfd >= 0, "J:fake-proxy-listen");
+    if (fp.lfd < 0) return;
+
+    ntx_config cfg; fill_cfg(&cfg, "test/.scratch/19/store");
+    cfg.proxy = 1; cfg.proxy_host = "127.0.0.1"; cfg.proxy_port = fp.port;
+    ntx_netx *n = ntx_netx_init(&cfg);
+    check(n != NULL, "J:netx-init");
+    if (!n) { close(fp.lfd); return; }
+
+    ntx_addr tgt; ntx_addr_set_v4(&tgt, inet_addr("127.0.0.1"));
+    ntx_cbs cbs; memset(&cbs, 0, sizeof cbs);
+    cbs.cl = mark_cl;
+
+    /* 1) in-flight dial dropped the way the session drops it (ntx_netx_del +
+     * close: conn_timeout, torrent removal, session_free). */
+    j_cl_fired = 0;
+    int fd = ntx_netx_route_connect(n, &tgt, 6881, (void *)0x1, &cbs);
+    check(fd >= 0, "J:proxy-dial-real-fd");
+    check(g_proxy_cc_live == 1, "J:inflight-dial-owns-one-connect-ctx");
+    check(n->fds[fd].proxy_pending == 1, "J:entry-claims-the-connect-ctx");
+    int pfd = poll_accept(fp.lfd, 200);
+    uint8_t gw[3];
+    check(pfd >= 0 && recv_bounded(pfd, gw, 3, 20, n) == 3 &&
+          gw[0] == 0x05 && gw[1] == 0x01 && gw[2] == 0x00, "J:socks-greeting");
+    for (int i = 0; i < 5; i++) ntx_netx_run_once(n, 10); /* server stays mute */
+    ntx_netx_del(n, fd);
+    close(fd);
+    check(g_proxy_cc_live == 0, "J:drop_releases_connect_ctx");
+    check(!n->fds[fd].used && !n->fds[fd].ctx && !n->fds[fd].proxy_pending,
+          "J:entry_fully_released");
+    if (pfd >= 0) close(pfd);
+
+    /* 2) backstop: loop torn down with the dial still in flight (no del). */
+    fd = ntx_netx_route_connect(n, &tgt, 6881, (void *)0x1, &cbs);
+    check(fd >= 0 && g_proxy_cc_live == 1, "J:second-inflight-dial");
+    ntx_netx_free(n);
+    close(fd); /* the socket stays the app's — only the ctx changed hands */
+    check(g_proxy_cc_live == 0, "J:netx_free_backstop_releases_connect_ctx");
+
+    /* 3) the dangerous handover: handshake COMPLETES (cc freed, app ctx + app
+     * cbs installed on the same fd) and only then is the fd dropped. A claim
+     * left behind would make that second drop free the cc again. Its own SOCKS5
+     * listener, so the leg-2 backlog cannot be mistaken for this dial. */
+    fake_proxy fp2 = { -1, 0 };
+    fp2.lfd = listen_v4(&fp2.port);
+    check(fp2.lfd >= 0, "J:handover-proxy-listen");
+    if (fp2.lfd < 0) { ntx_netx_free(n); close(fp.lfd); return; }
+    cfg.proxy_port = fp2.port;
+    ntx_netx *n3 = ntx_netx_init(&cfg);
+    check(n3 != NULL, "J:netx-init-2");
+    if (!n3) { close(fp2.lfd); close(fp.lfd); return; }
+    j_app_ctx = 0;
+    j_cl_fired = 0;
+    cbs.w = mark_w;
+    fd = ntx_netx_route_connect(n3, &tgt, 6881, &j_app_ctx, &cbs);
+    check(fd >= 0, "J:handover-dial-real-fd");
+    check(g_proxy_cc_live == 1, "J:handover-dial-owns-one-connect-ctx");
+    pfd = poll_accept(fp2.lfd, 200);
+    check(pfd >= 0, "J:handover-proxy-accepted");
+    if (pfd >= 0) {
+        check(recv_bounded(pfd, gw, 3, 20, n3) == 3, "J:handover-greeting");
+        const uint8_t am[2] = { 0x05, 0x00 };
+        check(send(pfd, am, 2, MSG_NOSIGNAL) == 2, "J:handover-method-reply");
+        uint8_t aq[10];
+        check(recv_bounded(pfd, aq, 10, 40, n3) == 10, "J:handover-connect-request");
+        const uint8_t ar[10] = { 0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 };
+        check(send(pfd, ar, 10, MSG_NOSIGNAL) == 10, "J:handover-connect-reply");
+        pump_until(j_app_ctx, n3, 200);
+        close(pfd);
+    }
+    check(j_app_ctx == 1, "J:handover-notified-app");
+    check(g_proxy_cc_live == 0, "J:handover_freed_connect_ctx");
+    check(!n3->fds[fd].proxy_pending, "J:no_stale_claim_after_handover");
+    check(n3->fds[fd].ctx == (void *)&j_app_ctx, "J:app_ctx_installed");
+    ntx_netx_del(n3, fd); /* drop the ESTABLISHED peer: must not touch cc */
+    close(fd);
+    check(g_proxy_cc_live == 0, "J:established_drop_touches_no_connect_ctx");
+    check(j_cl_fired == 0, "J:del-does-not-fake-a-close-callback");
+    ntx_netx_free(n3);
+    close(fp2.lfd);
+    close(fp.lfd);
+}
+
 int main(void) {
     g_port = 6980;
     cell_a_tunnel_precedence();
@@ -682,6 +793,7 @@ int main(void) {
     cell_g3_tunnel_serves_v6();
     cell_h_null_addr();
     cell_i_utp_off_proxy_still_serves();
+    cell_j_proxy_connect_ctx_ownership();
     if (!fails) printf("PASS egress-route-matrix\n");
     else printf("FAIL egress-route-matrix\n");
     return fails ? 1 : 0;
