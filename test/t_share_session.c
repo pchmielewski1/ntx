@@ -91,7 +91,21 @@
 
 #include "tscale.h" /* the tick gate below is widened by NTX_TEST_TIMEOUT_SCALE */
 
-#define SCRATCH "test/.scratch/a5"
+/* Pid-scoped scratch root. Two concurrent instances of this binary under one
+ * root destroyed each other's payloads and store entries — scratch() unlinks
+ * every non-dot entry in the st_<tag> store dirs and the cases write their
+ * payload files under the same tree — which showed up as FAIL
+ * hash_did_not_finish and FAIL tmp_or_torrent_left only when the two runs
+ * overlapped. CI runs one sequential suite per checkout, so this is local and
+ * parallel-agent hygiene; no product code is involved. Pid-suffixed dirs
+ * persist as garbage in a gitignored tree; clean up with
+ * `rm -rf test/.scratch/a5-*` (no stale-dir reaper here on purpose). */
+static char scratch_root[64];
+
+static void scratch_root_init(void) {
+    snprintf(scratch_root, sizeof scratch_root, "test/.scratch/a5-%d", (int)getpid());
+}
+
 #define BIG_MIB 64
 
 /* Sanitizer detection: GCC defines __SANITIZE_ADDRESS__ for -fsanitize=address,
@@ -148,13 +162,13 @@ static uint64_t now_ns(void) {
 
 static void scratch(void) {
     if (mkdir("test/.scratch", 0755) != 0 && errno != EEXIST) fail("scratch_root");
-    if (mkdir(SCRATCH, 0755) != 0 && errno != EEXIST) fail("scratch");
+    if (mkdir(scratch_root, 0755) != 0 && errno != EEXIST) fail("scratch");
     static const char *const tags[] = {"gates","hash","started","rmhash","pin","revive","ratio","a4","ceil","fdheld",
                                        "from","fromchg","fromerr","fromdup","fromio","fromserve",
                                        "frompread"};
     for (size_t k = 0; k < sizeof tags / sizeof tags[0]; k++) {
         char d[640];
-        snprintf(d, sizeof d, SCRATCH "/%s", tags[k]);
+        snprintf(d, sizeof d, "%s/%s", scratch_root, tags[k]);
         if (mkdir(d, 0755) != 0 && errno != EEXIST) fail("scratch_tag");
         if (mkdir(d, 0755) != 0 && errno != EEXIST) fail("scratch_st");
         /* the store dirs must start empty: a leftover .torrent (the salt makes
@@ -164,7 +178,7 @@ static void scratch(void) {
             struct dirent *de;
             while ((de = readdir(sd)))
                 if (de->d_name[0] != '.') {
-                    snprintf(d, sizeof d, SCRATCH "/st_%s/%s", tags[k], de->d_name);
+                    snprintf(d, sizeof d, "%s/st_%s/%s", scratch_root, tags[k], de->d_name);
                     unlink(d);
                 }
             closedir(sd);
@@ -533,7 +547,7 @@ typedef struct {
 
 static void sess_open(sess *x, const char *tag) {
     char dir[640];
-    snprintf(dir, sizeof dir, SCRATCH "/st_%s", tag);
+    snprintf(dir, sizeof dir, "%s/st_%s", scratch_root, tag);
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) fail("sess_dir");
     memset(&x->cfg, 0, sizeof x->cfg);
     x->cfg.store_dir = strdup(dir);
@@ -605,16 +619,17 @@ static void test_add_gates(void) {
     sess x;
     sess_open(&x, "gates");
     ntx_share_err e = NTX_SHARE_OK;
-    if (ntx_session_share_add(x.s, SCRATCH, NULL, &e) != -1 || e != NTX_SHARE_E_IO) fail("add_dir_io");
+    if (ntx_session_share_add(x.s, scratch_root, NULL, &e) != -1 || e != NTX_SHARE_E_IO)
+        fail("add_dir_io");
     char p[256];
-    snprintf(p, sizeof p, SCRATCH "/gates/empty");
+    snprintf(p, sizeof p, "%s/gates/empty", scratch_root);
     {
         int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) fail("empty_open");
         close(fd);
     }
     if (ntx_session_share_add(x.s, p, NULL, &e) != -1 || e != NTX_SHARE_E_IO) fail("add_empty_io");
-    snprintf(p, sizeof p, SCRATCH "/gates/\001bad");
+    snprintf(p, sizeof p, "%s/gates/\001bad", scratch_root);
     {
         int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) fail("ctl_open");
@@ -622,12 +637,12 @@ static void test_add_gates(void) {
         close(fd);
     }
     if (ntx_session_share_add(x.s, p, NULL, &e) != -1 || e != NTX_SHARE_E_BAD_NAME) fail("add_ctl_bad_name");
-    snprintf(p, sizeof p, SCRATCH "/gates/small.bin");
+    snprintf(p, sizeof p, "%s/gates/small.bin", scratch_root);
     mk_file(p, 200000, 1);
     if (ntx_session_share_add(x.s, p, NULL, &e) < 0 || e != NTX_SHARE_OK) fail("add_two_trackers");
 
     ntx_share_trackers_test_set(NULL, 0);
-    snprintf(p, sizeof p, SCRATCH "/gates/small2.bin");
+    snprintf(p, sizeof p, "%s/gates/small2.bin", scratch_root);
     mk_file(p, 4000, 2);
     if (ntx_session_share_add(x.s, p, NULL, &e) != -1 || e != NTX_SHARE_E_NO_TRACKERS) fail("add_no_trackers");
     ntx_session_share_free(x.s);
@@ -647,7 +662,7 @@ static void test_hash_and_results(void) {
     sess x;
     sess_open(&x, "hash");
     char p[256];
-    snprintf(p, sizeof p, SCRATCH "/hash/big.bin");
+    snprintf(p, sizeof p, "%s/hash/big.bin", scratch_root);
     mk_file(p, (uint64_t)BIG_MIB << 20, 7);
     struct stat before;
     if (stat(p, &before) != 0) fail("big_stat");
@@ -749,7 +764,7 @@ static void test_started_and_magnet(void) {
     sess x;
     sess_open(&x, "started");
     char p[256];
-    snprintf(p, sizeof p, SCRATCH "/started/f.bin");
+    snprintf(p, sizeof p, "%s/started/f.bin", scratch_root);
     mk_file(p, 300000, 11);
     ntx_share_err e = NTX_SHARE_OK;
     int ti = ntx_session_share_add(x.s, p, NULL, &e);
@@ -812,7 +827,7 @@ static void test_remove_during_hash(void) {
     sess x;
     sess_open(&x, "rmhash");
     char p[256];
-    snprintf(p, sizeof p, SCRATCH "/rmhash/g.bin");
+    snprintf(p, sizeof p, "%s/rmhash/g.bin", scratch_root);
     mk_file(p, (uint64_t)32 << 20, 13);
     ntx_share_err e = NTX_SHARE_OK;
     int ti = ntx_session_share_add(x.s, p, NULL, &e);
@@ -858,7 +873,7 @@ static void test_pin_fail(void) {
     sess x;
     sess_open(&x, "pin");
     char p[256];
-    snprintf(p, sizeof p, SCRATCH "/pin/h.bin");
+    snprintf(p, sizeof p, "%s/pin/h.bin", scratch_root);
     mk_file(p, 60000, 17);
     ntx_share_err e = NTX_SHARE_OK;
     int ti = ntx_session_share_add(x.s, p, NULL, &e);
@@ -899,7 +914,7 @@ static void test_revival(void) {
     sess x;
     sess_open(&x, "revive");
     char p[256];
-    snprintf(p, sizeof p, SCRATCH "/revive/i.bin");
+    snprintf(p, sizeof p, "%s/revive/i.bin", scratch_root);
     mk_file(p, 60000, 19);
     ntx_share_err e = NTX_SHARE_OK;
     int ti = ntx_session_share_add(x.s, p, NULL, &e);
@@ -952,7 +967,7 @@ static void test_ratio_exempt(void) {
     sess x;
     sess_open(&x, "ratio");
     char p[256];
-    snprintf(p, sizeof p, SCRATCH "/ratio/j.bin");
+    snprintf(p, sizeof p, "%s/ratio/j.bin", scratch_root);
     mk_file(p, 40000, 23);
     ntx_share_err e = NTX_SHARE_OK;
     int ti = ntx_session_share_add(x.s, p, NULL, &e);
@@ -989,7 +1004,7 @@ static void test_ratio_exempt(void) {
 static void test_a3_to_a4_round_trip(void) {
     scratch();
     char p[256];
-    snprintf(p, sizeof p, SCRATCH "/a4/k.bin");
+    snprintf(p, sizeof p, "%s/a4/k.bin", scratch_root);
     mk_file(p, 500000, 29);
     struct stat sb;
     if (stat(p, &sb) != 0 || sb.st_size <= 0) fail("a4_stat");
@@ -1024,7 +1039,7 @@ static void test_a3_to_a4_round_trip(void) {
     ntx_sha256(ib, ibn, ih2);
 
     char tp[NTX_SHARE_PATH_MAX];
-    snprintf(tp, sizeof tp, SCRATCH "/a4/out.torrent");
+    snprintf(tp, sizeof tp, "%s/a4/out.torrent", scratch_root);
     unlink(tp);
     if (ntx_share_write_torrent(tp, torrent, tn, ih) != NTX_SHARE_OK) fail("a4_write_ok");
     static uint8_t back[1 << 22];
@@ -1052,7 +1067,7 @@ static void test_a3_to_a4_round_trip(void) {
     if (!isz) fail("a4_info_substring_not_found");
     tampered[isz + 1] ^= 0x01;
     char tp2[NTX_SHARE_PATH_MAX];
-    snprintf(tp2, sizeof tp2, SCRATCH "/a4/probe.torrent");
+    snprintf(tp2, sizeof tp2, "%s/a4/probe.torrent", scratch_root);
     unlink(tp2);
     if (ntx_share_write_torrent(tp2, tampered, tn, ih) != NTX_SHARE_E_BAD_ARG) fail("a4_gate_not_enforced");
     if (file_exists(tp2)) fail("a4_gate_wrote");
@@ -1083,7 +1098,7 @@ static void test_ceiling_and_changed(void) {
     sess x;
     sess_open(&x, "ceil");
     char p[256];
-    snprintf(p, sizeof p, SCRATCH "/ceil/huge.bin");
+    snprintf(p, sizeof p, "%s/ceil/huge.bin", scratch_root);
     unlink(p);
     int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) fail("huge_open");
@@ -1100,7 +1115,7 @@ static void test_ceiling_and_changed(void) {
     if (fd >= 0) close(fd);
     unlink(p);
 
-    snprintf(p, sizeof p, SCRATCH "/ceil/m.bin");
+    snprintf(p, sizeof p, "%s/ceil/m.bin", scratch_root);
     mk_file(p, 60000, 31);
     ntx_share_err e = NTX_SHARE_OK;
     int ti = ntx_session_share_add(x.s, p, NULL, &e);
@@ -1124,7 +1139,7 @@ static void test_ceiling_and_changed(void) {
     if (ntx_session_share_poll_event(x.s, &ev) != 0) fail("changed_two_events");
 
     /* §5.5: 60 s without READY warns once and never ends the share */
-    snprintf(p, sizeof p, SCRATCH "/ceil/n.bin");
+    snprintf(p, sizeof p, "%s/ceil/n.bin", scratch_root);
     mk_file(p, 40000, 37);
     int tj = ntx_session_share_add(x.s, p, NULL, &e);
     if (tj < 0) fail("add_slow");
@@ -1149,7 +1164,7 @@ static void test_fd_held_and_ro(void) {
     sess x;
     sess_open(&x, "fdheld");
     char p[256], tmp[256];
-    snprintf(p, sizeof p, SCRATCH "/fdheld/o.bin");
+    snprintf(p, sizeof p, "%s/fdheld/o.bin", scratch_root);
     mk_file(p, 40000, 41);
     ntx_share_err e = NTX_SHARE_OK;
     int ti = ntx_session_share_add(x.s, p, NULL, &e);
@@ -1172,7 +1187,7 @@ static void test_fd_held_and_ro(void) {
      * serve, because the fd taken at share_add is the only handle we ever use. */
     static uint8_t a[16];
     if (ntx_store_read(&t->store, 0, 0, a, 16) != 16) fail("ro_read");
-    snprintf(tmp, sizeof tmp, SCRATCH "/fdheld/o.new");
+    snprintf(tmp, sizeof tmp, "%s/fdheld/o.new", scratch_root);
     mk_file(tmp, 40000, 42);
     if (rename(tmp, p) != 0) fail("rename");
     ntx_share_test_advance_ms(1500);
@@ -1222,7 +1237,7 @@ static void test_from_same_link(void) {
     sess x;
     sess_open(&x, "from");
     char p[256];
-    snprintf(p, sizeof p, SCRATCH "/from/s.bin");
+    snprintf(p, sizeof p, "%s/from/s.bin", scratch_root);
     mk_file(p, 300000, 51);
     ntx_share_err e = NTX_SHARE_OK;
     int ti = ntx_session_share_add(x.s, p, NULL, &e); /* the A5 share */
@@ -1310,8 +1325,8 @@ static void test_from_changed(void) {
     sess x;
     sess_open(&x, "fromchg");
     char p[256], cp[256];
-    snprintf(p, sizeof p, SCRATCH "/fromchg/s.bin");
-    snprintf(cp, sizeof cp, SCRATCH "/fromchg/c.bin");
+    snprintf(p, sizeof p, "%s/fromchg/s.bin", scratch_root);
+    snprintf(cp, sizeof cp, "%s/fromchg/c.bin", scratch_root);
     mk_file(p, 300000, 53);
     if (copy_file(p, cp) != 0) fail("fromchg_copy");
     /* The .torrent is the ORIGINAL bytes; the copy we share carries one byte
@@ -1332,7 +1347,7 @@ static void test_from_changed(void) {
     }
     if (!tb) fail("fromchg_mktorrent");
     char tp[NTX_SHARE_PATH_MAX];
-    snprintf(tp, sizeof tp, SCRATCH "/fromchg/known.torrent");
+    snprintf(tp, sizeof tp, "%s/fromchg/known.torrent", scratch_root);
     if (write_all(tp, tb, tn) != 0) fail("fromchg_write");
     free(tb);
 
@@ -1353,7 +1368,7 @@ static void test_from_changed(void) {
     /* the .torrent of a failed verification is still untouched, and no new
      * file was written for it */
     char other[NTX_SHARE_PATH_MAX];
-    snprintf(other, sizeof other, SCRATCH "/st_fromchg/known-00000000.torrent");
+    snprintf(other, sizeof other, "%s/st_fromchg/known-00000000.torrent", scratch_root);
     if (file_exists(other)) fail("fromchg_wrote_a_torrent");
     ntx_session_remove(x.s, ti);
     sess_close(&x);
@@ -1371,7 +1386,7 @@ static void test_from_bad_arg(void) {
     sess x;
     sess_open(&x, "fromerr");
     char p[256];
-    snprintf(p, sizeof p, SCRATCH "/fromerr/s.bin");
+    snprintf(p, sizeof p, "%s/fromerr/s.bin", scratch_root);
     mk_file(p, 300000, 57);
     size_t dn = 0;
     uint8_t *data = slurp(p, &dn);
@@ -1392,23 +1407,25 @@ static void test_from_bad_arg(void) {
     ntx_share_err e = NTX_SHARE_OK;
     pm_park(&x, NTX_PM_OFF);
 
-    snprintf(tp, sizeof tp, SCRATCH "/fromerr/public.torrent");
+    snprintf(tp, sizeof tp, "%s/fromerr/public.torrent", scratch_root);
     if (write_all(tp, pub, tn) != 0) fail("fromerr_write_pub");
     if (ntx_session_share_add(x.s, p, tp, &e) != -1 || e != NTX_SHARE_E_BAD_ARG) fail("fromerr_public");
     if (ntx_session_share_state(x.s, 0) != NTX_SHARE_NONE) fail("fromerr_public_slot");
 
-    snprintf(tp, sizeof tp, SCRATCH "/fromerr/badlen.torrent");
+    snprintf(tp, sizeof tp, "%s/fromerr/badlen.torrent", scratch_root);
     if (write_all(tp, bad, tn) != 0) fail("fromerr_write_bad");
     if (ntx_session_share_add(x.s, p, tp, &e) != -1 || e != NTX_SHARE_E_BAD_ARG) fail("fromerr_bad_len");
 
-    snprintf(tp, sizeof tp, SCRATCH "/fromerr/junk.torrent");
+    snprintf(tp, sizeof tp, "%s/fromerr/junk.torrent", scratch_root);
     if (write_all(tp, (const uint8_t *)"d6:lengthi1e", 12) != 0) fail("fromerr_write_junk");
     if (ntx_session_share_add(x.s, p, tp, &e) != -1 || e != NTX_SHARE_E_BAD_ARG) fail("fromerr_junk");
 
-    if (ntx_session_share_add(x.s, p, SCRATCH "/fromerr", &e) != -1 || e != NTX_SHARE_E_BAD_ARG)
+    char dp[640];
+    snprintf(dp, sizeof dp, "%s/fromerr", scratch_root);
+    if (ntx_session_share_add(x.s, p, dp, &e) != -1 || e != NTX_SHARE_E_BAD_ARG)
         fail("fromerr_dir");
-    if (ntx_session_share_add(x.s, p, SCRATCH "/fromerr/missing.torrent", &e) != -1 ||
-        e != NTX_SHARE_E_BAD_ARG)
+    snprintf(tp, sizeof tp, "%s/fromerr/missing.torrent", scratch_root);
+    if (ntx_session_share_add(x.s, p, tp, &e) != -1 || e != NTX_SHARE_E_BAD_ARG)
         fail("fromerr_missing");
     if (!file_exists(p)) fail("fromerr_consumed_the_file");
     if (ntx_session_share_state(x.s, 0) != NTX_SHARE_NONE) fail("fromerr_slot_used");
@@ -1430,7 +1447,7 @@ static void test_from_duplicate(void) {
     sess x;
     sess_open(&x, "fromdup");
     char p[256];
-    snprintf(p, sizeof p, SCRATCH "/fromdup/s.bin");
+    snprintf(p, sizeof p, "%s/fromdup/s.bin", scratch_root);
     mk_file(p, 300000, 59);
     size_t dn = 0;
     uint8_t *data = slurp(p, &dn);
@@ -1440,7 +1457,7 @@ static void test_from_duplicate(void) {
     free(data);
     if (!tb) fail("fromdup_mktorrent");
     char tp[NTX_SHARE_PATH_MAX];
-    snprintf(tp, sizeof tp, SCRATCH "/fromdup/dup.torrent");
+    snprintf(tp, sizeof tp, "%s/fromdup/dup.torrent", scratch_root);
     if (write_all(tp, tb, tn) != 0) fail("fromdup_write");
     free(tb);
 
@@ -1491,7 +1508,7 @@ static void test_from_truncated(void) {
     const uint32_t ps = 16384;
 
     /* --- part 1: ftruncate to half MID-HASH → CHANGED or IO, session lives --- */
-    snprintf(p, sizeof p, SCRATCH "/fromio/big.bin");
+    snprintf(p, sizeof p, "%s/fromio/big.bin", scratch_root);
     mk_file(p, big, 61);
     size_t dn = 0;
     uint8_t *data = slurp(p, &dn);
@@ -1500,7 +1517,7 @@ static void test_from_truncated(void) {
     uint8_t *tb = mk_torrent(data, dn, ps, 0, &tn);
     free(data);
     if (!tb) fail("fromio_mktorrent");
-    snprintf(tp, sizeof tp, SCRATCH "/fromio/big.torrent");
+    snprintf(tp, sizeof tp, "%s/fromio/big.torrent", scratch_root);
     if (write_all(tp, tb, tn) != 0) fail("fromio_write");
     free(tb);
 
@@ -1521,7 +1538,7 @@ static void test_from_truncated(void) {
     }
     /* the session survives: another share still works, ticks stay clean */
     char q[256];
-    snprintf(q, sizeof q, SCRATCH "/fromio/small.bin");
+    snprintf(q, sizeof q, "%s/fromio/small.bin", scratch_root);
     mk_file(q, 40000, 62);
     int tj = ntx_session_share_add(x.s, q, NULL, &e);
     if (tj < 0 || e != NTX_SHARE_OK) fail("fromio_session_dead");
@@ -1538,7 +1555,7 @@ static void test_from_truncated(void) {
      *            block request is refused (§5.5, review focus 4) --- */
     sess y;
     sess_open(&y, "fromserve");
-    snprintf(p, sizeof p, SCRATCH "/fromserve/s.bin");
+    snprintf(p, sizeof p, "%s/fromserve/s.bin", scratch_root);
     mk_file(p, 300000, 63);
     dn = 0;
     data = slurp(p, &dn);
@@ -1547,7 +1564,7 @@ static void test_from_truncated(void) {
     tb = mk_torrent(data, dn, 16384, 0, &tn);
     free(data);
     if (!tb) fail("fromserve_mktorrent");
-    snprintf(tp, sizeof tp, SCRATCH "/fromserve/s.torrent");
+    snprintf(tp, sizeof tp, "%s/fromserve/s.torrent", scratch_root);
     if (write_all(tp, tb, tn) != 0) fail("fromserve_write");
     free(tb);
 
@@ -1640,7 +1657,7 @@ static void test_from_serve_io(void) {
     char p[256], tp[NTX_SHARE_PATH_MAX];
     const uint32_t ps = 16384;
 
-    snprintf(p, sizeof p, SCRATCH "/frompread/g.bin");
+    snprintf(p, sizeof p, "%s/frompread/g.bin", scratch_root);
     mk_file(p, 40000, 64); /* 3 pieces: 16384 + 16384 + 7232 */
     size_t dn = 0;
     uint8_t *data = slurp(p, &dn);
@@ -1649,7 +1666,7 @@ static void test_from_serve_io(void) {
     uint8_t *tb = mk_torrent(data, dn, ps, 0, &tn);
     free(data);
     if (!tb) fail("frompread_mktorrent");
-    snprintf(tp, sizeof tp, SCRATCH "/frompread/g.torrent");
+    snprintf(tp, sizeof tp, "%s/frompread/g.torrent", scratch_root);
     if (write_all(tp, tb, tn) != 0) fail("frompread_write");
     free(tb);
 
@@ -1711,6 +1728,7 @@ static void test_from_serve_io(void) {
 
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    scratch_root_init();
     ntx_rng_init();
     scratch();
     test_add_gates();
