@@ -204,10 +204,6 @@ void ntx_session_peer_on_connect(struct ntx_session *s, int fd, void *ctx) {
         ntx_session_peer_on_rw(s, fd, ctx);
 }
 
-/* Body in ntx_session_bt_hs.c: the MSE responder's HS, built at accept time before
- * the torrent is known (safe — it only ever goes out RC4-encrypted after SKEY). */
-void sp_build_mse_responder_hs(struct ntx_session *s, uint8_t m[68]);
-
 void ntx_session_peer_on_accept(struct ntx_session *s, ntx_netx *n, int peer_fd, void *ctx) {
     (void)ctx;
     sp_g_s = s;
@@ -227,13 +223,9 @@ void ntx_session_peer_on_accept(struct ntx_session *s, ntx_netx *n, int peer_fd,
     ntx_pe_init(&s->pe[pi], NTX_PE_RESPONDER, peer_fd);
     ntx_pe_set_netx(&s->pe[pi], s->netx);
     sp_pe_set_infohash(s, pi);
-    {
-        uint8_t hs[68];
-        /* The MSE responder's HS is only ever sent RC4-encrypted after SKEY
-         * matched, so it is safe to build before the torrent is known. */
-        sp_build_mse_responder_hs(s, hs);
-        ntx_pe_set_bt_handshake(&s->pe[pi], hs);
-    }
+    /* §7 (R1): our MSE reply is built in PE_ST_RECV_HS, only after SKEY picked the
+     * slot, so no byte of another share's info hash can ever go out under these keys. */
+    ntx_pe_set_reply_hs(&s->pe[pi], sp_pe_reply_hs, s);
     ntx_cbs cbs = {sp_rw_cb, sp_rw_cb, peer_cl_cb};
     ntx_netx_add(n, peer_fd, EPOLLIN | EPOLLOUT, (void *)(intptr_t)(pi + 1), &cbs);
     sp_vlog_peer(s, pi, "accept", "pe responder start");

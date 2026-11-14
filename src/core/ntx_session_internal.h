@@ -336,6 +336,8 @@ int sp_match_tts(struct ntx_session *s, const uint8_t hash[20]);
 int sp_promote_peer_ok(struct ntx_session *s, int pi, const uint8_t hs[68]);
 void sp_bths_resync(uint8_t *buf, size_t *bl);
 void sp_build_bt_handshake(struct ntx_session *s, int pi, uint8_t m[68]);
+int sp_pe_reply_hs(void *ctx, const ntx_pe *pe, uint8_t out[NTX_PE_HANDSHAKE_LEN],
+                   const uint8_t got[NTX_PE_HANDSHAKE_LEN]);
 void sp_peer_ok_hello(struct ntx_session *s, int pi);
 void sp_peer_ok_poll(struct ntx_session *s, int pi);
 /* EPOLLOUT only while outbound bytes pending or during PE/BTHS (avoids idle spin). */

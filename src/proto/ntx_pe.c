@@ -507,16 +507,30 @@ static int pe_step_responder(ntx_pe *pe) {
         }
         if (pe->inn < pe->need) return 0;
         ntx_pe_decrypt(pe, pe->in, NTX_PE_HANDSHAKE_LEN);
-        if (!pe->bt_hs_set) {
-            pe_fail(pe);
-            return -1;
+        if (pe->reply_hs) {
+            /* §7/§7.1 (R1): asked only here, after pe_verify_skey picked the slot, so our
+             * reply can name nothing but that slot. A refusal drops the connection without
+             * one byte of ours: PE_ST_RECV_PADIA flushed the crypto field before we got
+             * here, so pe->out is idle and PE_ST_SEND_RHS is the only later send. The buffer
+             * is emptied so the session's plaintext sniff (ntx_session_peer_step) cannot read
+             * this RC4-decrypted handshake as a plaintext one and fall back on it. */
+            if (!pe->reply_hs(pe->reply_hs_ctx, pe, pe->out, pe->in)) {
+                pe->inn = 0;
+                pe_fail(pe);
+                return -1;
+            }
+        } else {
+            if (!pe->bt_hs_set) {
+                pe_fail(pe);
+                return -1;
+            }
+            memcpy(pe->out, pe->bt_hs, NTX_PE_HANDSHAKE_LEN);
         }
-        memcpy(pe->out, pe->bt_hs, NTX_PE_HANDSHAKE_LEN);
+        memcpy(pe->bt_hs, pe->in, NTX_PE_HANDSHAKE_LEN);
+        pe->bt_hs_got = 1;
         ntx_pe_encrypt(pe, pe->out, NTX_PE_HANDSHAKE_LEN);
         pe->outn = NTX_PE_HANDSHAKE_LEN;
         pe->sent = 0;
-        memcpy(pe->bt_hs, pe->in, NTX_PE_HANDSHAKE_LEN);
-        pe->bt_hs_got = 1;
         pe_consume(pe, NTX_PE_HANDSHAKE_LEN);
         pe->state = PE_ST_SEND_RHS;
         return 0;
@@ -563,6 +577,11 @@ void ntx_pe_set_infohash(ntx_pe *pe, const uint8_t hash[20]) {
 void ntx_pe_set_bt_handshake(ntx_pe *pe, const uint8_t hs[NTX_PE_HANDSHAKE_LEN]) {
     memcpy(pe->bt_hs, hs, NTX_PE_HANDSHAKE_LEN);
     pe->bt_hs_set = 1;
+}
+
+void ntx_pe_set_reply_hs(ntx_pe *pe, ntx_pe_reply_hs_fn fn, void *ctx) {
+    pe->reply_hs = fn;
+    pe->reply_hs_ctx = ctx;
 }
 
 int ntx_pe_handshake_sent(const ntx_pe *pe) {

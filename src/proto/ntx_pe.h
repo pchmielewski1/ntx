@@ -15,7 +15,18 @@ enum { NTX_PE_OK = 0, NTX_PE_DONE = 1, NTX_PE_FAIL = -1, NTX_PE_PLAIN = -2 };
 #define NTX_PE_HANDSHAKE_LEN 68
 #define NTX_PE_INFOHASH_CAND 16
 
-typedef struct {
+struct ntx_pe;
+
+/* §7 (R1) responder hook, installed by the session layer. Asked once, in RECV_HS, after
+ * pe_verify_skey proved one of our hashes: build OUR handshake for that slot (pe->infohash
+ * is the matched hash) and confirm the initiator's handshake `got` names the same slot.
+ * Returning 0 drops the connection with no byte sent for the reply. ctx is the session.
+ * NULL keeps the pre-set bt_hs path (plaintext-compat callers, tests). */
+typedef int (*ntx_pe_reply_hs_fn)(void *ctx, const struct ntx_pe *pe,
+                                  uint8_t out[NTX_PE_HANDSHAKE_LEN],
+                                  const uint8_t got[NTX_PE_HANDSHAKE_LEN]);
+
+typedef struct ntx_pe {
     int role;
     int state;
     int fd;
@@ -44,6 +55,8 @@ typedef struct {
     int bt_hs_sent;
     int plaintext;
     uint64_t state_t0_ms;
+    ntx_pe_reply_hs_fn reply_hs;
+    void *reply_hs_ctx;
 } ntx_pe;
 
 int ntx_pe_init(ntx_pe *pe, int role, int fd);
@@ -51,6 +64,8 @@ void ntx_pe_set_netx(ntx_pe *pe, struct ntx_netx *netx);
 void ntx_pe_set_infohash(ntx_pe *pe, const uint8_t hash[20]);
 void ntx_pe_set_bt_handshake(ntx_pe *pe, const uint8_t hs[NTX_PE_HANDSHAKE_LEN]);
 int ntx_pe_handshake_sent(const ntx_pe *pe);
+/* Responder only: install the §7 (R1) reply hook (ctx is passed back to fn). */
+void ntx_pe_set_reply_hs(ntx_pe *pe, ntx_pe_reply_hs_fn fn, void *ctx);
 int ntx_pe_step(ntx_pe *pe);
 int ntx_pe_done(const ntx_pe *pe);
 void ntx_pe_encrypt(ntx_pe *pe, uint8_t *buf, size_t n);

@@ -123,21 +123,20 @@ void sp_build_bt_handshake(struct ntx_session *s, int pi, uint8_t m[68]) {
     sp_fill_bt_handshake(s, ti, m);
 }
 
-/* The MSE responder's own handshake, offered at accept time, before the torrent
- * is known. Unchanged by §7.1: it only ever goes out RC4-encrypted under keys
- * derived from an info hash the initiator already proved with SKEY, so a scanner
- * cannot read it.
- * ponytail: still the first live slot, as before §7.1. Ceiling: a multi-slot
- * session whose SKEY matched a non-first candidate answers with the wrong hash
- * (pre-existing). Upgrade: let ntx_pe set bt_hs after RECV_SKEY, where
- * pe->infohash holds the matched hash, and drop this function. */
-void sp_build_mse_responder_hs(struct ntx_session *s, uint8_t m[68]) {
-    for (int i = 0; i < s->n_tts; i++)
-        if (s->tts[i].state != NTX_TTS_DEAD) {
-            sp_fill_bt_handshake(s, i, m);
-            return;
-        }
-    memset(m, 0, 68);
+/* §7 (R1): the MSE responder's own handshake, asked by ntx_pe in PE_ST_RECV_HS — after
+ * pe_verify_skey proved one of our hashes, so pe->infohash IS the matched slot. Answering
+ * with that slot and only that slot is what stops a holder of one share's info hash from
+ * reading a second share's hash out of our reply. The initiator's handshake must name the
+ * same slot; a mismatch is refused with no byte sent (ntx_pe drops before any pe_send_out). */
+int sp_pe_reply_hs(void *ctx, const ntx_pe *pe, uint8_t out[NTX_PE_HANDSHAKE_LEN],
+                   const uint8_t got[NTX_PE_HANDSHAKE_LEN]) {
+    struct ntx_session *s = ctx;
+    int ti = sp_match_tts(s, pe->infohash);
+    if (ti < 0) return 0;
+    if (got[0] != 19 || memcmp(got + 1, "BitTorrent protocol", 19) != 0) return 0;
+    if (sp_match_tts(s, got + 28) != ti) return 0; /* §7: must name the SKEY slot */
+    sp_fill_bt_handshake(s, ti, out);
+    return 1;
 }
 
 void sp_peer_ok_hello(struct ntx_session *s, int pi) {

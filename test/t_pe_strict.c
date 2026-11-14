@@ -432,6 +432,107 @@ static void test_mse_to_strict_counts_in_ok(void) {
     printf("PASS strict_mse_inbound_ok_counts\n");
 }
 
+/* §7 (R1): the MSE responder must answer with the slot the SKEY matched, not with
+ * the first live slot. Two slots (0 = strict share, 1 = public), the initiator runs
+ * a real ntx_pe against the socketpair end and the assertion reads the decrypted
+ * bytes of our reply out of the initiator's pe (bt_hs / bt_hs_got). */
+
+/* Full inbound MSE handshake; *reply gets the 20-byte hash of our reply handshake.
+   Returns 0 when the initiator never received one. */
+static int mse_reply_hash(ntx_session *s, int cli, const uint8_t skey_ih[20],
+                          const uint8_t hs_ih[20], uint8_t reply[20]) {
+    ntx_pe cli_pe;
+    ntx_pe_init(&cli_pe, NTX_PE_INITIATOR, cli);
+    ntx_pe_set_infohash(&cli_pe, skey_ih);
+    uint8_t hs[68];
+    mk_hs(hs, hs_ih, (const uint8_t *)"-peer0000000000000000");
+    ntx_pe_set_bt_handshake(&cli_pe, hs);
+    int idle = 0;
+    for (int k = 0; k < 20000 && !cli_pe.done && !cli_pe.failed; k++) {
+        int r = ntx_pe_step(&cli_pe);
+        if (r < 0) break;
+        ntx_session_peer_hs_tick(s);
+        if (r == 0) {
+            if (++idle > 2000) break;
+        } else idle = 0;
+    }
+    if (!cli_pe.bt_hs_got) return 0;
+    memcpy(reply, cli_pe.bt_hs + 28, 20);
+    return 1;
+}
+
+static void test_mse_responder_names_matched_slot(void) {
+    for (int want = 0; want < 2; want++) {
+        ntx_config cfg;
+        cfg_base(&cfg, 0);
+        ntx_netx *n;
+        ntx_session *s = mk(&cfg, &n);
+        set_slot(s, 0, 0x99, 1); /* strict share */
+        set_slot(s, 1, 0xAA, 0); /* public control slot */
+
+        ntx_addr a = lo4(6);
+        int cli = -1;
+        int pi = accept_peer(s, &a, 51005, &cli);
+
+        uint8_t reply[20];
+        if (!mse_reply_hash(s, cli, s->tts[want].info_hash, s->tts[want].info_hash, reply))
+            fail("mse_no_reply_hs");
+        if (memcmp(reply, s->tts[want].info_hash, 20) != 0) fail("mse_reply_not_skey_slot");
+        if (memcmp(reply, s->tts[1 - want].info_hash, 20) == 0) fail("mse_reply_is_other_slot");
+        if (s->peers[pi].fd == -1) fail("mse_reply_dropped");
+        if (s->peer_tts[pi] != want) fail("mse_reply_bound_wrong_slot");
+        if (s->peer_phase[pi] != PH_OK) fail("mse_reply_not_ok");
+        close(cli);
+        drop(s, n);
+    }
+    printf("PASS strict_mse_responder_names_matched_slot\n");
+}
+
+/* §7 (R1): SKEY proved slot 1 but the initiator's own handshake names slot 0 — the
+ * connection is dropped and, from the moment our reply would have gone out, the
+ * responder sends not one byte. MSE forces the responder to send its DH key and its
+ * crypto field before SKEY is even verified, so the silence is asserted after those
+ * bytes have been drained: nothing beyond them may follow. */
+static void test_mse_hash_mismatch_silent_drop(void) {
+    ntx_config cfg;
+    cfg_base(&cfg, 0);
+    ntx_netx *n;
+    ntx_session *s = mk(&cfg, &n);
+    set_slot(s, 0, 0xBB, 1); /* strict share: its hash must stay ours */
+    set_slot(s, 1, 0xCC, 0);
+
+    ntx_addr a = lo4(7);
+    int cli = -1;
+    int pi = accept_peer(s, &a, 51006, &cli);
+
+    ntx_pe cli_pe;
+    ntx_pe_init(&cli_pe, NTX_PE_INITIATOR, cli);
+    ntx_pe_set_infohash(&cli_pe, s->tts[1].info_hash); /* SKEY of the public slot */
+    uint8_t hs[68];
+    mk_hs(hs, s->tts[0].info_hash, (const uint8_t *)"-peer0000000000000000"); /* names the share */
+    ntx_pe_set_bt_handshake(&cli_pe, hs);
+
+    int idle = 0;
+    for (int k = 0; k < 20000 && !cli_pe.failed; k++) {
+        (void)ntx_pe_step(&cli_pe); /* reads the responder's DH key + vc/crypto/pad */
+        ntx_session_peer_hs_tick(s);
+        if (cli_pe.bt_hs_got || cli_pe.state == 15) break; /* 15 = RECV_HS: all read */
+        if (++idle > 4000) break;
+    }
+    /* The initiator has now read every byte MSE lets the responder send before the
+     * decision, so anything still in the socket is our reply — and there is none. */
+    uint8_t got[2048];
+    size_t gn = recv_all(cli, got, sizeof got);
+    if (s->peers[pi].fd != -1) fail("mismatched_hash_kept");
+    if (gn != 0) fail("answered_mismatched_hash");
+    if (cli_pe.bt_hs_got) fail("mismatched_hash_answered");
+    if (s->pe[pi].bt_hs_sent) fail("mismatched_hash_hs_sent");
+    if (has_magic(got, gn)) fail("mismatched_hash_sent_handshake");
+    close(cli);
+    drop(s, n);
+    printf("PASS strict_mse_hash_mismatch_silent_drop\n");
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     ntx_rng_init();
@@ -442,6 +543,8 @@ int main(void) {
     test_inbound_strict_slot();
     test_outbound_to_strict_dropped();
     test_mse_to_strict_counts_in_ok();
+    test_mse_responder_names_matched_slot();
+    test_mse_hash_mismatch_silent_drop();
     printf("ALL PASS\n");
     return 0;
 }

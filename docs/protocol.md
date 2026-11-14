@@ -296,6 +296,15 @@ The policy functions live in `src/core/ntx_session_pe.c` and `src/core/ntx_sessi
   sends nothing gets no response at all, so it cannot read the info hash of a live torrent out
   of us. Handshakes for unknown hashes are dropped with no reply (`sp_build_bt_handshake`
   zeroes the buffer when no slot is chosen).
+- **The MSE answer names the matched slot.** The responder builds its own handshake inside
+  `ntx_pe` in state `RECV_HS`, i.e. only after `pe_verify_skey` proved one of our hashes and
+  `pe->infohash` became that slot; the session supplies the bytes through the `ntx_pe` reply
+  hook (`ntx_pe_set_reply_hs`, wired in `ntx_session_peer_on_accept` to `sp_pe_reply_hs` in
+  `ntx_session_bt_hs.c`). The hook also checks that the initiator's own handshake resolves to
+  the **same** slot and refuses otherwise, so a peer that holds one share's info hash can never
+  read a second share's hash out of our reply, and a refusal costs it zero bytes (nothing is
+  sent before the decision). The plaintext path is unaffected: it still answers from
+  `sp_bths_try`.
 - MSE itself is unchanged: RC4 only, 768-bit DH, no authentication. Strict mode raises the
   bar against passive off-path observation and against an on-path peer that simply refuses to
   encrypt; it does not authenticate the peer.
