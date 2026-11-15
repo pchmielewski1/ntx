@@ -116,6 +116,17 @@ static int trk_is_httpish(const char *url) {
     return url && (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0);
 }
 
+/* R7 (§5.5): a share that stopped serving is not a live torrent. Its slot keeps
+ * the metainfo share_finish published before the failure, so the META/DL/DONE
+ * state gate alone still lets it announce with the real info-hash and be boosted
+ * like a seed. ntx_session_share_serving is 1 for a plain torrent (no share
+ * slot), so downloads are untouched; `stopped` is not routed through here —
+ * trk_stop_one decides that on trk_started_ok. */
+static int trk_share_off(const struct ntx_session *s, int tts_idx) {
+    if (tts_idx < 0 || tts_idx >= NTX_SESSION_MAX_TTS) return 0;
+    return s->share[tts_idx] && !ntx_session_share_serving(s, tts_idx);
+}
+
 static void trk_sendto_ip(struct ntx_session *s, uint32_t ip, uint16_t port, const uint8_t *buf, size_t n) {
     struct sockaddr_in dst;
     memset(&dst, 0, sizeof dst);
@@ -350,6 +361,8 @@ static void trk_http_apply(struct ntx_session *s, int tts_idx, int trk_idx, cons
 void ntx_session_trk_announce(struct ntx_session *s, int tts_idx, int event) {
     ntx_torrent *t = &s->tts[tts_idx];
     if (t->state == NTX_TTS_DEAD || t->state == NTX_TTS_PAUSED) return;
+    /* R7: a share that stopped serving has nothing left to announce. */
+    if (event != NTX_TRACKER_EVENT_STOPPED && trk_share_off(s, tts_idx)) return;
     s->trk_http_event[tts_idx] = event;
     uint64_t now = ntx_mono_ms();
     int has_udp = 0;
@@ -378,6 +391,7 @@ void ntx_session_trk_pump_udp(struct ntx_session *s) {
     uint64_t deadline = now + TRK_UDP_PUMP_BUDGET_MS;
     for (int tts_idx = 0; tts_idx < s->n_tts; tts_idx++) {
         ntx_torrent *t = &s->tts[tts_idx];
+        if (trk_share_off(s, tts_idx)) continue; /* R7: a dead share has no announce to send */
         for (int i = 0; i < s->trk_n[tts_idx]; i++) {
             if (!s->trk_udp_pending[tts_idx][i]) continue;
             s->trk_udp_pending[tts_idx][i] = 0;
@@ -404,6 +418,11 @@ void ntx_session_trk_pump_http(struct ntx_session *s, int max) {
     for (int tts_idx = 0; tts_idx < s->n_tts && max > 0; tts_idx++) {
         ntx_torrent *t = &s->tts[tts_idx];
         if (t->state == NTX_TTS_DEAD || t->state == NTX_TTS_PAUSED) continue;
+        /* R7: a share that stopped serving has no announce left in the queue. A
+         * queued `goodbye` still goes: ntx_session_trk_announce lets a STOPPED
+         * through, and trk_stop_one announces synchronously instead of queueing. */
+        if (trk_share_off(s, tts_idx) && s->trk_http_event[tts_idx] != NTX_TRACKER_EVENT_STOPPED)
+            continue;
         for (int i = 0; i < s->trk_n[tts_idx] && max > 0; i++) {
             if (trk_is_dead(s, tts_idx, i)) {
                 s->trk_http_pending[tts_idx][i] = 0;
@@ -434,6 +453,7 @@ static void trk_retry_stale(struct ntx_session *s) {
         s->trk_pending_used[slot] = 0;
         if (tts_idx < 0 || trk_idx < 0 || tts_idx >= s->n_tts) continue;
         if (trk_idx >= s->trk_n[tts_idx]) continue;
+        if (trk_share_off(s, tts_idx)) continue; /* R7: a dead share waits for no reply */
         const char *url = s->trk_urls[tts_idx][trk_idx];
         if (strncmp(url, "udp://", 6) != 0) continue;
         /* Timeout = one strike; do not silently retry forever. */
@@ -453,6 +473,10 @@ static void trk_stop_one(struct ntx_session *s, int tts_idx, uint64_t deadline) 
     if (tts_idx < 0 || tts_idx >= s->n_tts) return;
     ntx_torrent *t = &s->tts[tts_idx];
     if (t->state != NTX_TTS_META && t->state != NTX_TTS_DL && t->state != NTX_TTS_DONE) return;
+    /* R7 (§5.5): a share that never got its `started` answered was never in the
+     * tracker's swarm, so it has no goodbye to send. trk_started_ok is exactly
+     * the fact that one of this slot's trackers served the `started`. */
+    if (s->share[tts_idx] && !s->trk_started_ok[tts_idx]) return;
     s->trk_http_event[tts_idx] = NTX_TRACKER_EVENT_STOPPED;
     for (int i = 0; i < s->trk_n[tts_idx] && i < NTX_SESSION_MAX_TRK; i++) {
         s->trk_http_pending[tts_idx][i] = 0; /* a queued regular announce is pointless now */
@@ -485,6 +509,7 @@ void ntx_session_trk_tick(struct ntx_session *s) {
         if (s->tts[i].state != NTX_TTS_META && s->tts[i].state != NTX_TTS_DL &&
             s->tts[i].state != NTX_TTS_DONE)
             continue;
+        if (trk_share_off(s, i)) continue; /* R7: a failed share is not a live torrent */
         if (s->trk_next[i] && now >= s->trk_next[i])
             ntx_session_trk_announce(s, i, NTX_TRACKER_EVENT_NONE);
     }
@@ -497,6 +522,9 @@ void ntx_session_trk_boost_peers(struct ntx_session *s) {
         if (s->tts[i].state != NTX_TTS_META && s->tts[i].state != NTX_TTS_DL &&
             s->tts[i].state != NTX_TTS_DONE)
             continue;
+        /* R7: a share that stopped serving has no swarm to fetch peers for;
+         * pulling trk_next forward here would schedule an announce. */
+        if (trk_share_off(s, i)) continue;
         int ok = 0, un = 0, hs = 0;
         for (int pi = 0; pi < NTX_SESSION_MAX_PEERS; pi++) {
             if (s->peer_tts[pi] != i || s->peers[pi].fd == -1) continue;

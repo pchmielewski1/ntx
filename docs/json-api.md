@@ -131,7 +131,7 @@ Slots with state `DEAD` are not listed. `i` and `ih` come first in each object.
 | Key | Meaning |
 |-----|---------|
 | `i` | Slot number `0`-`15`. Stable for the life of the torrent; this is the `i` used in commands. The array index is not the slot. |
-| `ih` | 40 lowercase hex digits: the 20-byte info hash used on the wire and in tracker announces. SHA-1 of the `info` dictionary for v1 and hybrid torrents; the first 20 bytes of the SHA-256 for pure v2. The full 32-byte v2 hash is not exposed. |
+| `ih` | 40 lowercase hex digits: the 20-byte info hash used on the wire and in tracker announces. SHA-1 of the `info` dictionary for v1 and hybrid torrents; the first 20 bytes of the SHA-256 for pure v2. The full 32-byte v2 hash is not exposed. `40` zeros for a share that failed (`share` = `2`) — the share announces nothing with it, so nothing is published about it. |
 | `name` | Torrent name, at most 47 bytes (empty until known; a magnet's `dn=` is used before the metadata arrives). |
 | `state` | Numeric state, see below. |
 | `phase` | Phase string, see below. |
@@ -178,7 +178,7 @@ Slots with state `DEAD` are not listed. `i` and `ih` come first in each object.
 
 #### `phase` values
 
-`init`, `trk`, `trk-wait`, `connect`, `hs`, `meta-wait`, `meta`, `verify`, `hash`, `dl`, `wait`, `choked`, `stall`, `seed`, `ratio-done`, `pause` (at most 11 bytes). `hash` appears only while a `share` is hashing its file. Meanings: [cli.md](cli.md#phases).
+`init`, `trk`, `trk-wait`, `connect`, `hs`, `meta-wait`, `meta`, `verify`, `hash`, `fail`, `dl`, `wait`, `choked`, `stall`, `seed`, `ratio-done`, `pause` (at most 11 bytes). `hash` appears only while a `share` is hashing its file. `fail` appears only for a share that failed (`share` = `2`): the slot is not announced, not matched against peers and its `ih` is `40` zeros. Meanings: [cli.md](cli.md#phases).
 
 #### Size and truncation
 

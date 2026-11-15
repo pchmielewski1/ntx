@@ -165,7 +165,8 @@ static void scratch(void) {
     if (mkdir(scratch_root, 0755) != 0 && errno != EEXIST) fail("scratch");
     static const char *const tags[] = {"gates","hash","started","rmhash","pin","revive","ratio","a4","ceil","fdheld",
                                        "from","fromchg","fromerr","fromdup","fromio","fromserve",
-                                       "frompread","store","during","durtrunc"};
+                                       "frompread","store","during","durtrunc",
+                                       "r7dead","r7hash","r7pend"};
     for (size_t k = 0; k < sizeof tags / sizeof tags[0]; k++) {
         char d[640];
         snprintf(d, sizeof d, "%s/%s", scratch_root, tags[k]);
@@ -1948,6 +1949,178 @@ static void test_trunc_during_hash(void) {
     ok("truncate_during_hash_is_changed");
 }
 
+/* ---- R7: a share that failed AFTER its metainfo was published ----
+ * share_finish fills the slot through ntx_torrent_init_meta (state META, real
+ * info-hash, np/have set) and only then discovers that the .torrent cannot be
+ * written. share_fail parked the share in FAILED, but left the torrent slot
+ * looking like a live seed: stats said phase "trk-wait" with the real `ih`,
+ * ntx_session_trk_tick would announce it as soon as an announce was scheduled,
+ * and ntx_session_trk_stop_all sent `stopped` with the real hash for a share
+ * that had never sent `started`. The .torrent write is forced to fail by moving
+ * the store dir away after the synchronous gate proved it writable (works for
+ * root too, unlike the 0500 trick of case 6b). */
+static void test_failed_share_is_dead(void) {
+    scratch();
+    tracker tr;
+    memset(&tr, 0, sizeof tr);
+    tracker_start(&tr);
+    set_test_trackers(&tr, 2);
+    sess x;
+    sess_open(&x, "r7dead");
+    char p[256];
+    snprintf(p, sizeof p, "%s/r7dead/f.bin", scratch_root);
+    mk_file(p, 4000, 91);
+
+    ntx_share_err e = NTX_SHARE_OK;
+    int ti = ntx_session_share_add(x.s, p, NULL, &e);
+    if (ti < 0 || e != NTX_SHARE_OK) fail("r7dead_add");
+    pm_park(&x, NTX_PM_OFF);
+    /* sess_close frees cfg.store_dir, so the path is kept here for the rename back. */
+    char sd[640], gone[768];
+    snprintf(sd, sizeof sd, "%s", x.cfg.store_dir);
+    snprintf(gone, sizeof gone, "%.600s.gone", sd);
+    (void)rmdir(gone); /* a leftover from a killed run is not a verdict */
+    if (rename(sd, gone) != 0) fail("r7dead_store_rename");
+    (void)pump_until_hashed(&x, ti, 2000, NULL);
+
+    if (ntx_session_share_state(x.s, ti) != NTX_SHARE_FAILED) {
+        printf("ST=%d (want FAILED)\n", (int)ntx_session_share_state(x.s, ti));
+        fail("r7dead_not_failed");
+    }
+    if (x.s->share[ti]->err != NTX_SHARE_E_IO) {
+        printf("CODE=%s (want io)\n", ntx_share_err_code(x.s->share[ti]->err));
+        fail("r7dead_not_io");
+    }
+    if (ntx_session_share_serving(x.s, ti) != 0) fail("r7dead_still_serving");
+
+    /* (1) the UI must not see a live torrent: share 2, phase fail, zeroed ih. */
+    ntx_session_stats_refresh(x.s, 0);
+    ntx_stats st;
+    ntx_session_snapshot(x.s, &st);
+    if (st.n != 1) fail("r7dead_stats_n");
+    if (st.t[ti].share != 2) fail("r7dead_stats_share");
+    if (strcmp(st.t[ti].phase, "fail") != 0) {
+        printf("PHASE=%s (want fail)\n", st.t[ti].phase);
+        fail("r7dead_phase_not_fail");
+    }
+    static const uint8_t zeros[20];
+    if (memcmp(st.t[ti].h, zeros, 20) != 0) {
+        printf("IH=%02x%02x%02x%02x... (want 40 zeros)\n", st.t[ti].h[0], st.t[ti].h[1],
+               st.t[ti].h[2], st.t[ti].h[3]);
+        fail("r7dead_ih_not_zero");
+    }
+    /* the slot itself keeps the real hash: the gate is in the stats output, not
+     * in the data the rest of the session reads. */
+    if (memcmp(x.s->tts[ti].info_hash, zeros, 20) == 0) fail("r7dead_slot_hash_zeroed");
+    /* S04's predicate still refuses to resolve the dead slot by its real hash. */
+    if (sp_match_tts(x.s, x.s->tts[ti].info_hash) >= 0) fail("r7dead_still_matchable");
+
+    /* (2) a scheduled announce must not go out, neither from the periodic tick
+     * nor from the peer-boost path. The three sub-sessions share this tracker, so
+     * every check compares against the count the tracker already holds. */
+    int base = tracker_count(&tr);
+    x.s->trk_next[ti] = 1; /* as if one had been scheduled before the failure */
+    for (int i = 0; i < 60; i++) ntx_session_tick(x.s);
+    ntx_session_trk_tick(x.s);
+    ntx_session_trk_boost_peers(x.s);
+    pump_announces(&x, ti);
+    if (tracker_count(&tr) != base) {
+        printf("REQS=%d PHASE=%s\n", tracker_count(&tr) - base, st.t[ti].phase);
+        printf("TRK[%s]\n", tr.lines);
+        fail("r7dead_announced_after_fail");
+    }
+
+    /* (3) teardown sends no goodbye for a share that never sent `started`. */
+    base = tracker_count(&tr);
+    ntx_session_trk_stop_all(x.s);
+    if (tracker_count(&tr) != base) {
+        printf("STOPREQS=%d TRK[%s]\n", tracker_count(&tr) - base, tr.lines);
+        fail("r7dead_stopped_without_started");
+    }
+    printf("PASS r7dead_failed_share_quiet (phase=%s)\n", st.t[ti].phase);
+
+    /* (4) regression guard: while a share merely HASHES, nothing is announced
+     * either (the happy path of cases 2..5 stays untouched). */
+    sess y;
+    sess_open(&y, "r7hash");
+    snprintf(p, sizeof p, "%s/r7hash/g.bin", scratch_root);
+    mk_file(p, (uint64_t)32 << 20, 92);
+    e = NTX_SHARE_OK;
+    int hi = ntx_session_share_add(y.s, p, NULL, &e);
+    if (hi < 0) fail("r7hash_add");
+    pm_park(&y, NTX_PM_OFF);
+    for (int i = 0; i < 3; i++) ntx_session_tick(y.s);
+    if (ntx_session_share_state(y.s, hi) != NTX_SHARE_HASHING) fail("r7hash_not_hashing");
+    ntx_session_stats_refresh(y.s, 0);
+    ntx_session_snapshot(y.s, &st);
+    if (st.t[hi].share != 1 || strcmp(st.t[hi].phase, "hash") != 0) {
+        printf("HASH share=%u phase=%s\n", (unsigned)st.t[hi].share, st.t[hi].phase);
+        fail("r7hash_phase");
+    }
+    base = tracker_count(&tr);
+    y.s->trk_next[hi] = 1;
+    for (int i = 0; i < 3; i++) ntx_session_tick(y.s);
+    ntx_session_trk_tick(y.s);
+    ntx_session_trk_boost_peers(y.s);
+    pump_announces(&y, hi);
+    if (tracker_count(&tr) != base) {
+        printf("HASHREQS=%d TRK[%s]\n", tracker_count(&tr) - base, tr.lines);
+        fail("r7hash_announced_while_hashing");
+    }
+    for (int k = 0; k < NTX_SESSION_MAX_TRK; k++)
+        if (y.s->trk_http_pending[hi][k] || y.s->trk_udp_pending[hi][k])
+            fail("r7hash_announce_queued_while_hashing");
+    if (ntx_session_share_state(y.s, hi) != NTX_SHARE_HASHING) fail("r7hash_promoted_by_the_tick");
+    ntx_session_remove(y.s, hi);
+    sess_close(&y);
+
+    /* (5) `started` held back for the port map (§5.5) and then a failure: the
+     * goodbye of ntx_session_trk_stop must stay in too — nothing was announced. */
+    sess z;
+    sess_open(&z, "r7pend");
+    snprintf(p, sizeof p, "%s/r7pend/h.bin", scratch_root);
+    mk_file(p, 60000, 93);
+    e = NTX_SHARE_OK;
+    int pi = ntx_session_share_add(z.s, p, NULL, &e);
+    if (pi < 0) fail("r7pend_add");
+    pm_park(&z, NTX_PM_PENDING);
+    (void)pump_until_hashed(&z, pi, 2000, NULL);
+    if (ntx_session_share_state(z.s, pi) != NTX_SHARE_ANNOUNCING) fail("r7pend_not_announcing");
+    if (!z.s->pm || ntx_session_portmap_state(z.s) != NTX_PM_PENDING) fail("r7pend_pm");
+    for (int i = 0; i < 5; i++) {
+        ntx_session_tick(z.s);
+        pump_announces(&z, pi);
+    }
+    base = tracker_count(&tr);
+    if (tracker_count(&tr) != base) fail("r7pend_announced_while_pending");
+    {
+        int fd = open(p, O_WRONLY);
+        if (fd < 0) fail("r7pend_edit_open");
+        uint8_t one = 0x77;
+        if (pwrite(fd, &one, 1, 10) != 1) fail("r7pend_edit_pwrite");
+        close(fd);
+    }
+    ntx_share_test_advance_ms(1500);
+    ntx_session_share_tick(z.s);
+    if (ntx_session_share_state(z.s, pi) != NTX_SHARE_FAILED) fail("r7pend_not_failed");
+    if (tracker_count(&tr) != base) {
+        printf("PENDREQS=%d TRK[%s]\n", tracker_count(&tr) - base, tr.lines);
+        fail("r7pend_stopped_without_started");
+    }
+    ntx_session_trk_stop_all(z.s);
+    if (tracker_count(&tr) != base) {
+        printf("PENDSTOP=%d TRK[%s]\n", tracker_count(&tr) - base, tr.lines);
+        fail("r7pend_stop_all_stopped_without_started");
+    }
+    ntx_session_remove(z.s, pi);
+    sess_close(&z);
+
+    sess_close(&x);
+    if (rename(gone, sd) != 0) fail("r7dead_store_rename_back");
+    tracker_stop(&tr);
+    ok("failed_share_is_dead");
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     scratch_root_init();
@@ -1972,6 +2145,7 @@ int main(void) {
     test_from_serve_io();
     test_edit_during_hash();
     test_trunc_during_hash();
+    test_failed_share_is_dead();
     ntx_share_trackers_test_set(NULL, -1);
     printf("ALL PASS\n");
     return 0;

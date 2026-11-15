@@ -234,6 +234,7 @@ Tags are appended in this order. Counters are capped at 99.
 | `meta` | Downloading metadata (BEP 9). |
 | `verify` | Scanning existing files on disk after a restart. |
 | `hash` | Only with `--share`: the shared file is being hashed (design §5.3). The bar and percentage show hashing progress, not a download. |
+| `fail` | Only with `--share`: the share failed (the `.torrent` could not be written, the file changed, a read failed — `share` = `2` in JSON). The slot announces nothing and accepts no peers; its `ih` in the JSON stats is `40` zeros. |
 | `dl` | Pieces are arriving. |
 | `wait` | At least one peer has unchoked us, nothing has arrived yet. |
 | `choked` | Peers connected but none lets us download. |

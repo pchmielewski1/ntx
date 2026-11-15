@@ -912,6 +912,15 @@ void ntx_session_share_on_remove(struct ntx_session *s, int ti) {
     struct ntx_share_slot *sl = s->share[ti];
     if (!sl) return;
     int was_hashing = sl->st == NTX_SHARE_HASHING;
+    /* R7 (§5.5): the tracker list of a share belongs to the share, so a share
+     * that never had its `started` answered takes that list with it — the
+     * ntx_session_trk_stop() that ntx_session_remove calls right after this
+     * would otherwise send a goodbye with the real hash for a swarm this slot
+     * was never in. trk_started_ok is read here because share_free_slot clears it.
+     * ponytail: ceiling = this borrows trk_n to say "never announced", which only
+     * works because the slot dies next. Upgrade path: keep a per-slot
+     * `trk_announced` flag on ntx_session and let trk_stop_one read that. */
+    if (!ntx_session_share_serving(s, ti) && !s->trk_started_ok[ti]) s->trk_n[ti] = 0;
     share_free_slot(s, ti); /* drops the queued event too (§13 focus 2) */
     if (was_hashing) {
         /* Nothing was announced and nothing may be: trk_stop only fires for

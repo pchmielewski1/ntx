@@ -137,6 +137,14 @@ static void stats_fill_phase(struct ntx_session *s, int i, ntx_tts_stat *tt, uin
         phase = "hash";
         tt->pct = ntx_session_share_pct(s, i);
     }
+    /* R7 (design §5.5): a share that failed after share_finish published its
+     * metainfo keeps the real hash on the slot, so without this it reads as a
+     * live seed — phase "trk-wait", pct 100, its hash in `ih`. The slot keeps
+     * the hash; only what the UI is shown says "fail" and shows no hash. */
+    if (sh == NTX_SHARE_FAILED) {
+        phase = "fail";
+        memset(tt->h, 0, sizeof tt->h);
+    }
     snprintf(tt->phase, sizeof tt->phase, "%s", phase);
 }
 
