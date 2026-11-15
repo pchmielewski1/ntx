@@ -114,6 +114,18 @@ static void ck_eq(long got, long want, const char *what) {
 #define PCP_MRT_MS 1024000u /* RFC 6887 §8.1.1 maximum retransmission timeout */
 #define NATPMP_IRT_MS 250u /* RFC 6886 §3.1 initial interval, doubled, nine sends */
 
+/* The gateway's own verdicts, spelled out rather than read from the driver: a test
+ * that asked the codec which codes mean "no" could not fail when the codec treated
+ * them as silence (R14). PCP numbering is RFC 6887 §7.4, NAT-PMP's RFC 6886 §3.5. */
+#define PCP_RES_NOT_AUTHORIZED 2u
+#define PCP_RES_NETWORK_FAILURE 7u
+#define PCP_RES_NO_RESOURCES 8u
+#define PCP_RES_USER_EX_QUOTA 10u
+#define NATPMP_RES_NOT_AUTHORIZED 2u
+#define NATPMP_RES_NETWORK_FAILURE 3u
+#define NATPMP_RES_OUT_OF_RESOURCES 4u
+#define NATPMP_RES_UNSUPP_OPCODE 5u
+
 static char *read_all(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return NULL;
@@ -398,6 +410,52 @@ static void pm_check_jitter(sess *x, uint32_t ms, const char *tag) {
         printf("FAIL %s_no_jitter all=%ld\n", tag, first);
         fails++;
     }
+}
+
+/* How many datagrams the driver sends over steps × step_ms of clock. A refusal has
+ * to stop the schedule instead of replaying the whole nine-send schedule against a
+ * gateway that already said no, so the cases below count on the wire (R14). */
+static int pm_sends_in(sess *x, uint64_t step_ms, int steps) {
+    uint8_t buf[2048];
+    int n = 0;
+    for (int i = 0; i < steps; i++) {
+        ntx_portmap_test_advance_ms(step_ms);
+        pm_tick(x);
+        pump_ms(x->n, 10);
+        while (gw_get(buf, sizeof buf) >= 0) n++;
+    }
+    return n;
+}
+
+/* One PCP MAP error reply, 24 B: the response header of RFC 6887 §7.2 with the R
+ * bit and opcode MAP set, the result code in octet 3 and the error lifetime in
+ * octets 4..7 — and no opcode data, which §7.4 allows an error to omit. This is
+ * the form the codec used to throw away as "too short" (R14). */
+static void pcp_err24(uint8_t out[24], uint32_t res, uint32_t lifetime) {
+    memset(out, 0, 24);
+    out[0] = 2;
+    out[1] = 0x81;
+    out[3] = (uint8_t)res;
+    out[4] = (uint8_t)(lifetime >> 24);
+    out[5] = (uint8_t)(lifetime >> 16);
+    out[6] = (uint8_t)(lifetime >> 8);
+    out[7] = (uint8_t)lifetime;
+}
+
+/* Put the driver into NAT-PMP mode with the TCP mapping query outstanding, the way
+ * a v1-only gateway is reached: the UNSUPP_VERSION answer, then the reply to the
+ * external-address query. Returns the length of the mapping request on the wire. */
+static int gw_to_natpmp_map(sess *x, uint8_t *req, size_t cap) {
+    const uint8_t unsupp[4] = {0, 0, 0, 1}; /* Vers 0, OP 0, Result 1 = UNSUPP_VERSION */
+    if (gw_wait(req, cap, 300) != 60) return -1;
+    gw_send(unsupp, sizeof unsupp);
+    pump_ms(x->n, 40);
+    if (gw_wait(req, cap, 300) != 2) return -1;
+    uint8_t aresp[12];
+    natpmp_addr_resp(aresp, 203, 0, 113, 9);
+    gw_send(aresp, sizeof aresp);
+    pump_ms(x->n, 40); /* the driver only reads the reply when the loop runs */
+    return (int)gw_wait(req, cap, 300);
 }
 
 /* One retransmission: nothing may go out before the scheduled instant, and the
@@ -1043,7 +1101,15 @@ int main(void) {
         sess_close(&x);
     }
 
-    /* ---- M. definitive non-success: no grant, and no immediate resend (§8.3) ---- */
+    /* ---- M. a datagram that carries no verdict at all: no grant, no immediate
+     * resend, and the retransmission schedule continues (§8.3).
+     *
+     * This case used to answer with result 7 (NETWORK_FAILURE) and then pin the
+     * driver retransmitting the query eight more times, i.e. it pinned the very
+     * behaviour review §6 / R14 calls the defect: a refusal the gateway stated
+     * outright was indistinguishable from silence. The pacing probe now rides a
+     * reply that is not an answer (opcode PEER, not MAP), which is the one thing
+     * that legitimately leaves the schedule running. The refusals are M2..M7. ---- */
     {
         sess x;
         sess_open(&x, "m");
@@ -1054,7 +1120,7 @@ int main(void) {
         uint8_t pub[16];
         pcp_v4(pub, 203, 0, 113, 9);
         pcp_resp(rsp, req, EXT_PORT, pub, 7200, 7);
-        rsp[3] = 7; /* NETWORK_FAILURE: the codec folds it to "not a grant" */
+        rsp[1] = 0x82; /* R set, opcode PEER: not an answer to a MAP query */
         gw_send(rsp, 60);
         pump_ms(x.n, 120); /* two real ticks */
         pm_tick(&x);
@@ -1069,6 +1135,272 @@ int main(void) {
          * the wire in case D, where nothing consumes real time around the send. */
         ck_eq(x.s->pm->gap, 2u * PCP_IRT_MS, "M_resend_schedule");
         ck(pm_send_at_due(&x), "M_resend_on_schedule");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- M2. PCP NOT_AUTHORIZED as a 24 B result-only error (R14).
+
+     * RFC 6887 §7.2 puts the verdict in the common header, which an error reply may
+     * carry on its own. Pre-fix the codec demanded the whole 60 B MAP reply before it
+     * would read octet 3, so this refusal was indistinguishable from silence: the
+     * driver replayed the nine-send schedule (~128 s of PCP) against a gateway that
+     * had already said no, and the state stayed `pending`. Pre-fix failure:
+     * M2_no_further_resend got=8 want=0, M2_none got=1 want=3, and the result code
+     * is absent from the verbose log. ---- */
+    {
+        char diagpath[256];
+        snprintf(diagpath, sizeof diagpath, "%s/diag_m2.log", SCRATCH);
+        unlink(diagpath);
+        ck_eq(ntx_diag_open(diagpath), 0, "M2_diag_capture");
+        sess x;
+        sess_open(&x, "m2");
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t req[2048], err[24];
+        ck_eq(gw_wait(req, sizeof req, 300), 60, "M2_request");
+        pcp_err24(err, PCP_RES_NOT_AUTHORIZED, 1800);
+        gw_send(err, sizeof err);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "M2_none");
+        ck_eq(x.s->pm->phase, -1, "M2_nothing_outstanding");
+        ck_eq(x.s->pm->tries, 0, "M2_no_retries");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "M2_none_adv_port");
+        ck_eq(pm_sends_in(&x, 60000, 6), 0, "M2_no_further_resend");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        char *text = read_all(diagpath);
+        ck(text && strstr(text, "NOT_AUTHORIZED") && strstr(text, "2"), "M2_verbose_result_code");
+        free(text);
+        ntx_diag_close();
+    }
+
+    /* ---- M3. PCP NOT_AUTHORIZED in a full 60 B MAP reply (R14).
+
+     * The other half of the same defect: the reply is long enough to parse and the
+     * result octet is non-zero, which pre-fix the codec folded to "no reply" as well
+     * (`result != SUCCESS` → -1). Same verdict as M2 — pre-fix: still retransmitting
+     * (got=8 want=0) and the state stays `pending`. ---- */
+    {
+        sess x;
+        sess_open(&x, "m3");
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t req[2048], rsp[64];
+        ck_eq(gw_wait(req, sizeof req, 300), 60, "M3_request");
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pcp_resp(rsp, req, EXT_PORT, pub, 1800, 7);
+        rsp[3] = PCP_RES_NOT_AUTHORIZED;
+        gw_send(rsp, 60);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "M3_none");
+        ck_eq(x.s->pm->phase, -1, "M3_nothing_outstanding");
+        ck_eq(pm_sends_in(&x, 60000, 6), 0, "M3_no_further_resend");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- M4. USER_EX_QUOTA and UNSUPP_OPCODE are definitive too (R14).
+
+     * Both arrive as 24 B result-only errors; neither may leave the schedule running. ---- */
+    {
+        static const uint32_t res[] = {PCP_RES_USER_EX_QUOTA, 4u /* UNSUPP_OPCODE */};
+        for (int i = 0; i < 2; i++) {
+            sess x;
+            sess_open(&x, "m4");
+            x.cfg.port_map = 1;
+            pm_start(&x);
+            uint8_t req[2048], err[24];
+            ck_eq(gw_wait(req, sizeof req, 300), 60, "M4_request");
+            pcp_err24(err, res[i], 1800);
+            gw_send(err, sizeof err);
+            pump_ms(x.n, 40);
+            pm_tick(&x);
+            ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "M4_none");
+            ck_eq(pm_sends_in(&x, 60000, 6), 0, "M4_no_further_resend");
+            ntx_session_portmap_stop(x.s);
+            sess_close(&x);
+        }
+    }
+
+    /* ---- M5. NAT-PMP opcode-128 refusals end the schedule (R14).
+
+     * RFC 6886 §3.5: 2 Not Authorized, 3 Network Failure, 4 Out of resources, 5
+     * Unsupported opcode. 3 and 4 are the retryable pair (M7/M8); with lifetime 0
+     * every one of them is final, and 2 and 5 are final whatever the lifetime says.
+     * Pre-fix the codec returned -1 for all of them, so all four replayed the nine
+     * NAT-PMP sends and the state stayed `pending`. ---- */
+    {
+        static const struct {
+            uint16_t res;
+            const char *tag;
+        } cases[] = {
+            {NATPMP_RES_NOT_AUTHORIZED, "m5a"},
+            {NATPMP_RES_NETWORK_FAILURE, "m5b"},
+            {NATPMP_RES_UNSUPP_OPCODE, "m5c"},
+            {NATPMP_RES_OUT_OF_RESOURCES, "m5d"},
+        };
+        for (int i = 0; i < 4; i++) {
+            sess x;
+            sess_open(&x, cases[i].tag);
+            x.cfg.port_map = 1;
+            pm_start(&x);
+            uint8_t req[2048], rsp[16];
+            int n = gw_to_natpmp_map(&x, req, sizeof req);
+            ck_eq(n, 12, "M5_natpmp_map_request");
+            natpmp_map_resp(rsp, 2, (uint16_t)ntx_netx_port(x.n), 0, 0);
+            rsp[2] = 0;
+            rsp[3] = (uint8_t)cases[i].res;
+            gw_send(rsp, sizeof rsp);
+            pump_ms(x.n, 40);
+            pm_tick(&x);
+            ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "M5_none");
+            ck_eq(x.s->pm->phase, -1, "M5_nothing_outstanding");
+            ck_eq(pm_sends_in(&x, 60000, 4), 0, "M5_no_further_resend");
+            ntx_session_portmap_stop(x.s);
+            sess_close(&x);
+        }
+    }
+
+    /* ---- M6. a refused sequence stays refused: the state is final (R14).
+
+     * Nothing may come back to life after a definitive refusal, not through the
+     * clock and not through a tick: the schedule is over, not paused. ---- */
+    {
+        sess x;
+        sess_open(&x, "m6");
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t req[2048], err[24];
+        ck_eq(gw_wait(req, sizeof req, 300), 60, "M6_request");
+        pcp_err24(err, PCP_RES_NOT_AUTHORIZED, 1800);
+        gw_send(err, sizeof err);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck_eq(pm_sends_in(&x, 600000, 12), 0, "M6_final_for_two_hours");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "M6_stays_none");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- M7. NO_RESOURCES carries a retry-after: one attempt, never sooner than
+     * 60 s (R14).
+
+     * RFC 6887 §7.4 calls NO_RESOURCES and NETWORK_FAILURE short-lifetime errors and
+     * §8 says the same request may succeed later, so the schedule stops (no replay of
+     * the nine sends) and exactly one further attempt is made after the lifetime the
+     * reply itself names. lifetime 120 → nothing before 120 s, one at 120 s; the
+     * lifetime is never allowed to hurry the driver below 60 s, and lifetime 0 means
+     * the gateway offered no retry at all. Pre-fix: eight sends in the 0..119 s window
+     * and no single deferred attempt at 120 s. ---- */
+    {
+        sess x;
+        sess_open(&x, "m7");
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t req[2048], err[24];
+        ck_eq(gw_wait(req, sizeof req, 300), 60, "M7_request");
+        pcp_err24(err, PCP_RES_NO_RESOURCES, 120);
+        gw_send(err, sizeof err);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "M7_none_while_waiting");
+        ck_eq(pm_sends_in(&x, 30000, 3), 0, "M7_quiet_before_120s"); /* 0..90 s */
+        ck_eq(pm_sends_in(&x, 29000, 1), 0, "M7_still_quiet_at_119s");
+        ck_eq(pm_sends_in(&x, 2000, 1), 1, "M7_one_retry_after_lifetime");
+        /* The retry is a real query again, so its own schedule runs from there. */
+        ck_eq(x.s->pm->phase, PM_PH_TCP, "M7_retry_outstanding");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "M7_retry_pending");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+    {
+        /* The 60 s floor: a lifetime of 10 s must not buy a retry at 10 s. */
+        sess x;
+        sess_open(&x, "m7b");
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t req[2048], err[24];
+        ck_eq(gw_wait(req, sizeof req, 300), 60, "M7b_request");
+        pcp_err24(err, PCP_RES_NETWORK_FAILURE, 10);
+        gw_send(err, sizeof err);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck_eq(pm_sends_in(&x, 29000, 2), 0, "M7b_quiet_below_60s_floor"); /* 0..58 s */
+        ck_eq(pm_sends_in(&x, 3000, 1), 1, "M7b_retry_at_the_floor");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+    {
+        /* lifetime 0 in the reply = the gateway named no retry: `none` is final. */
+        sess x;
+        sess_open(&x, "m7c");
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t req[2048], err[24];
+        ck_eq(gw_wait(req, sizeof req, 300), 60, "M7c_request");
+        pcp_err24(err, PCP_RES_NO_RESOURCES, 0);
+        gw_send(err, sizeof err);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "M7c_none");
+        ck_eq(pm_sends_in(&x, 60000, 12), 0, "M7c_lifetime0_no_retry");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- M8. NAT-PMP "Out of resources" with a lifetime: same one deferred
+     * attempt (RFC 6886 §3.5 codes 3 and 4 are the retryable pair). ---- */
+    {
+        sess x;
+        sess_open(&x, "m8");
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t req[2048], rsp[16];
+        ck_eq(gw_to_natpmp_map(&x, req, sizeof req), 12, "M8_natpmp_map_request");
+        natpmp_map_resp(rsp, 2, (uint16_t)ntx_netx_port(x.n), 0, 300);
+        rsp[3] = NATPMP_RES_OUT_OF_RESOURCES;
+        gw_send(rsp, sizeof rsp);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "M8_none_while_waiting");
+        ck_eq(pm_sends_in(&x, 55000, 4), 0, "M8_quiet_before_300s"); /* 0..220 s */
+        ck_eq(pm_sends_in(&x, 90000, 1), 1, "M8_one_retry_after_lifetime"); /* → 310 s */
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- M9. a deferred retry must not stall the renewal of a grant we hold
+     * (R14, the fall-through in the tick).
+
+     * The one attempt a NO_RESOURCES promised is pending until the wait it names.
+     * While we wait, a mapping that IS active still has its renew window, and losing
+     * it costs the grant: the gateway drops it at the end of its lifetime. So the
+     * wait has to fall through to the renewals, not return. Pre-fix the tick bailed
+     * out on the pending retry and the TCP renewal never went out. ---- */
+    {
+        sess x;
+        sess_open(&x, "m9");
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "M9_active");
+        gw_drain();
+        /* A retryable refusal on the UDP query, deferred to the lifetime it names. */
+        x.s->pm->retry_ph = PM_PH_UDP;
+        x.s->pm->retried = 1; /* the one allowed attempt is already spent: nothing to send */
+        x.s->pm->retry_at = pm_now() + 7200000u; /* due long after the renew window */
+        ntx_portmap_test_advance_ms(3601000); /* past the TCP renew window */
+        pm_tick(&x);
+        uint8_t req[2048];
+        ck_eq(gw_get(req, sizeof req), 60, "M9_renew_not_stalled");
+        ck(req_is(req, 60, NTX_PCP_PROTO_TCP, 7200), "M9_renew_is_tcp");
+        ck_eq(x.s->pm->retry_ph, PM_PH_UDP, "M9_retry_still_pending");
         ntx_session_portmap_stop(x.s);
         sess_close(&x);
     }

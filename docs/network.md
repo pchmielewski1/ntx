@@ -699,16 +699,25 @@ blocking calls.
   read from `/proc/net/route` (and `/proc/net/ipv6_route`), and the socket is `connect()`ed to
   it. A datagram is fed to the parsers **only** when it comes from that gateway address — the
   LAN side is the one place `ntx` accepts unsolicited UDP.
-- **Strictness.** The parser accepts a reply only when the length, version, opcode, R bit,
-  nonce, protocol and internal port all match the request; a result code other than `SUCCESS`
-  is a failure, so a mapping is only what a grant says. Nothing past the declared length is
+- **Strictness.** The parser accepts a grant only when the length, version, opcode, R bit,
+  nonce, protocol and internal port all match the request. Nothing past the declared length is
   read. The server's lifetime is taken verbatim and then capped by the driver (RFC 6887 §8.3).
-- **Retransmission and lifetime.** Nine sends per query at most, with the pacing each
-  protocol specifies: PCP starts at IRT 3 s and doubles up to MRT 1024 s, every interval
-  jittered by ±10% (RFC 6887 §8.1.1, `PM_PCP_IRT_MS` / `PM_PCP_MRT_MS`); NAT-PMP starts at
-  250 ms and doubles, no jitter, so its nine sends end at 64 s (RFC 6886 §3.1,
-  `PM_NATPMP_IRT_MS`). A grant is requested for 7200 s and renewed at half the granted
-  lifetime. A PCP epoch rollback resets the state. On exit `ntx_session_portmap_stop()`
+- **A refusal is an answer, not silence (R14).** The parsers hand the gateway's own result code
+  back to the driver, read from the 24 B common header alone (RFC 6887 §7.2), so a result-only
+  error reply is a verdict. A definitive refusal — `NOT_AUTHORIZED`, `USER_EX_QUOTA`,
+  `UNSUPP_OPCODE`/`UNSUPP_OPTION`/`MALFORMED_OPTION`/`UNSUPP_PROTOCOL`/`CANNOT_PROVIDE_EXTERNAL`/
+  `ADDRESS_MISMATCH`/`EXCESSIVE_REMOTE_PEERS`, NAT-PMP 2/3 — ends the schedule immediately: the
+  state becomes `none` and no further datagram goes out, exactly as if the gateway had never
+  answered. `NO_RESOURCES` and `NETWORK_FAILURE` are the RFC 6887 §7.4 / RFC 6886 §3.5 "ask again
+  later" pair: the schedule stops too, but one further attempt goes out after the wait the reply's
+  own Lifetime names, never sooner than 60 s (`PM_RETRY_MIN_S`) and at most once per sequence.
+  `UNSUPP_VERSION` keeps the PCP → NAT-PMP fallback step. The code is printed under `--verbose`.
+- **Retransmission and lifetime.** Nine sends per query at most — reached only against a gateway
+  that says nothing, with the pacing each protocol specifies: PCP starts at IRT 3 s and doubles up
+  to MRT 1024 s, every interval jittered by ±10% (RFC 6887 §8.1.1, `PM_PCP_IRT_MS` /
+  `PM_PCP_MRT_MS`); NAT-PMP starts at 250 ms and doubles, no jitter, so its nine sends end at 64 s
+  (RFC 6886 §3.1, `PM_NATPMP_IRT_MS`). A grant is requested for 7200 s and renewed at half the
+  granted lifetime. A PCP epoch rollback resets the state. On exit `ntx_session_portmap_stop()`
   sends lifetime-0 delete requests, bounded in time like the `stopped` announces.
 - **A share does not wait for the gateway.** A `pending` mapping holds the `started`
   announce (design §5.5) for at most `NTX_PM_SHARE_SETTLE_MS` (4 s): after that the announce

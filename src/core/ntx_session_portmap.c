@@ -35,6 +35,11 @@
 #define PM_NATPMP_IRT_MS 250u   /* RFC 6886 §3.1 initial interval */
 #define PM_MAX_TRIES 9u         /* nine sends per query, both families */
 #define PM_RX_BUDGET 8          /* datagrams handled per read callback */
+/* RFC 6887 §7.4 calls NO_RESOURCES and NETWORK_FAILURE short-lifetime errors and
+ * §8 says the same request may succeed later; the reply names that wait in its own
+ * Lifetime field. The wait is honoured, but never taken below this floor — a gateway
+ * handing out lifetime 0 would otherwise buy a tight retry loop. */
+#define PM_RETRY_MIN_S 60u
 
 /* One outstanding query at a time, in this order. The NAT-PMP external-address
  * query exists only in the fallback: it is how CGNAT is found without PCP. */
@@ -70,6 +75,9 @@ struct ntx_portmap {
     uint32_t epoch;
     int epoch_seen;            /* 0 until the first PCP answer: no baseline */
     int fallback_used;    /* the one PCP → NAT-PMP step of this sequence is spent (R9) */
+    int retry_ph;         /* query the gateway told us to ask for again, -1 = none (R14) */
+    uint64_t retry_at;    /* virtual ms that retry may go out (never sooner than PM_RETRY_MIN_S) */
+    int retried;          /* the one deferred retry of this sequence is spent (R14) */
 };
 
 /* Process globals because the test hooks take no session. Production never sets
@@ -222,6 +230,7 @@ static struct ntx_portmap *pm_alloc(struct ntx_session *s) {
     if (!pm) return NULL;
     pm->fd = -1;
     pm->phase = -1;
+    pm->retry_ph = -1;
     pm->netx = s->netx;
     pm->cfg = s->cfg;
     s->pm = pm;
@@ -254,6 +263,9 @@ static void pm_reset(struct ntx_portmap *pm, ntx_pm_state st) {
     pm->addr_done = 0;
     pm->epoch_seen = 0;
     pm->fallback_used = 0; /* the PCP → NAT-PMP step is per sequence, not per process (R9) */
+    pm->retry_ph = -1;
+    pm->retry_at = 0;
+    pm->retried = 0;
     pm->st = st;
 }
 
@@ -308,6 +320,62 @@ static int pm_drain_err(struct ntx_portmap *pm) {
 
 static void pm_start_query(struct ntx_portmap *pm, int phase, uint16_t sugg_port);
 static void pm_give_up_phase(struct ntx_portmap *pm, int ph);
+
+/* The gateway's verdicts, named for --verbose only (R14): the number is what the
+ * gateway sent and is always printed, the name is convenience. One line per refusal,
+ * and a refusal ends the sequence, so this cannot repeat the way a retry loop does.
+ * RFC 6887 §7.4 and RFC 6886 §3.5. */
+static const char *const pm_pcp_result_name[] = {
+    "SUCCESS", "UNSUPP_VERSION", "NOT_AUTHORIZED", "MALFORMED_REQUEST", "UNSUPP_OPCODE",
+    "UNSUPP_OPTION", "MALFORMED_OPTION", "NETWORK_FAILURE", "NO_RESOURCES", "UNSUPP_PROTOCOL",
+    "USER_EX_QUOTA", "CANNOT_PROVIDE_EXTERNAL", "ADDRESS_MISMATCH", "EXCESSIVE_REMOTE_PEERS"
+};
+static const char *const pm_natpmp_result_name[] = {
+    "SUCCESS", "UNSUPP_VERSION", "NOT_AUTHORIZED", "NETWORK_FAILURE", "OUT_OF_RESOURCES",
+    "UNSUPP_OPCODE"
+};
+
+static void pm_diag_result(int fam, uint32_t res) {
+    static const char *const *t = NULL;
+    size_t n = 0;
+    if (fam == PM_PCP) {
+        t = pm_pcp_result_name;
+        n = sizeof pm_pcp_result_name / sizeof pm_pcp_result_name[0];
+    } else {
+        t = pm_natpmp_result_name;
+        n = sizeof pm_natpmp_result_name / sizeof pm_natpmp_result_name[0];
+    }
+    ntx_diag("ntx: port map: %s result %u %s\n", fam == PM_PCP ? "PCP" : "NAT-PMP", res,
+             res < n ? t[res] : "UNKNOWN");
+}
+
+/* The two codes per family that mean "not now, the same request may work later" —
+ * RFC 6887 §7.4 NO_RESOURCES / NETWORK_FAILURE, RFC 6886 §3.5 out-of-resources /
+ * network-failure. Every other verdict the gateway states is final for this run. */
+static int pm_result_retryable(int fam, uint32_t res) {
+    if (fam == PM_PCP) return res == NTX_PCP_RES_NETWORK_FAILURE || res == NTX_PCP_RES_NO_RESOURCES;
+    return res == NTX_NATPMP_RES_NETWORK_FAILURE || res == NTX_NATPMP_RES_OUT_OF_RESOURCES;
+}
+
+/* The gateway answered the outstanding query with a verdict that is not a grant
+ * (R14). The schedule stops in both cases — nine more datagrams at a gateway that
+ * already refused say nothing new — and the difference is only in the future: the
+ * retryable pair gets exactly one further attempt after the wait the reply itself
+ * names (RFC 6887 §7.4, §8; RFC 6886 §3.5), never sooner than PM_RETRY_MIN_S, and a
+ * lifetime of 0 means the gateway named no retry at all. Everything else is final:
+ * the state says none and the tick stays quiet, exactly as for a gateway that never
+ * answered, so the sequence is not reopened behind the gateway's back. */
+static void pm_refused_result(struct ntx_portmap *pm, int ph, uint32_t res, uint32_t life_s) {
+    pm->phase = -1;
+    pm->tries = 0;
+    pm_diag_result(pm->fam, res);
+    pm_give_up_phase(pm, ph);
+    if (!pm_result_retryable(pm->fam, res) || life_s == 0 || pm->retried) return;
+    uint64_t wait_s = life_s < PM_RETRY_MIN_S ? PM_RETRY_MIN_S : life_s;
+    pm->retry_ph = ph;
+    pm->retry_at = pm_now() + wait_s * 1000u;
+    pm->gave_up = 0; /* the tick is what sends the one deferred attempt */
+}
 
 /* Nothing at the gateway port answered at all (R9). §8 keeps the order PCP first,
  * NAT-PMP second; the step is allowed once per sequence and never backwards, so a
@@ -417,6 +485,8 @@ static void pm_lost(struct ntx_portmap *pm) {
     pm_clear_grants(pm);
     for (int i = 0; i < PM_NPH; i++) pm->failed[i] = 0;
     pm->gave_up = 0;
+    pm->retry_ph = -1; /* a fresh sequence supersedes any deferred retry (R14) */
+    pm->retried = 0;
     pm->phase = -1;
     pm->tries = 0;
     pm->st = NTX_PM_PENDING;
@@ -452,6 +522,10 @@ static void pm_rx(struct ntx_portmap *pm, const uint8_t *b, size_t n) {
             pm->fam = PM_NATPMP;
             pm->addr_done = 0;
             pm_start_query(pm, PM_PH_ADDR, 0);
+            return;
+        }
+        if (rc > 1) { /* the gateway stated a verdict: not a grant (R14) */
+            pm_refused_result(pm, ph, (uint32_t)rc, r.lifetime);
             return;
         }
         if (rc != 0) return; /* -1 garbage, -2 not an answer to our query */
@@ -494,7 +568,12 @@ static void pm_rx(struct ntx_portmap *pm, const uint8_t *b, size_t n) {
 
     uint16_t ext = 0;
     uint32_t life = 0;
-    if (natpmp_parse_map(b, n, pm_op_of(ph), pm->iport, &ext, &life) != 0) return;
+    int rc = natpmp_parse_map(b, n, pm_op_of(ph), pm->iport, &ext, &life);
+    if (rc > 1) { /* the gateway stated a verdict: not a grant (R14) */
+        pm_refused_result(pm, ph, (uint32_t)rc, life);
+        return;
+    }
+    if (rc != 0) return;
     life = pm_cap_life(life);
     if (life == 0) {
         pm_lost(pm);
@@ -650,6 +729,25 @@ void ntx_session_portmap_tick(struct ntx_session *s) {
         return;
     }
     if (pm->gave_up) return;
+
+    /* The single deferred retry a retryable refusal promised (R14). It goes out at
+     * most once per sequence and the schedule restarts behind it, so a gateway that
+     * keeps saying NO_RESOURCES is met by one datagram per wait it names. */
+    if (pm->retry_ph >= 0) {
+        int ph = pm->retry_ph;
+        /* Not yet due: fall through to the renewals below — a deferred retry for
+         * one phase must not stall the renew window of a grant we already hold. */
+        if (now >= pm->retry_at) {
+            pm->retry_ph = -1;
+            int first = !pm->retried;
+            pm->retried = 1;
+            pm->failed[ph] = 0;
+            if (ph != PM_PH_UDP) pm->failed[PM_PH_UDP] = 0;
+            if (first && pm->st != NTX_PM_ACTIVE) pm->st = NTX_PM_PENDING;
+            pm_start_query(pm, ph, ph == PM_PH_ADDR ? 0 : pm->ext[ph]);
+            return;
+        }
+    }
 
     for (int i = 0; i < PM_NPH; i++)
         if (pm->active[i] && !pm->failed[i] && now >= pm->renew_at[i]) {

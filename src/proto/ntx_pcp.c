@@ -81,20 +81,35 @@ int pcp_parse_map(const uint8_t *b, size_t n, const uint8_t nonce[12], uint8_t p
     if (b[0] == 0)
         return (n >= 4 && pcp_get16(b + 2) == PCP_RESULT_UNSUPP_VERSION) ? 1 : -1;
 
+    /* Only the 24 B common header (RFC 6887 §7.2) is needed for a verdict: the
+     * Result Code is octet 3 and the retry-after Lifetime is octets 4..7, so an
+     * error reply that carries no MAP data is still the gateway answering — it
+     * must not look like silence (R14). Reading the result below is therefore
+     * gated on the header, not on the 60 B of a successful MAP reply. */
     if (b[0] != PCP_VERSION) return -1;
-    if (n < PCP_MAP_LEN || n > PCP_MAX_LEN || (n & 3) != 0) return -1;
+    if (n < PCP_HDR_LEN || n > PCP_MAX_LEN || (n & 3) != 0) return -1;
     if (b[1] != (0x80 | PCP_OPCODE_MAP)) return -1;  /* R set, opcode MAP */
 
     uint8_t result = b[3];
     if (result == PCP_RESULT_UNSUPP_VERSION) return 1;
-    if (result != PCP_RESULT_SUCCESS) return -1;     /* only SUCCESS grants a mapping */
 
-    if (memcmp(b + PCP_MAP_NONCE, nonce, 12) != 0) return -2;
-    if (b[PCP_MAP_PROTO] != proto) return -2;
-    if (pcp_get16(b + PCP_MAP_INT_PORT) != int_port) return -2;
+    /* The 36 B of MAP data (§11.1 fig. 10) are what a reply can be matched against,
+     * and §7.3 has an error reply copy the request, so when they are present they
+     * must still identify our query. Without them there is nothing to mismatch: the
+     * source test in the driver is what says this came from the gateway. SUCCESS
+     * without that data grants nothing that can be used — the external port and
+     * address live in it. */
+    if (n >= PCP_MAP_LEN) {
+        if (memcmp(b + PCP_MAP_NONCE, nonce, 12) != 0) return -2;
+        if (b[PCP_MAP_PROTO] != proto) return -2;
+        if (pcp_get16(b + PCP_MAP_INT_PORT) != int_port) return -2;
+    } else if (result == PCP_RESULT_SUCCESS) return -1;
 
+    /* The gateway's own verdict, and the wait it asks for (RFC 6887 §7.4). The
+     * fields of a grant stay unspecified on an error return. */
     r->result = result;
     r->lifetime = pcp_get32(b + 4);
+    if (result != PCP_RESULT_SUCCESS) return (int)result;
     r->epoch = pcp_get32(b + 8);
     r->ext_port = pcp_get16(b + PCP_MAP_EXT_PORT);
     memcpy(r->ext_ip16, b + PCP_MAP_EXT_IP, 16);
@@ -138,7 +153,15 @@ int natpmp_parse_map(const uint8_t *b, size_t n, uint8_t op, uint16_t int_port,
         (op != PCP_NATPMP_OP_UDP && op != PCP_NATPMP_OP_TCP) ||
         b[1] != (uint8_t)(128 + op))
         return -1;
-    if (pcp_get16(b + 2) != PCP_RESULT_SUCCESS) return -1;
+    uint16_t result = pcp_get16(b + 2);
+    if (result != PCP_RESULT_SUCCESS) {
+        /* §3.3 puts the result and the lifetime in the same reply, so an error
+         * still says when to try again: hand both to the driver instead of
+         * calling a stated refusal silence (R14). The internal port is checked
+         * only for a grant — an error reply leaves it undefined in practice. */
+        *lifetime = pcp_get32(b + 12);
+        return (int)result;
+    }
     if (pcp_get16(b + 8) != int_port) return -1;
     *ext_port = pcp_get16(b + 10);
     *lifetime = pcp_get32(b + 12);

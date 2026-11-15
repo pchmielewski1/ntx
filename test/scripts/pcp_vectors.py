@@ -14,8 +14,12 @@ Verdicts the C test asserts (the contract of ntx_pcp.c):
   pcp_build_map / natpmp_build_addr / natpmp_build_map -> bytes == "hex"
   pcp_parse_map     -> 0 ok | -1 short/garbage | -2 nonce/proto/port mismatch
                        | 1 UNSUPP_VERSION (NAT-PMP fallback)
+                       | any other result code of §7.4, returned verbatim, so the
+                       driver can tell a stated refusal from silence (R14)
   natpmp_parse_addr -> 0 ok | -1 anything else
   natpmp_parse_map  -> 0 ok | -1 anything else
+                       | the §3.5 result code of a refusal, verbatim, and the
+                       lifetime the refusal names (R14)
 """
 import hashlib
 import ipaddress
@@ -172,10 +176,43 @@ def cases():
             "R bit clear — a request, not a response")
     garbage("map_resp_bad_opcode", good[:1] + bytes([0x82]) + good[2:],
             "R set but opcode 2 (PEER), not MAP")
-    garbage("map_resp_bad_result",
-            pcp_resp(7, 30, EPOCHW,
-                     pcp_map_resp_data(NONCE, 6, INT_PORT, SUGG_PORT, bytes(16))),
-            "result 7 NETWORK_FAILURE is not a mapping — only 0 and 1 are accepted", 7)
+    # An error reply is the gateway answering, not silence (R14): the parser hands
+    # the §7.4 code back verbatim, and with it the Lifetime the reply names.
+    add("map_resp_bad_result", "parse_pcp_map",
+        pcp_resp(7, 30, EPOCHW,
+                 pcp_map_resp_data(NONCE, 6, INT_PORT, SUGG_PORT, bytes(16))),
+        "result 7 NETWORK_FAILURE is not a mapping, but it is a verdict",
+        nonce=NONCE.hex(), proto=6, int_port=INT_PORT, ext_port=-1, ext_ip="",
+        lifetime=30, epoch=-1, result=7, expect=7)
+
+    def err24(name, result, lifetime, note):
+        """RFC 6887 §7.2: the verdict needs only the 24 B common header — Result
+        Code in octet 3, the retry-after in octets 4..7, no opcode data."""
+        msg = struct.pack(">BBBB", 2, 0x80 | OPCODE_MAP, 0, result)
+        msg += struct.pack(">I", lifetime) + EPOCHW + bytes(12)
+        assert len(msg) == 24
+        add(name, "parse_pcp_map", msg, note,
+            nonce=NONCE.hex(), proto=6, int_port=INT_PORT, ext_port=-1, ext_ip="",
+            lifetime=lifetime, epoch=-1, result=result, expect=result)
+
+    err24("map_resp_err24_not_authorized", 2, 1800,
+          "24 B result-only error, NOT_AUTHORIZED: a verdict, not garbage (R14)")
+    err24("map_resp_err24_no_resources", 8, 120,
+          "24 B result-only error, NO_RESOURCES with the 120 s retry-after of §7.4")
+    err24("map_resp_err24_user_ex_quota", 10, 1800,
+          "24 B result-only error, USER_EX_QUOTA")
+    err24("map_resp_err24_unsupp_opcode", 4, 1800,
+          "24 B result-only error, UNSUPP_OPCODE")
+    garbage("map_resp_err23_truncated",
+            struct.pack(">BBBB", 2, 0x80 | OPCODE_MAP, 0, 3) + bytes(19),
+            "23 B: one short of the §7.2 header, so the verdict is unreadable")
+    add("map_resp_err60_wrong_nonce", "parse_pcp_map",
+        pcp_resp(2, 1800, EPOCHW,
+                 pcp_map_resp_data(BAD_NONCE, 6, INT_PORT, SUGG_PORT, bytes(16))),
+        "error reply carrying the 36 B of MAP data: §7.3 has it copy the request, so "
+        "a nonce that is not ours is still 'not an answer to our query'",
+        nonce=NONCE.hex(), proto=6, int_port=INT_PORT, ext_port=-1, ext_ip="",
+        lifetime=-1, epoch=-1, result=-1, expect=-2)
     garbage("map_resp_too_long", good + bytes(1044),
             "1104 B > the 1100 B PCP ceiling (RFC 6887 §7)")
     garbage("map_resp_not_mult4", good + b"\x00" * 1039,
@@ -255,9 +292,15 @@ def cases():
         map_resp("natpmp_map_resp_" + tag + "_wrong_port", 128 + op, 0,
                  NATPMP_INT_PORT + 1, NATPMP_EXT_PORT, NATPMP_LIFETIME,
                  "internal port in the response is not the one requested", -1)
+        # A refusal is the gateway answering, not silence (R14): the §3.5 code comes
+        # back verbatim together with the lifetime the reply names.
         map_resp("natpmp_map_resp_" + tag + "_error", 128 + op, 4,
                  NATPMP_INT_PORT, 0, 30,
-                 "result 4 NOT_AUTHORIZED (RFC 6886 §3.3)", -1)
+                 "result 4 Out of resources (RFC 6886 §3.5): a verdict, with its "
+                 "30 s lifetime", 4)
+        map_resp("natpmp_map_resp_" + tag + "_not_authorized", 128 + op, 2,
+                 NATPMP_INT_PORT, 0, 0,
+                 "result 2 Not Authorized/Refused (RFC 6886 §3.5) with lifetime 0", 2)
         map_resp("natpmp_map_resp_" + tag + "_delete", 128 + op, 0,
                  NATPMP_INT_PORT, 0, 0,
                  "deletion ack: result 0, external port 0, lifetime 0 (RFC 6886 §3.4)", 0)
