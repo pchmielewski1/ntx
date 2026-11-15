@@ -1358,6 +1358,136 @@ int main(void) {
         sess_close(&x);
     }
 
+    /* ---- O. a renewal and a delete carry the nonce of the GRANT (R13).
+     *
+     * RFC 6887 §11.2: the gateway identifies a mapping by the nonce, so renewing one
+     * means sending the SAME request again — a fresh nonce reads as a request for a
+     * NEW mapping, and the mapping already in place is left to expire on its own
+     * (7200 s) next to the new one. §11.1: a delete carries the grant's nonce too, or
+     * the gateway has no mapping to match it against and drops the datagram.
+     * Pre-fix `pm_start_query` drew a fresh nonce for EVERY query, renewals included,
+     * and copied it into `grant_nonce[phase]` at SEND time, so the renewal asked for a
+     * second mapping and the delete of a renewal in flight named a nonce the gateway
+     * was never asked about. ---- */
+
+    /* O1. the renewal is the grant's request again: same nonce, and it suggests the
+     * address and port the gateway assigned (§11.2). */
+    {
+        sess x;
+        sess_open(&x, "o1");
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        uint8_t gn[12];
+        memcpy(gn, granted_nonce[NTX_PCP_PROTO_TCP], 12);
+        gw_drain();
+        ntx_portmap_test_advance_ms(3601000); /* past half of the 7200 s grant */
+        pm_tick(&x);
+        uint8_t req[2048];
+        ck_eq(gw_get(req, sizeof req), 60, "O1_renew_sent");
+        ck(req_is(req, 60, NTX_PCP_PROTO_TCP, 7200), "O1_renew_is_pcp_tcp");
+        ck(memcmp(req + 24, gn, 12) == 0, "O1_renew_reuses_grant_nonce");
+        ck_eq((req[42] << 8) | req[43], EXT_PORT, "O1_renew_suggests_granted_port");
+        ck(memcmp(req + 44, pub, 16) == 0, "O1_renew_suggests_granted_ip");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* O2. two renewals in a row keep that one nonce — it belongs to the mapping, not
+     * to the query. */
+    {
+        sess x;
+        sess_open(&x, "o2");
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        uint8_t gn[12];
+        memcpy(gn, granted_nonce[NTX_PCP_PROTO_TCP], 12);
+        gw_drain();
+        uint8_t req[2048], rsp[64];
+        ntx_portmap_test_advance_ms(3601000);
+        pm_tick(&x);
+        ck_eq(gw_get(req, sizeof req), 60, "O2_renew1_sent");
+        ck(memcmp(req + 24, gn, 12) == 0, "O2_renew1_same_nonce");
+        pcp_resp(rsp, req, EXT_PORT, pub, 7200, gw_epoch_live(x.s->pm));
+        gw_send(rsp, 60);
+        pump_ms(x.n, 20);
+        gw_drain();
+        ntx_portmap_test_advance_ms(3601000);
+        pm_tick(&x);
+        ck_eq(gw_get(req, sizeof req), 60, "O2_renew2_sent");
+        ck(memcmp(req + 24, gn, 12) == 0, "O2_renew2_same_nonce");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* O3. stop() with a renewal unanswered: the lifetime-0 delete repeats the NONCE
+     * THE GATEWAY GRANTED, not the one the outstanding renewal happened to carry. */
+    {
+        sess x;
+        sess_open(&x, "o3");
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        uint8_t gn[12];
+        memcpy(gn, granted_nonce[NTX_PCP_PROTO_TCP], 12);
+        gw_drain();
+        ntx_portmap_test_advance_ms(3601000);
+        pm_tick(&x);
+        uint8_t req[2048], dn[12];
+        ck_eq(gw_get(req, sizeof req), 60, "O3_renew_in_flight");
+        ck_eq(rd32(req + 4), 7200, "O3_renew_is_no_delete");
+        ck(memcmp(req + 24, gn, 12) == 0, "O3_renewal_carries_grant_nonce");
+        memset(dn, 0, sizeof dn);
+        ntx_session_portmap_stop(x.s);
+        int dels = 0;
+        while (gw_get(req, sizeof req) >= 0) {
+            if (rd32(req + 4) != 0 || req[36] != NTX_PCP_PROTO_TCP) continue;
+            dels++;
+            memcpy(dn, req + 24, 12);
+        }
+        ck_eq(dels, 1, "O3_one_delete");
+        ck(memcmp(dn, gn, 12) == 0, "O3_delete_repeats_grant_nonce");
+        sess_close(&x);
+    }
+
+    /* O4. the other side of the rule, so O1 cannot be satisfied by never refreshing:
+     * the acquisition after a §8.5 rollback is a NEW mapping and MUST draw a new
+     * nonce (and state no preference for the external address again, §11.1). */
+    {
+        sess x;
+        sess_open(&x, "o4");
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        uint8_t gn[12];
+        memcpy(gn, granted_nonce[NTX_PCP_PROTO_TCP], 12);
+        gw_drain();
+        ntx_portmap_test_advance_ms(3601000);
+        pm_tick(&x);
+        uint8_t req[2048], rsp[64], zeros[16];
+        memset(zeros, 0, sizeof zeros);
+        ck_eq(gw_get(req, sizeof req), 60, "O4_renew_sent");
+        pcp_resp(rsp, req, EXT_PORT, pub, 7200, 0); /* the counter starts over: restart */
+        gw_send(rsp, 60);
+        pump_ms(x.n, 20);
+        pm_tick(&x); /* the tick owes the one fresh query of the rollback (R10) */
+        ck_eq(gw_get(req, sizeof req), 60, "O4_fresh_query_sent");
+        ck(req_is(req, 60, NTX_PCP_PROTO_TCP, 7200), "O4_fresh_query_is_pcp_tcp");
+        ck(memcmp(req + 24, gn, 12) != 0, "O4_new_acquisition_draws_new_nonce");
+        ck(memcmp(req + 44, zeros, 16) == 0, "O4_fresh_ask_no_suggested_ip");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
     /* ---- M. a datagram that carries no verdict at all: no grant, no immediate
      * resend, and the retransmission schedule continues (§8.3).
      *

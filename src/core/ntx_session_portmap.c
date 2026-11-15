@@ -76,6 +76,7 @@ struct ntx_portmap {
     size_t reqlen;
     uint8_t nonce[12];               /* of the outstanding query */
     uint8_t grant_nonce[PM_NPH][12]; /* the nonce each grant was made with (§11.1) */
+    uint8_t grant_ip[PM_NPH][16];    /* the external address each grant came with (§11.2) */
     uint8_t proto;                   /* of the outstanding MAP query */
     uint16_t iport;                  /* internal port of the outstanding MAP query */
     int active[PM_NPH];
@@ -308,7 +309,8 @@ static int pm_udp_wanted(const struct ntx_portmap *pm) { return pm->cfg && pm->c
 
 static uint8_t pm_op_of(int phase) { return (uint8_t)(phase == PM_PH_UDP ? 1 : 2); }
 
-static void pm_build(struct ntx_portmap *pm, int phase, uint32_t lifetime, uint16_t sugg_port) {
+static void pm_build(struct ntx_portmap *pm, int phase, uint32_t lifetime, uint16_t sugg_port,
+                     const uint8_t sugg_ip16[16]) {
     uint16_t lp = ntx_netx_port(pm->netx);
     pm->iport = lp;
     pm->phase = phase;
@@ -318,7 +320,8 @@ static void pm_build(struct ntx_portmap *pm, int phase, uint32_t lifetime, uint1
     }
     pm->proto = (uint8_t)(phase == PM_PH_TCP ? NTX_PCP_PROTO_TCP : NTX_PCP_PROTO_UDP);
     if (pm->fam == PM_PCP)
-        pm->reqlen = pcp_build_map(pm->req, pm->client_ip, pm->nonce, pm->proto, lp, sugg_port, lifetime);
+        pm->reqlen =
+            pcp_build_map(pm->req, pm->client_ip, pm->nonce, pm->proto, lp, sugg_port, lifetime, sugg_ip16);
     else
         pm->reqlen = natpmp_build_map(pm->req, pm_op_of(phase), lp, sugg_port, lifetime);
 }
@@ -452,15 +455,30 @@ static void pm_send(struct ntx_portmap *pm) {
     pm->gap = (pm->fam == PM_PCP && pm->gap >= PM_PCP_MRT_MS / 2u) ? PM_PCP_MRT_MS : pm->gap * 2u;
 }
 
-/* Start a query from scratch: fresh nonce, fresh schedule, sent now. */
+/* Start a query: fresh schedule, sent now. The nonce depends on whether this is the
+ * first ask for the mapping or a renewal of one we hold. RFC 6887 §11.2: the gateway
+ * keys a MAP request on the nonce, so a renewal that draws a new one is a request for
+ * a SECOND mapping — the grant in place then just sits there until its lifetime runs
+ * out — and the delete of §11.1 would go out with a nonce the gateway was never
+ * asked about. So a live grant reuses its grant nonce and suggests the address and
+ * port it came with; a fresh acquisition (nothing live: the opening of a sequence, or
+ * the re-acquisition after pm_lost) draws a new nonce and states no preference.
+ * `grant_nonce`/`grant_ip` are written only by pm_grant, never here (R13). */
 static void pm_start_query(struct ntx_portmap *pm, int phase, uint16_t sugg_port) {
     if (phase < 0 || pm->fd < 0) return;
+    const uint8_t *sugg_ip = NULL;
     pm->lost = 0; /* any fresh query is the sequence starting again (R10) */
-    if (phase != PM_PH_ADDR) ntx_rand_bytes(pm->nonce, sizeof pm->nonce);
+    if (phase != PM_PH_ADDR) {
+        if (pm->active[phase]) {
+            memcpy(pm->nonce, pm->grant_nonce[phase], sizeof pm->nonce);
+            sugg_ip = pm->grant_ip[phase];
+        } else {
+            ntx_rand_bytes(pm->nonce, sizeof pm->nonce);
+        }
+    }
     pm->tries = 0;
     pm->gap = pm->fam == PM_PCP ? PM_PCP_IRT_MS : PM_NATPMP_IRT_MS;
-    pm_build(pm, phase, PM_LIFE_S, sugg_port);
-    if (phase != PM_PH_ADDR) memcpy(pm->grant_nonce[phase], pm->nonce, sizeof pm->nonce);
+    pm_build(pm, phase, PM_LIFE_S, sugg_port, sugg_ip);
     pm_send(pm);
 }
 
@@ -476,7 +494,8 @@ static void pm_send_deletes(struct ntx_portmap *pm) {
         size_t n;
         if (pm->fam == PM_PCP) {
             uint8_t proto = (uint8_t)(ph == PM_PH_TCP ? NTX_PCP_PROTO_TCP : NTX_PCP_PROTO_UDP);
-            n = pcp_build_map(buf, pm->client_ip, pm->grant_nonce[ph], proto, lp, pm->ext[ph], 0);
+            n = pcp_build_map(buf, pm->client_ip, pm->grant_nonce[ph], proto, lp, pm->ext[ph], 0,
+                              pm->grant_ip[ph]);
         } else {
             n = natpmp_build_map(buf, pm_op_of(ph), lp, pm->ext[ph], 0);
         }
@@ -485,9 +504,18 @@ static void pm_send_deletes(struct ntx_portmap *pm) {
     }
 }
 
-static void pm_grant(struct ntx_portmap *pm, int phase, uint16_t ext_port, uint32_t life) {
+/* The only place a grant nonce is recorded (R13): the request identified by this
+ * answer — its nonce is pm->nonce, which pcp_parse_map matched against the reply —
+ * IS the mapping, so renewals and deletes go out with it (§11.1/§11.2), together with
+ * the external address and port the gateway assigned. NAT-PMP has no nonce: its
+ * request is identified by version/opcode/internal port, so only the port is kept. */
+static void pm_grant(struct ntx_portmap *pm, int phase, uint16_t ext_port, uint32_t life,
+                     const uint8_t ext_ip16[16]) {
     pm->active[phase] = 1;
     pm->failed[phase] = 0;
+    memcpy(pm->grant_nonce[phase], pm->nonce, sizeof pm->nonce);
+    if (ext_ip16) memcpy(pm->grant_ip[phase], ext_ip16, 16);
+    else memset(pm->grant_ip[phase], 0, 16);
     pm->ext[phase] = ext_port;
     pm->renew_at[phase] = pm_now() + (uint64_t)(life / 2) * 1000u;
     pm->phase = -1;
@@ -616,7 +644,7 @@ static void pm_rx(struct ntx_portmap *pm, const uint8_t *b, size_t n) {
             pm_cgnat(pm);
             return;
         }
-        pm_grant(pm, ph, r.ext_port, life);
+        pm_grant(pm, ph, r.ext_port, life, r.ext_ip16);
         return;
     }
 
@@ -651,7 +679,7 @@ static void pm_rx(struct ntx_portmap *pm, const uint8_t *b, size_t n) {
         pm_zero_lifetime(pm, ph);
         return;
     }
-    pm_grant(pm, ph, ext, life);
+    pm_grant(pm, ph, ext, life, NULL);
 }
 
 static void pm_on_rw(int fd, void *ctx) {

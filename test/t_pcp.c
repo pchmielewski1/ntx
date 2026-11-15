@@ -127,7 +127,7 @@ static void test_blob_hex(const gm *cases, const uint8_t *blob, size_t blobn) {
 /* ------------------------------------------------------------------ */
 static void test_builders(const gm *cases) {
     static const char *names[] = {
-        "map_req_tcp", "map_req_udp_zero_sugg", "map_req_delete",
+        "map_req_tcp", "map_req_udp_zero_sugg", "map_req_delete", "map_req_renewal",
         "natpmp_addr_req", "natpmp_map_req_udp", "natpmp_map_req_tcp"
     };
     char tn[160];
@@ -147,11 +147,12 @@ static void test_builders(const gm *cases) {
         }
         memset(out, 0x5A, sizeof out);
         if (strcmp(kind, "build_pcp_map") == 0) {
-            uint8_t ip[16], nonce[12];
-            const char *cs_ip = NULL, *cs_nonce = NULL;
+            uint8_t ip[16], nonce[12], sugg_ip[16];
+            const char *cs_ip = NULL, *cs_nonce = NULL, *cs_sugg_ip = NULL;
             int64_t proto, ipt, sugg, lifetime;
             if (str_field(c, "client_ip", &cs_ip) != 0 ||
                 str_field(c, "nonce", &cs_nonce) != 0 ||
+                str_field(c, "sugg_ip", &cs_sugg_ip) != 0 ||
                 hexbytes(cs_ip, ip, 16) != 16 ||
                 hexbytes(cs_nonce, nonce, 12) != 12 ||
                 num_field(c, "proto", &proto) != 0 ||
@@ -161,8 +162,18 @@ static void test_builders(const gm *cases) {
                 check(0, names[i]);
                 continue;
             }
+            /* "" = the all-zeros "no preference" of §11.1, handed to the builder as
+             * NULL; anything else is the granted address a renewal suggests. */
+            const uint8_t *sip = NULL;
+            if (cs_sugg_ip[0]) {
+                if (hexbytes(cs_sugg_ip, sugg_ip, 16) != 16) {
+                    check(0, names[i]);
+                    continue;
+                }
+                sip = sugg_ip;
+            }
             got = pcp_build_map(out, ip, nonce, (uint8_t)proto, (uint16_t)ipt,
-                                (uint16_t)sugg, (uint32_t)lifetime);
+                                (uint16_t)sugg, (uint32_t)lifetime, sip);
         } else if (strcmp(kind, "build_natpmp_addr") == 0) {
             got = natpmp_build_addr(out);
         } else if (strcmp(kind, "build_natpmp_map") == 0) {

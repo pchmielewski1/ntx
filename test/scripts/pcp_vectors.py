@@ -68,10 +68,16 @@ def pcp_req(lifetime, client_ip16, opcode_data):
     return msg
 
 
-def pcp_map_req_data(nonce, proto, int_port, sugg_port):
-    """RFC 6887 §11.1 fig. 9 MAP opcode request data (36 B)."""
+def pcp_map_req_data(nonce, proto, int_port, sugg_port, sugg_ip16=None):
+    """RFC 6887 §11.1 fig. 9 MAP opcode request data (36 B).
+
+    sugg_ip16 is the Suggested External IP Address: None means the all-zeros "no
+    preference" a first acquisition sends. A renewal or a delete repeats the address
+    the gateway assigned with the grant, so that the request is still recognised as
+    the same mapping (§11.1 for the delete, §11.2 for the renewal)."""
+    ip = bytes(16) if sugg_ip16 is None else sugg_ip16
     # Protocol, then 24 reserved bits, then the two 16-bit ports.
-    data = nonce + bytes([proto, 0, 0, 0]) + struct.pack(">HH", int_port, sugg_port) + bytes(16)
+    data = nonce + bytes([proto, 0, 0, 0]) + struct.pack(">HH", int_port, sugg_port) + ip
     assert len(data) == 36, len(data)
     return data
 
@@ -111,12 +117,13 @@ def cases():
     assert len(good) == 60
 
     # --- PCP MAP requests (builder cases; byte-exact vs. the RFC layout) --
-    def req(name, proto, int_port, sugg_port, lifetime, note):
+    def req(name, proto, int_port, sugg_port, lifetime, note, sugg_ip16=None):
         add(name, "build_pcp_map",
             pcp_req(lifetime, CLIENT_IP16,
-                    pcp_map_req_data(NONCE, proto, int_port, sugg_port)),
+                    pcp_map_req_data(NONCE, proto, int_port, sugg_port, sugg_ip16)),
             note, client_ip=CLIENT_IP16.hex(), nonce=NONCE.hex(), proto=proto,
-            int_port=int_port, sugg_port=sugg_port, lifetime=lifetime, expect=60)
+            int_port=int_port, sugg_port=sugg_port, lifetime=lifetime,
+            sugg_ip="" if sugg_ip16 is None else sugg_ip16.hex(), expect=60)
 
     req("map_req_tcp", 6, INT_PORT, SUGG_PORT, LIFETIME,
         "RFC 6887 §7.1+§11.1 MAP request, TCP, 60 B")
@@ -124,6 +131,11 @@ def cases():
         "MAP request, UDP, suggested external port 0 (RFC 6887 §11.1)")
     req("map_req_delete", 6, INT_PORT, EXT_PORT, 0,
         "lifetime 0 = delete, renewal-style suggested external port")
+    # R13: the renewal of a mapping is the grant's request again — same nonce, and the
+    # external address/port the gateway assigned come back as the suggestion (§11.2).
+    req("map_req_renewal", 6, INT_PORT, EXT_PORT, LIFETIME,
+        "renewal of a grant: same nonce, suggested external address = the granted one "
+        "(RFC 6887 §11.2)", sugg_ip16=EXT_IP16)
 
     # --- PCP MAP responses ----------------------------------------------
     ok = dict(nonce=NONCE.hex(), proto=6, int_port=INT_PORT, ext_port=EXT_PORT,

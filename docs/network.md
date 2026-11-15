@@ -691,7 +691,13 @@ blocking calls.
 
 - **Protocol.** PCP (RFC 6887) `MAP` (opcode 1) first, 60 bytes: our address as an
   IPv4-mapped IPv6, a random 12-byte nonce, protocol, internal port and suggested external
-  port, with the suggested external address left all-zeros ("no preference"). If the answer
+  port, with the suggested external address left all-zeros ("no preference") for a first
+  acquisition. The nonce belongs to the mapping, not to the query (R13): the gateway keys a
+  mapping on it, so the nonce is drawn once — when a phase has no live grant — and a renewal
+  (RFC 6887 §11.2) and a lifetime-0 delete (§11.1) go out with the nonce of the grant,
+  suggesting the external address and port that grant assigned. A renewal drawn with a fresh
+  nonce would read as a request for a second mapping and leave the first to expire on its
+  own. If the answer
   reports a version mismatch the driver falls back to NAT-PMP (RFC 6886) — an external-address
   request (2 bytes) plus a mapping request (12 bytes) per protocol, opcode 1 for UDP and 2 for
   TCP. Both directions are mapped on the listen port.

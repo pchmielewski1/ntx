@@ -48,7 +48,8 @@ static uint32_t pcp_get32(const uint8_t *p) {
 }
 
 size_t pcp_build_map(uint8_t out[60], const uint8_t client_ip16[16], const uint8_t nonce[12],
-                     uint8_t proto, uint16_t int_port, uint16_t sugg_port, uint32_t lifetime)
+                     uint8_t proto, uint16_t int_port, uint16_t sugg_port, uint32_t lifetime,
+                     const uint8_t sugg_ip16[16])
 {
     out[0] = PCP_VERSION;
     out[1] = PCP_OPCODE_MAP;      /* R clear = request */
@@ -63,7 +64,11 @@ size_t pcp_build_map(uint8_t out[60], const uint8_t client_ip16[16], const uint8
     out[PCP_MAP_PROTO + 3] = 0;    /* 24 reserved bits */
     pcp_put16(out + PCP_MAP_INT_PORT, int_port);
     pcp_put16(out + PCP_MAP_EXT_PORT, sugg_port);
-    memset(out + PCP_MAP_EXT_IP, 0, 16); /* suggested external IP: no preference */
+    /* Suggested external IP: NULL is the all-zeros "no preference" of §11.1; a
+     * renewal passes the address the gateway assigned, which §11.2 wants echoed
+     * back so the request still identifies the same mapping. */
+    if (sugg_ip16) memcpy(out + PCP_MAP_EXT_IP, sugg_ip16, 16);
+    else memset(out + PCP_MAP_EXT_IP, 0, 16);
     return PCP_MAP_LEN;
 }
 

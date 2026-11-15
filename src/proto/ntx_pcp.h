@@ -23,10 +23,14 @@ enum { NTX_NATPMP_RES_UNSUPP_VERSION = 1, NTX_NATPMP_RES_NETWORK_FAILURE = 3,
        NTX_NATPMP_RES_OUT_OF_RESOURCES = 4 };
 
 /* RFC 6887 MAP request (60 B): client ip as v4-mapped v6, nonce 12 B, proto,
- * internal/suggested port. Writes exactly 60 B and returns 60. The suggested
- * external IP is always the all-zeros "no preference" address (RFC 6887 §11.1). */
+ * internal/suggested port. Writes exactly 60 B and returns 60. sugg_ip16 is the
+ * suggested external address: NULL writes the all-zeros "no preference" of §11.1
+ * (what a first acquisition sends); a renewal of a mapping we hold passes the address
+ * the gateway assigned with the grant, which §11.2 wants back so the request still
+ * identifies that mapping rather than asking for a new one. */
 size_t pcp_build_map(uint8_t out[60], const uint8_t client_ip16[16], const uint8_t nonce[12],
-                     uint8_t proto, uint16_t int_port, uint16_t sugg_port, uint32_t lifetime);
+                     uint8_t proto, uint16_t int_port, uint16_t sugg_port, uint32_t lifetime,
+                     const uint8_t sugg_ip16[16]);
 
 typedef struct { uint8_t result; uint32_t lifetime, epoch; uint16_t ext_port; uint8_t ext_ip16[16]; } ntx_pcp_map_resp;
 
