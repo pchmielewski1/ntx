@@ -325,6 +325,50 @@ poll 10 "$WORK/seed.err" 'plaintext_strict_share' || fail "seed never logged pla
 AFTER=$(count "$WORK/seed.err" 'plaintext_strict_share')
 [ "$AFTER" -gt "$BEFORE" ] || fail "plaintext drop not newly observed ($BEFORE -> $AFTER)" "$WORK/seed.err"
 
+# 7 — R4: a share that WAS ready and then loses its file still reports the
+# failure. docs/cli.md: `ntx: share failed: <reason>` on stderr and exit 1;
+# docs/json-api.md: under --stats-json the same failure is the slot's second
+# `share` event with "ok":0. Pre-fix the error event was pushed against the
+# slot's spent one-shot flag, so nothing reached either consumer.
+say "r4: CLI share -> ready -> file changed"
+R4A="$WORK/storeR4A"
+mkdir -p "$R4A" || fail "cannot create $R4A"
+dd if=/dev/urandom of="$SRC/r4.bin" bs=65536 count=32 >/dev/null 2>&1 || fail "dd r4 payload"
+timeout -k 5 120 "$ROOT/$BIN" --share="$SRC/r4.bin" --allow-local-peers \
+    --store-dir="$R4A" --no-port-map --port-lo=0 --port-hi=0 \
+    </dev/null >"$WORK/r4.out" 2>"$WORK/r4.err" &
+spawn
+R4_PID=$!
+poll 60 "$WORK/r4.out" '^magnet:?xt=urn:btih:' \
+    || fail "r4: CLI share never got ready" "$WORK/r4.err"
+grep -q '^ntx: shared — ' "$WORK/r4.err" || fail "r4: CLI ready note missing" "$WORK/r4.err"
+# §5.5: the 1 s fstat on the held fd is what sees the append
+printf 'r4-edit' >> "$SRC/r4.bin"
+poll 20 "$WORK/r4.err" '^ntx: share failed: ' \
+    || fail "r4: no 'share failed' line after the file changed" "$WORK/r4.err" "$WORK/r4.out"
+rc4=0
+wait "$R4_PID" 2>/dev/null || rc4=$?
+[ "$rc4" -eq 1 ] || fail "r4: CLI exit $rc4 after a failed share, want 1" "$WORK/r4.err"
+say "r4: CLI reported 'share failed' and exited 1"
+
+say "r4: JSON share -> ready -> file changed -> one ok:0 event"
+R4B="$WORK/storeR4B"
+mkdir -p "$R4B" || fail "cannot create $R4B"
+dd if=/dev/urandom of="$SRC/r4j.bin" bs=65536 count=32 >/dev/null 2>&1 || fail "dd r4j payload"
+timeout -k 5 120 "$ROOT/$BIN" --share="$SRC/r4j.bin" --allow-local-peers \
+    --store-dir="$R4B" --no-port-map --port-lo=0 --port-hi=0 --stats-json \
+    </dev/null >"$WORK/r4j.ndjson" 2>"$WORK/r4j.err" &
+spawn
+R4J_PID=$!
+poll 60 "$WORK/r4j.ndjson" '"type":"share","i":0,"ok":1' \
+    || fail "r4: JSON share never got ready" "$WORK/r4j.ndjson" "$WORK/r4j.err"
+printf 'r4-edit' >> "$SRC/r4j.bin"
+poll 20 "$WORK/r4j.ndjson" '"type":"share","i":0,"ok":0,"code":"changed"' \
+    || fail "r4: no ok:0 changed event after the file changed" "$WORK/r4j.ndjson" "$WORK/r4j.err"
+R4EV=$(count "$WORK/r4j.ndjson" '"type":"share"')
+[ "$R4EV" -eq 2 ] || fail "r4: $R4EV share event lines, want exactly 2 (ready + error)" "$WORK/r4j.ndjson"
+say "r4: JSON reported the failure as the slot's second share event"
+
 # --------------------------------------------------------------- wrap-up -----
 kill "$SEED_PID" 2>/dev/null || true
 kill "$LEECH_PID" 2>/dev/null || true

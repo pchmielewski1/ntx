@@ -161,7 +161,7 @@ Start-up failures (exit `1`):
 | `.torrent` missing, empty or not valid metainfo | `ntx: cannot load .torrent file (missing, empty or not valid metainfo): ...` |
 | `--share` in a build with too few pinned share trackers | `ntx: cannot share: no HTTPS share trackers are pinned in this build` |
 | `--share` whose synchronous checks fail (unreadable, not a regular file, empty, bad name, a rejected `--share-from`, no slot, a `--store-dir` that cannot be created or written) | `ntx: cannot share <path>: <reason>` where `<reason>` is the share module's text — `invalid share argument`, `cannot read the file`, `cannot write the .torrent into <store-dir>`, `too many shared files`, `file too large to share`, `this file is already shared`, `the file changed while sharing`, `invalid file name` |
-| a `--share` that fails after it was added (CLI mode only — under `--stats-json` the failure is a JSON `share` event instead) | `ntx: share failed: <reason>`, same table of reasons |
+| a `--share` that fails after it was added — before or after it was ready (CLI mode only — under `--stats-json` the failure is a JSON `share` event instead, and the session keeps running) | `ntx: share failed: <reason>`, same table of reasons, and exit code `1`. One such line per share at most, and only after the `ntx: shared — …` line if the share had already been ready. |
 
 The tests for these cases live in `test/cli_errors.sh` (`make test-cli`).
 

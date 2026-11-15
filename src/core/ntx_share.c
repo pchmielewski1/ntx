@@ -55,7 +55,11 @@ struct ntx_share_slot {
      * claims — known from the moment it is read — live here instead. */
     ntx_torrent *src;
     uint8_t src_ih[20], src_ih2[32];
-    int ev_full; /* one share event per slot, however it ends */
+    /* R4: the two facts a share event carries, one bit per event, set ONLY after
+     * the event really reached the queue. A slot may therefore report READY once
+     * and one error afterwards (§5.4/§5.5); a share that dies before READY has
+     * never been ready and reports only the error. */
+    int ev_ready, ev_err;
     int started_pending; /* §5.5: wait for the port mapping before `started` */
     uint64_t added_at, warn_at, fstat_at;
     int warned;
@@ -195,25 +199,43 @@ static void share_evq_drop(struct ntx_session *s, struct ntx_share_slot *sl) {
         if (share_evq[i].owner == sl) share_evq[i].owner = NULL;
 }
 
+/* R4 (§5.4/§5.5): at most one READY event and at most one error event per slot,
+ * in that order — a share that dies before READY was never ready and reports
+ * only the error. The flag is spent by an entry that was REALLY placed: when the
+ * queue is full the event stays pending and the next ntx_session_share_tick
+ * pushes it again, so a full queue delays an event and never drops one. One
+ * attempt per kind per tick, so a full queue cannot spin. */
 static void share_evq_push(struct ntx_share_slot *sl) {
-    if (!sl || sl->ev_full) return;
+    int ok;
+    if (!sl) return;
+    if (sl->st == NTX_SHARE_READY) ok = 1;
+    else if (sl->st == NTX_SHARE_FAILED) ok = 0;
+    else return; /* HASHING / ANNOUNCING (§5.3, §5.5): nothing to report yet */
+    if (ok ? sl->ev_ready : sl->ev_err) return;
+    /* The two events of one slot keep their order: while its READY event is still
+     * unread in the queue, the error event waits for the next tick too, so a
+     * consumer never sees ok:0 for an i it has not seen as ok:1 yet. */
+    if (!ok)
+        for (size_t i = 0; i < sizeof share_evq / sizeof share_evq[0]; i++)
+            if (share_evq[i].owner == sl) return;
     for (size_t i = 0; i < sizeof share_evq / sizeof share_evq[0]; i++) {
         if (share_evq[i].owner) continue;
         ntx_share_event *ev = &share_evq[i].ev;
         memset(ev, 0, sizeof *ev);
         ev->i = sl->ti;
-        ev->ok = sl->st == NTX_SHARE_READY;
-        ev->err = ev->ok ? NTX_SHARE_OK : sl->err;
+        ev->ok = ok;
+        ev->err = ok ? NTX_SHARE_OK : sl->err;
         memcpy(ev->ih, sl->sess_ih, 20); /* zeros while hashing, the real hash at READY */
         memcpy(ev->ih2, sl->ih2, 32);
         snprintf(ev->name, sizeof ev->name, "%s", sl->name);
         snprintf(ev->magnet, sizeof ev->magnet, "%s", sl->magnet);
         snprintf(ev->torrent_path, sizeof ev->torrent_path, "%s", sl->torrent_path);
         share_evq[i].owner = sl;
-        sl->ev_full = 1; /* one event per share, however it ends */
+        if (ok) sl->ev_ready = 1;
+        else sl->ev_err = 1; /* R4: only a placed event is a spent event */
         return;
     }
-    sl->ev_full = 1;
+    /* R4: the queue was full — nothing is marked sent, the next tick retries. */
 }
 
 /* The validated copy of a --share-from .torrent holds exactly what
@@ -897,6 +919,11 @@ void ntx_session_share_tick(struct ntx_session *s) {
     for (int ti = 0; ti < NTX_SESSION_MAX_TTS; ti++) {
         struct ntx_share_slot *sl = s->share[ti];
         if (!sl || s->tts[ti].state == NTX_TTS_DEAD) continue;
+        /* R4: the retry point for an event a previous attempt could not place
+         * because the queue was full. push() answers immediately for a slot with
+         * nothing pending and for HASHING/ANNOUNCING (§5.3, §5.5), so this costs
+         * a state compare per slot per tick and cannot spin. */
+        share_evq_push(sl);
         if (sl->st == NTX_SHARE_HASHING) {
             share_hash_tick(s, sl);
             continue;

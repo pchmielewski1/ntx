@@ -47,7 +47,10 @@ Emitted once, as the very first line, and again as the reply to the `hello` comm
 
 ### `share`
 
-Emitted once per `share` command, when the share reaches `ready` or fails. It is
+Emitted per `share` command when the share reaches `ready` or fails, and — for a share
+that reached `ready` and later died (the file changed, a read failed while serving) — once
+more with the failure. So a slot gets at most one `"ok":1` line and at most one `"ok":0`
+line, in that order; a share that fails before `ready` gets only the failure line. It is
 asynchronous: the `ack` for the command is already out. Per event-loop tick the order is
 always `ack` first, then `share`, then the `stats` snapshot.
 
@@ -68,8 +71,11 @@ always `ack` first, then `share`, then the `stats` snapshot.
 | `torrent` | Path of the `.torrent` for this share. Without a `torrent` in the request, the file `ntx` wrote inside `--store-dir` (mode `0600`); with one, the path that was passed in, which `ntx` reads and leaves untouched. |
 | `code` | On failure only; one of the share codes below. |
 
-Exactly one `share` event exists per `share` command. If the torrent is `remove`d before
-the event is emitted, the event is dropped with the slot.
+At most two `share` events exist per `share` command: the ready one and, if the share later
+fails, one error event for the same `i`. A pending event is never lost — when the internal
+event queue is full the event simply waits for a later tick — but an event the emitter never
+got because the torrent was `remove`d is dropped with the slot. Consumers must therefore
+accept `"ok":0` for an `i` they already saw as `"ok":1`, and stop treating that share as live.
 
 ### `stats`
 
@@ -255,7 +261,7 @@ table, `ntx_share_err_code()` in `src/core/ntx_share.c`:
 | `code` | Cause |
 |--------|-------|
 | `"bad_arg"` | No `path`, an empty `path`, an unusable file name, or a `torrent` that does not pass the re-share gate: unreadable, empty or over 4 MiB, not valid bencode, no `info` dictionary, `private` missing or zero, more than one file, `length` other than the size of `path`, `piece length` not a power of two in `16 KiB`-`64 MiB`, a `pieces` count that does not match the size, missing BEP 52 `piece layers` above one piece, or a v1-only metainfo (a share is always published as hybrid, so a v1 link would mislabel the wire protocol). |
-| `"io"` | The file cannot be opened, is not a regular file, is empty, or the hash / metainfo / store / `.torrent` write failed — including the `.torrent` destination itself: `<store-dir>` is created on demand and proven writable inside the synchronous gate, and a store dir that cannot be created or written is `io` before any hashing, with the text `cannot write the .torrent into <dir>`. A `pread` that comes back short or with `EIO` while the share is serving parks it in `failed` with this code too, but it is not a second event: one `share` command gets exactly one event, so the failure is only visible as `share: 2` in the stats. |
+| `"io"` | The file cannot be opened, is not a regular file, is empty, or the hash / metainfo / store / `.torrent` write failed — including the `.torrent` destination itself: `<store-dir>` is created on demand and proven writable inside the synchronous gate, and a store dir that cannot be created or written is `io` before any hashing, with the text `cannot write the .torrent into <dir>`. A `pread` that comes back short or with `EIO` while the share is serving parks it in `failed` with this code too, and arrives as the slot's error event: `{"type":"share","i":<i>,"ok":0,"code":"io"}`, next to `share: 2` in the stats. |
 | `"full"` | No free torrent slot (all 16 in use). |
 | `"no_trackers"` | Too few pinned HTTPS share trackers in this build. |
 | `"too_big"` | The file would need more than 32 768 pieces, so no piece length in the supported range fits the metainfo limits. Only on the `--share` path; with a `torrent` the piece length comes from that file, and one outside the supported range is `bad_arg`. |

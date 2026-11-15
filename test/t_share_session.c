@@ -167,7 +167,7 @@ static void scratch(void) {
                                        "from","fromchg","fromerr","fromdup","fromio","fromserve",
                                        "frompread","store","during","durtrunc",
                                        "r7dead","r7hash","r7pend",
-                                       "r5chg","r5io"};
+                                       "r5chg","r5io","r4evt","r4qa"};
     for (size_t k = 0; k < sizeof tags / sizeof tags[0]; k++) {
         char d[640];
         snprintf(d, sizeof d, "%s/%s", scratch_root, tags[k]);
@@ -1924,11 +1924,17 @@ static void test_from_truncated(void) {
     ntx_session_share_tick(y.s);
     if (ntx_session_share_state(y.s, si) != NTX_SHARE_FAILED) fail("fromserve_not_changed");
     if (ntx_session_share_serving(y.s, si) != 0) fail("fromserve_still_serving");
-    /* One event per share (§5.5, A5): the READY one was already reported, so the
-     * failure reaches the UI through share=2 / code in the stats, not a second
-     * event. Asserting that here keeps the rule visible. */
+    /* R4: the READY event was already reported, so the failure must arrive as
+     * the slot's one error event — not as silence behind `share: 2` in the stats.
+     * Exactly one, carrying `changed`. */
     ntx_share_event ev3;
-    if (ntx_session_share_poll_event(y.s, &ev3) != 0) fail("fromserve_second_event");
+    memset(&ev3, 0, sizeof ev3);
+    if (ntx_session_share_poll_event(y.s, &ev3) != 1) fail("fromserve_second_event");
+    if (ev3.ok || ev3.err != NTX_SHARE_E_CHANGED || ev3.i != si) {
+        printf("EV3 ok=%d err=%d i=%d\n", ev3.ok, (int)ev3.err, ev3.i);
+        fail("fromserve_second_event_fields");
+    }
+    if (ntx_session_share_poll_event(y.s, &ev3) != 0) fail("fromserve_third_event");
     if (y.s->share[si]->err != NTX_SHARE_E_CHANGED) fail("fromserve_err_not_changed");
     uint64_t up_before = y.s->tts_up[si];
     /* R5 replaced the old choke-and-keep here: share_halt drops the peer instead
@@ -2032,9 +2038,16 @@ static void test_from_serve_io(void) {
         fail("frompread_err_not_io");
     if (ntx_session_share_serving(z.s, si) != 0) fail("frompread_still_serving");
     if (z.s->peers[pi].fd != -1) fail("frompread_peer_kept_after_io");
-    /* one event per share (§5.5): the failure is in the stats, not a second line */
+    /* R4: one READY event, then exactly one error event with `code io` — the
+     * queue is not full here, so nothing may delay it. */
     ntx_share_event ev1;
-    if (ntx_session_share_poll_event(z.s, &ev1) != 0) fail("frompread_second_event");
+    memset(&ev1, 0, sizeof ev1);
+    if (ntx_session_share_poll_event(z.s, &ev1) != 1) fail("frompread_second_event");
+    if (ev1.ok || ev1.err != NTX_SHARE_E_IO || ev1.i != si) {
+        printf("EV1 ok=%d err=%d i=%d\n", ev1.ok, (int)ev1.err, ev1.i);
+        fail("frompread_second_event_fields");
+    }
+    if (ntx_session_share_poll_event(z.s, &ev1) != 0) fail("frompread_third_event");
 
     close(sv[0]);
     close(sv[1]);
@@ -2423,6 +2436,182 @@ static void test_halt_after_io(void) {
     ok("halt_after_io");
 }
 
+/* =================== R4: the error that FOLLOWS a ready event ==============
+ * share_evq_push used to lock a slot after its FIRST event (sl->ev_full), so a
+ * share that reached READY and later died of `changed` (§5.5) or of a failed
+ * read while serving (§5.6.1) pushed an error event that was never queued: the
+ * CLI kept running as if all was well (docs/cli.md promises `ntx: share failed:
+ * <reason>` and exit 1) and the JSON consumer never saw {"ok":0}. */
+
+/* ---- R4 a: READY -> changed, and READY -> io: exactly one error event ---- */
+static void test_error_after_ready(void) {
+    scratch();
+    tracker tr;
+    memset(&tr, 0, sizeof tr);
+    tracker_start(&tr);
+    set_test_trackers(&tr, 2);
+    sess x;
+    sess_open(&x, "r4evt");
+    char p[256];
+    ntx_share_err e = NTX_SHARE_OK;
+    ntx_share_event ev;
+
+    /* (1) READY, then a byte edited under the held fd: the one error event the
+     * share gets must be the CHANGED one, drained after the READY event. */
+    snprintf(p, sizeof p, "%s/r4evt/a.bin", scratch_root);
+    mk_file(p, 60000, 121);
+    int ti = share_add_parked(&x, p, NULL, &e);
+    if (ti < 0 || e != NTX_SHARE_OK) fail("r4evt_add");
+    (void)pump_until_hashed(&x, ti, 2000, NULL);
+    if (!pump_to_ready(&x, ti)) fail("r4evt_not_ready");
+    if (ntx_session_share_poll_event(x.s, &ev) != 1 || !ev.ok || ev.i != ti) fail("r4evt_ready_event");
+
+    {
+        int fd = open(p, O_WRONLY);
+        if (fd < 0) fail("r4evt_edit_open");
+        uint8_t one = 0xA5;
+        if (pwrite(fd, &one, 1, 7) != 1) fail("r4evt_edit_pwrite");
+        close(fd);
+    }
+    ntx_share_test_advance_ms(1500); /* past the 1 s fstat interval (§5.5) */
+    ntx_session_share_tick(x.s);
+    if (ntx_session_share_state(x.s, ti) != NTX_SHARE_FAILED) fail("r4evt_not_failed");
+    memset(&ev, 0, sizeof ev);
+    if (ntx_session_share_poll_event(x.s, &ev) != 1) fail("r4evt_changed_no_error_event");
+    if (ev.ok || ev.err != NTX_SHARE_E_CHANGED || ev.i != ti) {
+        printf("EV ok=%d err=%d i=%d\n", ev.ok, (int)ev.err, ev.i);
+        fail("r4evt_error_fields");
+    }
+    if (ntx_session_share_poll_event(x.s, &ev) != 0) fail("r4evt_third_event");
+    ntx_session_remove(x.s, ti);
+
+    /* (2) READY, then a pread that fails *while serving* (§5.6.1): the same
+     * contract with the code `io`. The 1 s fstat is disarmed so the read is the
+     * only thing that can fail the share. */
+    snprintf(p, sizeof p, "%s/r4evt/b.bin", scratch_root);
+    mk_file(p, 40000, 122); /* 3 pieces: 16384 + 16384 + 7232 */
+    int tj = share_add_parked(&x, p, NULL, &e);
+    if (tj < 0 || e != NTX_SHARE_OK) fail("r4evt_io_add");
+    (void)pump_until_hashed(&x, tj, 2000, NULL);
+    if (!pump_to_ready(&x, tj)) fail("r4evt_io_not_ready");
+    if (ntx_session_share_poll_event(x.s, &ev) != 1 || !ev.ok || ev.i != tj) fail("r4evt_io_ready_event");
+
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) fail("r4evt_socketpair");
+    ntx_addr pa;
+    ntx_addr_set_v4(&pa, htonl(0x7f000001));
+    int pi = ntx_session_peer_alloc(x.s, sv[0], &pa, 6881, tj);
+    if (pi < 0) fail("r4evt_peer_alloc");
+    x.s->peer_phase[pi] = PH_OK;
+    x.s->peer_plain[pi] = 1;
+    x.s->peer_hello_sent[pi] = 1;
+    x.s->peer_fast[pi] = 1;
+    ntx_peer_set_we_choke(&x.s->peers[pi], 0);
+    ntx_peer_set_int_us(&x.s->peers[pi], 1);
+    x.s->share[tj]->fstat_at = UINT64_MAX; /* only the read may fail the share */
+    if (trunc_to(p, 20000) != 0) fail("r4evt_trunc"); /* abs of piece 2 is past EOF */
+    ntx_session_data_on_request(x.s, pi, 2, 0, 1024);
+    if (ntx_session_share_state(x.s, tj) != NTX_SHARE_FAILED) fail("r4evt_io_not_failed");
+    if (x.s->share[tj]->err != NTX_SHARE_E_IO) fail("r4evt_io_err_not_io");
+    memset(&ev, 0, sizeof ev);
+    if (ntx_session_share_poll_event(x.s, &ev) != 1) fail("r4evt_io_no_error_event");
+    if (ev.ok || ev.err != NTX_SHARE_E_IO || ev.i != tj) {
+        printf("EVio ok=%d err=%d i=%d\n", ev.ok, (int)ev.err, ev.i);
+        fail("r4evt_io_error_fields");
+    }
+    if (ntx_session_share_poll_event(x.s, &ev) != 0) fail("r4evt_io_third_event");
+
+    close(sv[0]);
+    close(sv[1]);
+    x.s->peers[pi].fd = -1;
+    x.s->peer_tts[pi] = -1;
+    ntx_session_remove(x.s, tj);
+    sess_close(&x);
+    tracker_stop(&tr);
+    ok("error_after_ready");
+}
+
+/* ---- R4 b: a full queue delays an event, it never drops one ----
+ * share_evq is NTX_SESSION_MAX_TTS * 2 deep and the old push set ev_full even
+ * when the loop found no room, so a discarded event was gone forever. Three
+ * shares reach READY, the queue is then stuffed to its capacity with OTHER
+ * shares' events, and only now is one of them failed: the error event cannot be
+ * placed, and must still come out after the queue drains. */
+static void test_evq_full_delays(void) {
+    scratch();
+    tracker tr;
+    memset(&tr, 0, sizeof tr);
+    tracker_start(&tr);
+    set_test_trackers(&tr, 2);
+    sess x;
+    sess_open(&x, "r4qa");
+    char p[256];
+    int ti[3] = {-1, -1, -1};
+    ntx_share_err e = NTX_SHARE_OK;
+
+    for (int k = 0; k < 3; k++) {
+        snprintf(p, sizeof p, "%s/r4qa/p%d.bin", scratch_root, k);
+        mk_file(p, 40000, (uint8_t)(131 + k));
+        ti[k] = share_add_parked(&x, p, NULL, &e);
+        if (ti[k] < 0 || e != NTX_SHARE_OK) fail("r4q_add");
+        (void)pump_until_hashed(&x, ti[k], 2000, NULL);
+        if (!pump_to_ready(&x, ti[k])) fail("r4q_not_ready");
+    }
+
+    /* Keep the three real READY events, then take every remaining entry for the
+     * backlog of another share: the array only holds (owner, event) pairs, so a
+     * copy of a queued event is exactly what a full queue looks like to a push. */
+    size_t cap = sizeof share_evq / sizeof share_evq[0];
+    share_evt real[3];
+    size_t n = 0;
+    for (size_t i = 0; i < cap; i++)
+        if (share_evq[i].owner && n < 3) real[n++] = share_evq[i];
+    if (n != 3) fail("r4q_three_ready_events");
+    for (size_t i = 0; i < cap; i++) share_evq[i].owner = NULL;
+    for (size_t i = 0; i < 3; i++) share_evq[i] = real[i]; /* A, B, C first */
+    for (size_t i = 3; i < cap; i++) {
+        share_evq[i].owner = share_evq[1].owner;
+        share_evq[i].ev = share_evq[1].ev;
+    }
+
+    /* A's file changes while the queue is full: the push must be refused and the
+     * event kept pending, not spent. */
+    snprintf(p, sizeof p, "%s/r4qa/p0.bin", scratch_root);
+    {
+        int fd = open(p, O_WRONLY);
+        if (fd < 0) fail("r4q_edit_open");
+        uint8_t one = 0x5A;
+        if (pwrite(fd, &one, 1, 11) != 1) fail("r4q_edit_pwrite");
+        close(fd);
+    }
+    ntx_share_test_advance_ms(1500);
+    ntx_session_share_tick(x.s);
+    if (ntx_session_share_state(x.s, ti[0]) != NTX_SHARE_FAILED) fail("r4q_not_failed");
+    for (size_t i = 0; i < cap; i++)
+        if (share_evq[i].owner == x.s->share[ti[0]] && !share_evq[i].ev.ok)
+            fail("r4q_queued_while_full");
+
+    /* Drain everything; the pending error has to survive to the next attempt. */
+    int seen_ready = 0, got_err = 0, spins = 0;
+    for (int i = 0; i < 400 && !got_err; i++) {
+        ntx_share_event ev;
+        if (ntx_session_share_poll_event(x.s, &ev)) {
+            if (ev.i != ti[0]) continue; /* the other shares' backlog */
+            if (ev.ok) seen_ready = 1;
+            else if (ev.err == NTX_SHARE_E_CHANGED) got_err = 1;
+            continue;
+        }
+        if (++spins > 60) break; /* no event and no progress: the queue is empty */
+        ntx_session_share_tick(x.s);
+    }
+    if (!seen_ready) fail("r4q_ready_lost");
+    if (!got_err) fail("r4q_error_event_lost");
+    for (int k = 0; k < 3; k++) ntx_session_remove(x.s, ti[k]);
+    sess_close(&x);
+    tracker_stop(&tr);
+    ok("evq_full_delays");
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     scratch_root_init();
@@ -2450,6 +2639,8 @@ int main(void) {
     test_failed_share_is_dead();
     test_halt_after_change();
     test_halt_after_io();
+    test_error_after_ready();
+    test_evq_full_delays();
     ntx_share_trackers_test_set(NULL, -1);
     printf("ALL PASS\n");
     return 0;
