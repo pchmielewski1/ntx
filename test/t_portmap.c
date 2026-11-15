@@ -477,6 +477,44 @@ static void one_torrent(sess *x) {
     ntx_torrent_init_meta(&x->s->tts[0], ih);
 }
 
+/* ---- R9 helpers: a port nobody listens on, and a real-clock loop counter ---- */
+
+/* An ephemeral port that is bound, learned and immediately released: nothing
+ * answers there, so every datagram the driver's connect()ed socket sends comes
+ * back as ICMP port-unreachable — the R9 repro, without a fake gateway. */
+static uint16_t dead_port(void) {
+    uint16_t p = 0;
+    int fd = udp_loopback(&p);
+    close(fd);
+    return p;
+}
+
+/* The review's repro, in one step: put one ICMP port-unreachable on the
+ * connect()ed socket and leave it there. Nothing else will send from here (the
+ * sequence is over), so with no close callback the pending error holds EPOLLERR
+ * asserted and the loop never blocks again. */
+static void pm_arm_icmp(struct ntx_portmap *pm) {
+    uint8_t one[2] = {0, 0};
+    (void)send(pm->fd, one, sizeof one, MSG_DONTWAIT);
+    struct timespec ts = {0, 100 * 1000 * 1000};
+    nanosleep(&ts, NULL);
+}
+
+/* How many loop iterations `ms` of wall time buys. With a pending ICMP error and
+ * no close callback, epoll_wait returns instantly forever — that is the 100% CPU
+ * spin of R9 (581 577 events in 0,3 s in the review's repro). */
+static long pm_loop_iters(ntx_netx *n, int ms) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    long iters = 0;
+    for (;;) {
+        ntx_netx_run_once(n, 20);
+        iters++;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 >= ms) return iters;
+    }
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     ntx_rng_init();
@@ -922,6 +960,108 @@ int main(void) {
         ntx_session_portmap_stop(x.s);
         sess_close(&x);
     }
+
+    /* ---- N. R9: ICMP port-unreachable must not spin the loop.
+
+     * The gateway port is a port that was bound and released, so nothing listens:
+     * every datagram the connect()ed driver socket sends comes back as ICMP
+     * port-unreachable, which a connected UDP socket reports as a pending SO_ERROR
+     * and epoll as level-triggered EPOLLERR. With nothing reading SO_ERROR the loop
+     * never blocks (the review's repro: 581 577 events in 0,3 s) and the discarded
+     * send() result loses the retransmission. The outstanding request is read from
+     * the driver because the fake gateway cannot see datagrams sent to a dead port —
+     * req/reqlen is verbatim what goes on the wire. */
+    {
+        sess x;
+        sess_open(&x, "n");
+        x.cfg.port_map = 1;
+        ntx_portmap_test_set_gateway_port(dead_port());
+        pm_start(&x);
+        ck_eq(x.s->pm->phase, PM_PH_TCP, "N_pcp_tcp_outstanding");
+        ck_eq(x.s->pm->fam, PM_PCP, "N_starts_as_pcp");
+        ck_eq((long)x.s->pm->reqlen, 60, "N_pcp_request_on_wire");
+
+        /* One pass of the loop is what has to see the error and judge it: EPOLLIN
+         * and EPOLLERR are reported together and the clock never moves here, so the
+         * verdict comes from the socket, not from a retransmission. */
+        int spins = 0;
+        while (x.s->pm->fam == PM_PCP && spins++ < 50) {
+            struct timespec ts = {0, 5 * 1000 * 1000};
+            nanosleep(&ts, NULL);
+            ntx_netx_run_once(x.n, 2);
+        }
+        ck_eq(x.s->pm->fam, PM_NATPMP, "N_pcp_refused_falls_back_to_natpmp");
+        ck_eq(x.s->pm->phase, PM_PH_ADDR, "N_fallback_is_natpmp_addr_query");
+        ck_eq((long)x.s->pm->reqlen, 2, "N_natpmp_addr_query_on_wire");
+        ck(x.s->pm->req[0] == 0 && x.s->pm->req[1] == 0, "N_natpmp_addr_request_bytes");
+        ck_eq(x.s->pm->tries, 1, "N_fallback_gets_a_fresh_schedule");
+
+        /* NAT-PMP reaches the same dead port: the loop, on its own and with the
+         * clock standing still, must judge that refusal too. */
+        spins = 0;
+        while (ntx_session_portmap_state(x.s) == NTX_PM_PENDING && spins++ < 50) {
+            struct timespec ts = {0, 5 * 1000 * 1000};
+            nanosleep(&ts, NULL);
+            ntx_netx_run_once(x.n, 2);
+        }
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "N_none_after_both_refused");
+        ck_eq(x.s->pm->fam, PM_NATPMP, "N_no_pingpong_back_to_pcp");
+        ck_eq(x.s->pm->phase, -1, "N_nothing_outstanding");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "N_none_adv_port");
+
+        /* None is final: no re-opened sequence, and no step back to PCP. */
+        for (int i = 0; i < 4; i++) {
+            ntx_portmap_test_advance_ms(60000);
+            pm_tick(&x);
+            ntx_netx_run_once(x.n, 2);
+        }
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "N_none_stays_quiet");
+        ck_eq(x.s->pm->phase, -1, "N_quiet_nothing_outstanding");
+        ck_eq(x.s->pm->tries, 0, "N_quiet_no_retries");
+
+        /* The 100 % CPU case, measured on a live error: one more ICMP on the socket,
+         * then 1 s of wall time must still buy a bounded number of loop iterations.
+         * Nothing sends from here any more, so pre-fix the error stays pending,
+         * epoll_wait returns instantly forever and this counts >100 000 iterations. */
+        pm_arm_icmp(x.s->pm);
+        long iters = pm_loop_iters(x.n, 1000);
+        if (iters >= 5000) printf("  (spin: %ld loop iterations in 1 s)\n", iters);
+        ck(iters < 5000, "N_bounded_loop_after_icmp");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "N_spin_does_not_reopen");
+
+        gw_drain();
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- N2. R9: a hard send error (not a refusal) ends the attempt.
+
+     * shutdown(SHUT_WR) makes every send fail with EPIPE, which is not a "no
+     * responder" refusal. The result must not be discarded into the retry budget:
+     * the attempt ends there and the state says none. */
+    {
+        sess x;
+        sess_open(&x, "n2");
+        x.cfg.port_map = 1;
+        ntx_portmap_test_set_gateway_port(dead_port());
+        pm_start(&x);
+        ck_eq(x.s->pm->phase, PM_PH_TCP, "N2_pcp_tcp_outstanding");
+        shutdown(x.s->pm->fd, SHUT_WR);
+        ntx_portmap_test_advance_ms(260);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "N2_hard_send_error_ends_attempt");
+        ck_eq(x.s->pm->phase, -1, "N2_nothing_outstanding");
+        ck(x.s->pm->tries <= 1, "N2_no_retry_budget_burned");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "N2_none_adv_port");
+        /* A dead socket must not keep the loop awake either. */
+        long iters = pm_loop_iters(x.n, 500);
+        if (iters >= 5000) printf("  (spin: %ld loop iterations in 0,5 s)\n", iters);
+        ck(iters < 5000, "N2_bounded_loop_after_send_error");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    ntx_portmap_test_set_gateway_port(gw_port);
 
     close(gwd);
     if (fails) {

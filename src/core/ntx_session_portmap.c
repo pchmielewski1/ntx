@@ -61,6 +61,7 @@ struct ntx_portmap {
     uint64_t renew_at[PM_NPH]; /* virtual ms */
     uint32_t epoch;
     int epoch_seen;            /* 0 until the first PCP answer: no baseline */
+    int fallback_used;    /* the one PCP → NAT-PMP step of this sequence is spent (R9) */
 };
 
 /* Process globals because the test hooks take no session. Production never sets
@@ -244,6 +245,7 @@ static void pm_reset(struct ntx_portmap *pm, ntx_pm_state st) {
     pm->gave_up = 0;
     pm->addr_done = 0;
     pm->epoch_seen = 0;
+    pm->fallback_used = 0; /* the PCP → NAT-PMP step is per sequence, not per process (R9) */
     pm->st = st;
 }
 
@@ -277,11 +279,71 @@ static void pm_build(struct ntx_portmap *pm, int phase, uint32_t lifetime, uint1
         pm->reqlen = natpmp_build_map(pm->req, pm_op_of(phase), lp, sugg_port, lifetime);
 }
 
+/* The ICMP answer for a datagram sent on the connect()ed socket lives in SO_ERROR.
+ * Reading it is the only thing that clears a level-triggered EPOLLERR, and the only
+ * way this driver learns "nothing listens at the gateway port" (R9). */
+static int pm_drain_err(struct ntx_portmap *pm) {
+    int err = 0;
+    socklen_t len = sizeof err;
+    if (getsockopt(pm->fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0) return 0;
+    return err;
+}
+
+static void pm_start_query(struct ntx_portmap *pm, int phase, uint16_t sugg_port);
+static void pm_give_up_phase(struct ntx_portmap *pm, int ph);
+
+/* Nothing at the gateway port answered at all (R9). §8 keeps the order PCP first,
+ * NAT-PMP second; the step is allowed once per sequence and never backwards, so a
+ * gateway that answers neither cannot be ping-ponged between the two families. */
+static void pm_refused(struct ntx_portmap *pm, int ph) {
+    pm->phase = -1;
+    pm->tries = 0;
+    if (pm->fam == PM_PCP && !pm->fallback_used) {
+        /* The same step a UNSUPP_VERSION answer takes (RFC 6886 §3.5): start over as
+         * NAT-PMP, whose sequence opens with the external-address query. */
+        pm->fallback_used = 1;
+        pm->fam = PM_NATPMP;
+        pm->addr_done = 0;
+        pm_start_query(pm, PM_PH_ADDR, 0);
+        return;
+    }
+    pm_give_up_phase(pm, ph);
+}
+
+/* The one verdict for both ways the socket reports trouble (SO_ERROR via the close
+ * callback, or the errno of send()). ECONNREFUSED is the ICMP port-unreachable of a
+ * gateway without a PCP/NAT-PMP responder; anything else is a socket that cannot
+ * send at all (EPIPE, ENOBUFS …), and nine retries of a datagram the kernel refused
+ * is pure delay. ponytail: the hard-error path takes no NAT-PMP step — the fallback
+ * rides the same fd, so a broken socket says nothing about a protocol. */
+static void pm_sock_err(struct ntx_portmap *pm, int err) {
+    /* An error says something only while a query is outstanding; with nothing
+     * outstanding it is stale — drained, judged as nothing, the spin is gone. This
+     * also makes the two report paths (recvfrom and the close callback, which epoll
+     * hands out in the same event) safe against judging one error twice. */
+    if (pm->phase < 0) return;
+    int ph = pm->phase;
+    pm->phase = -1;
+    pm->tries = 0;
+    if (err == ECONNREFUSED) {
+        pm_refused(pm, ph);
+        return;
+    }
+    pm_give_up_phase(pm, ph);
+}
+
+/* The result of send() is never discarded (R9): trouble is judged here and the
+ * retransmission schedule only gets the next say when the datagram went out. */
 static void pm_send(struct ntx_portmap *pm) {
-    if (pm->fd < 0) return;
-    /* A connected UDP socket reports only the peer's ICMP trouble; whatever the
-     * answer, the retransmission schedule gets the next say. */
-    (void)send(pm->fd, pm->req, pm->reqlen, 0);
+    if (pm->fd < 0 || pm->phase < 0) return;
+    /* Drain before sending: the pending error belongs to the datagram that caused it
+     * and must not be blamed on this one, and while it stays pending EPOLLERR keeps
+     * firing, which is the spin. */
+    (void)pm_drain_err(pm);
+    if (send(pm->fd, pm->req, pm->reqlen, 0) < 0) {
+        pm_sock_err(pm, errno ? errno : EIO);
+        return;
+    }
     pm->tries++;
     pm->next_try = pm_now() + pm->gap;
     pm->gap *= 2;
@@ -314,6 +376,7 @@ static void pm_send_deletes(struct ntx_portmap *pm) {
         } else {
             n = natpmp_build_map(buf, pm_op_of(ph), lp, pm->ext[ph], 0);
         }
+        (void)pm_drain_err(pm); /* an ICMP for the last live query must not skip this delete (R9) */
         if (send(pm->fd, buf, n, 0) < 0) break;
     }
 }
@@ -432,6 +495,16 @@ static void pm_on_rw(int fd, void *ctx) {
     }
 }
 
+/* EPOLLERR/EPOLLHUP (R9). The error must be read here, in the callback epoll gives
+ * for it: an unread SO_ERROR stays pending, the level-triggered event never goes
+ * away and the loop stops blocking. */
+static void pm_on_err(void *ctx) {
+    struct ntx_portmap *pm = (struct ntx_portmap *)ctx;
+    if (pm->fd < 0) return;
+    int err = pm_drain_err(pm);
+    if (err) pm_sock_err(pm, err);
+}
+
 /* Read the route, judge whether mapping makes sense, open the gateway socket.
  * Returns 0 when the answer is permanently no (no route, or no NAT in the way). */
 static int pm_open(struct ntx_portmap *pm) {
@@ -469,12 +542,15 @@ static int pm_open(struct ntx_portmap *pm) {
             return 0;
         }
     }
-    /* No close callback on purpose: an ICMP error for a datagram the gateway never
-     * answered raises EPOLLERR on a connected UDP socket, and that is a soft error
-     * the retransmission schedule already covers. */
+    /* A connected UDP socket reports the gateway's ICMP port-unreachable as a
+     * pending SO_ERROR, and epoll then holds EPOLLERR asserted until somebody reads
+     * it. Without the close callback the loop would never block again (R9: 581 577
+     * events in 0,3 s), so pm_on_err is what clears it — and what turns the error
+     * into the "no PCP/NAT-PMP here" verdict. */
     ntx_cbs cbs;
     memset(&cbs, 0, sizeof cbs);
     cbs.r = pm_on_rw;
+    cbs.cl = pm_on_err;
     pm->fd = fd;
     pm->fam = PM_PCP;
     pm->st = NTX_PM_PENDING;
