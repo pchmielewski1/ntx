@@ -114,7 +114,9 @@ Behaviour worth knowing:
   session.
 - `--port-map` / `--no-port-map` decide whether `ntx` asks the gateway for an external
   port while the share runs (design §8); the public swarm is never mapped. Port
-  mapping is on by default whenever a share is live and off otherwise.
+  mapping is on by default whenever a share is live and off otherwise. The mapping
+  never holds up the magnet: `started` waits for it at most 4 s, then goes out on the
+  listen port, and a mapping granted later re-announces with the external port.
 - With `--share-from` the sequence above changes in two places. Step 1 additionally reads and
   accepts or rejects the `.torrent` (see the option row), and step 3 neither builds nor
   writes a metainfo — the `.torrent` on disk is kept exactly as it is and only the magnet

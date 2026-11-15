@@ -14,6 +14,14 @@ typedef enum {
     NTX_PM_CGNAT = 4
 } ntx_pm_state;
 
+/* How long a share waits in PENDING before it announces on the listen port
+ * (R11, design §5.5/§8). The retransmission schedule of a gateway that never
+ * answers runs to ~64 s (NAT-PMP, RFC 6886 §3.1) or ~128 s (PCP, RFC 6887 §8.1.1)
+ * before the driver gives up, and the magnet is worthless for all of it. The
+ * mapping keeps running in the background: a late grant re-announces with the
+ * external port. */
+#define NTX_PM_SHARE_SETTLE_MS 4000u
+
 void ntx_session_portmap_want(struct ntx_session *s, int on); /* share add/remove; honours cfg->port_map */
 void ntx_session_portmap_tick(struct ntx_session *s);
 void ntx_session_portmap_stop(struct ntx_session *s); /* lifetime 0, bounded, at exit */

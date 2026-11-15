@@ -167,7 +167,7 @@ static void scratch(void) {
                                        "from","fromchg","fromerr","fromdup","fromio","fromserve",
                                        "frompread","store","during","durtrunc",
                                        "r7dead","r7hash","r7pend",
-                                       "r5chg","r5io","r4evt","r4qa"};
+                                       "r5chg","r5io","r4evt","r4qa","r11","r11b"};
     for (size_t k = 0; k < sizeof tags / sizeof tags[0]; k++) {
         char d[640];
         snprintf(d, sizeof d, "%s/%s", scratch_root, tags[k]);
@@ -608,6 +608,276 @@ static uint64_t pump_until_hashed(sess *x, int ti, int max_ticks, int *out_ticks
 static void pump_announces(sess *x, int ti) {
     for (int k = 0; k < NTX_SESSION_MAX_TRK; k++) x->s->trk_http_due[ti][k] = 0;
     ntx_session_trk_pump_http(x->s, NTX_SESSION_MAX_TRK);
+}
+
+static int tr_count(tracker *t, const char *needle); /* below, with the R5 helpers */
+
+/* --- R11 helpers: a real driver against a gateway that never answers ---------
+ * pm_park pins the ENUM; this case needs the real state machine, so the driver is
+ * pointed at a fake UDP socket that only receives (the silent gateway of R11) and
+ * at a route fixture under the scratch tree. Same fixture shape t_portmap.c uses:
+ * /proc/net/route prints the gateway as a host-byte-order hex u32. */
+static char r11_v4[256], r11_v6[256];
+
+/* The driver's cap and the port its grant will carry, spelled out here instead of
+ * read from the driver: the case must fail on the BEHAVIOUR it is about (R11), not
+ * on a missing macro. */
+#define R11_SETTLE_MS 4000u
+#define R11_EXT 40123u
+
+static void r11_routes(uint16_t port) {
+    snprintf(r11_v4, sizeof r11_v4, "%s/r11_route4", scratch_root);
+    snprintf(r11_v6, sizeof r11_v6, "%s/r11_route6", scratch_root);
+    char line[512];
+    snprintf(line, sizeof line,
+             "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+             "lo\t00000000\t0100007F\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+             "lo\t0100007F\t00000000\t0001\t0\t0\t100\t000000FF\t0\t0\t0\n");
+    FILE *f = fopen(r11_v4, "w");
+    if (!f) fail("r11_route4_open");
+    fputs(line, f);
+    fclose(f);
+    snprintf(line, sizeof line,
+             "00000000000000000000000000000000 00 00000000000000000000FFFF7F000001 40 "
+             "00000000000000000000000000000000 00000100 00000001 00000000 00000001 lo\n");
+    f = fopen(r11_v6, "w");
+    if (!f) fail("r11_route6_open");
+    fputs(line, f);
+    fclose(f);
+    ntx_portmap_test_set_route_files(r11_v4, r11_v6);
+    ntx_portmap_test_set_gateway_port(port);
+}
+
+/* A UDP socket bound and never read: the driver's datagrams go there, nothing
+ * ever answers, and no ICMP comes back (it is alive), so this is the SILENT
+ * gateway of R11 — neither PCP nor NAT-PMP replies. */
+static int r11_gw_start(uint16_t *port) {
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(0x7f000001);
+    if (fd < 0 || bind(fd, (struct sockaddr *)&a, sizeof a) != 0) fail("r11_gw_bind");
+    socklen_t al = sizeof a;
+    getsockname(fd, (struct sockaddr *)&a, &al);
+    *port = ntohs(a.sin_port);
+    return fd;
+}
+
+/* ---- R11: a share must not wait on a silent gateway -------------------------
+ * The gate of §5.5 held `started` back until the port map LEFT PENDING. Against a
+ * gateway that answers nothing that is the whole retransmission schedule — nine
+ * sends, doubled, ~64 s over NAT-PMP (the driver's first family is PCP, so ~128 s
+ * of RFC 6887 pacing plus the NAT-PMP fallback). The magnet, which §5.5 promises
+ * as soon as one tracker answers `started`, therefore arrived two minutes late.
+ * Now: after NTX_PM_SHARE_SETTLE_MS the announce goes out on the listen port, and
+ * a grant that arrives later re-announces with the external port. */
+static void test_silent_gateway_settles(void) {
+    scratch();
+    tracker tr;
+    memset(&tr, 0, sizeof tr);
+    tracker_start(&tr);
+    set_test_trackers(&tr, 2);
+    uint16_t gport = 0;
+    int gwd = r11_gw_start(&gport);
+    r11_routes(gport);
+
+    sess x;
+    sess_open(&x, "r11");
+    x.cfg.port_map = 1;
+    char p[256];
+    snprintf(p, sizeof p, "%s/r11/s.bin", scratch_root);
+    mk_file(p, 300000, 141);
+    ntx_share_err e = NTX_SHARE_OK;
+    int ti = ntx_session_share_add(x.s, p, NULL, &e); /* §8: the share wants the map */
+    if (ti < 0) {
+        printf("R11ADD e=%d %s\n", (int)e, ntx_share_err_msg(e));
+        fail("r11_add");
+    }
+    if (!x.s->pm || !x.s->pm->want) fail("r11_portmap_not_requested");
+
+    /* The driver reaches PENDING for real (route read, socket opened), and the
+     * share leaves HASHING, so the §5.5 gate is the only thing left holding. */
+    for (int i = 0; i < 20; i++) ntx_session_tick(x.s);
+    if (ntx_session_portmap_state(x.s) != NTX_PM_PENDING) fail("r11_not_pending");
+    (void)pump_until_hashed(&x, ti, 2000, NULL);
+    if (ntx_session_share_state(x.s, ti) != NTX_SHARE_ANNOUNCING) fail("r11_not_announcing");
+
+    /* Nothing announced while the mapping is pending and the settle window is
+     * still open (the §5.5 behaviour, and the pre-fix state forever). */
+    for (int i = 0; i < 3; i++) {
+        ntx_session_tick(x.s);
+        pump_announces(&x, ti);
+    }
+    if (tracker_count(&tr) != 0) {
+        printf("EARLY[%s]\n", tr.lines);
+        fail("r11_announced_before_settle");
+    }
+
+    /* The clock to just under the cap: still nothing. Just past it: `started` on
+     * the LISTEN port, with the mapping still PENDING. */
+    ntx_share_test_advance_ms(R11_SETTLE_MS - 500);
+    for (int i = 0; i < 3; i++) {
+        ntx_session_tick(x.s);
+        pump_announces(&x, ti);
+    }
+    if (tr_count(&tr, "event=started") != 0) fail("r11_started_before_cap");
+    ntx_share_test_advance_ms(1000);
+    for (int i = 0; i < 8 && tr_count(&tr, "event=started") < 1; i++) {
+        ntx_session_tick(x.s);
+        pump_announces(&x, ti);
+    }
+    if (ntx_session_portmap_state(x.s) != NTX_PM_PENDING) fail("r11_map_still_pending");
+    if (tr_count(&tr, "event=started") < 1) {
+        printf("TRK[%s]\n", tr.lines);
+        fail("r11_no_started_after_settle");
+    }
+    char want[64];
+    snprintf(want, sizeof want, "port=%u&", (unsigned)ntx_netx_port(x.n));
+    if (!strstr(tr.lines, want)) {
+        printf("TRK[%s]\n", tr.lines);
+        printf("WANT[%s]\n", want);
+        fail("r11_started_not_on_listen_port");
+    }
+    if (!x.s->trk_started_ok[ti]) fail("r11_started_ok");
+
+    /* The late grant: the canned PCP SUCCESS for the request the driver has
+     * outstanding. The port it carries must reach a LATER announce. */
+    struct sockaddr_in from;
+    socklen_t fl = sizeof from;
+    uint8_t req[2048], rsp[60];
+    ssize_t rn = -1;
+    for (int i = 0; i < 40 && rn < 0; i++) {
+        ntx_portmap_test_advance_ms(1000); /* walk the retransmission schedule */
+        ntx_session_portmap_tick(x.s);
+        rn = recvfrom(gwd, req, sizeof req, MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
+    }
+    if (rn != 60 || req[1] != 1 || req[36] != 6) {
+        printf("REQ n=%zd\n", rn);
+        fail("r11_no_pcp_request_outstanding");
+    }
+    memset(rsp, 0, sizeof rsp);
+    rsp[0] = 2;
+    rsp[1] = 0x81;
+    rsp[4] = 0; rsp[5] = 0x1c; rsp[6] = 0x20; rsp[7] = 0; /* lifetime 7200 */
+    rsp[8] = 0; rsp[9] = 0; rsp[10] = 0; rsp[11] = 7;    /* epoch */
+    memcpy(rsp + 24, req + 24, 12);                      /* its nonce */
+    rsp[36] = req[36];
+    rsp[40] = req[40];
+    rsp[41] = req[41];
+    rsp[42] = (uint8_t)(R11_EXT >> 8);
+    rsp[43] = (uint8_t)R11_EXT;
+    rsp[44] = 0xff; rsp[45] = 0xff;                       /* IPv4-mapped … */
+    rsp[56] = 203; rsp[57] = 0; rsp[58] = 113; rsp[59] = 9;
+    if (sendto(gwd, rsp, sizeof rsp, 0, (struct sockaddr *)&from, fl) < 0) fail("r11_gw_send");
+    for (int i = 0; i < 40; i++) ntx_netx_run_once(x.n, 2);
+    if (ntx_session_portmap_state(x.s) != NTX_PM_ACTIVE) fail("r11_not_active_after_grant");
+    if (ntx_session_adv_port(x.s) != (uint16_t)R11_EXT) fail("r11_adv_port");
+
+    snprintf(want, sizeof want, "port=%u&", (unsigned)R11_EXT);
+    int got_ext = 0;
+    for (int i = 0; i < 8 && !got_ext; i++) {
+        ntx_session_tick(x.s);
+        pump_announces(&x, ti);
+        tracker_drain(&tr);
+        got_ext = strstr(tr.lines, want) != NULL;
+    }
+    if (!got_ext) {
+        printf("TRK2[%s]\n", tr.lines);
+        printf("WANT[%s]\n", want);
+        fail("r11_no_reannounce_with_ext_port");
+    }
+
+    ntx_session_remove(x.s, ti);
+    sess_close(&x);
+    tracker_stop(&tr);
+    close(gwd);
+    ntx_portmap_test_set_route_files(NULL, NULL);
+    ntx_portmap_test_set_gateway_port(0);
+    ok("silent_gateway_settles");
+}
+
+/* ---- R11 b: the mapping gives up AFTER the share already announced ----------
+ * The interaction with R9's error paths: the settle cap fired, `started` went out
+ * on the listen port, and the sequence then runs its budget out. The share must
+ * stay up on the listen port, announce no second `started`, and the driver must
+ * still reach `none` exactly as it did before the cap existed. */
+static void test_silent_gateway_gives_up(void) {
+    scratch();
+    tracker tr;
+    memset(&tr, 0, sizeof tr);
+    tracker_start(&tr);
+    set_test_trackers(&tr, 2);
+    uint16_t gport = 0;
+    int gwd = r11_gw_start(&gport);
+    r11_routes(gport);
+
+    sess x;
+    sess_open(&x, "r11b");
+    x.cfg.port_map = 1;
+    char p[256];
+    snprintf(p, sizeof p, "%s/r11/t.bin", scratch_root);
+    mk_file(p, 100000, 142);
+    ntx_share_err e = NTX_SHARE_OK;
+    int ti = ntx_session_share_add(x.s, p, NULL, &e);
+    if (ti < 0) fail("r11b_add");
+    (void)pump_until_hashed(&x, ti, 2000, NULL);
+    if (ntx_session_share_state(x.s, ti) != NTX_SHARE_ANNOUNCING) fail("r11b_not_announcing");
+
+    /* §5.5 held it back while the mapping was pending and the window was open, then
+     * the cap let it go — both on the share's own clock, so neither is a race. */
+    for (int i = 0; i < 3; i++) {
+        ntx_session_tick(x.s);
+        pump_announces(&x, ti);
+    }
+    if (tr_count(&tr, "event=started") != 0) fail("r11b_started_before_cap");
+    ntx_share_test_advance_ms(R11_SETTLE_MS + 1000);
+    for (int i = 0; i < 400 && tr_count(&tr, "event=started") < 1; i++) {
+        ntx_session_tick(x.s);
+        pump_announces(&x, ti);
+    }
+    if (tr_count(&tr, "event=started") < 1) fail("r11b_no_started_after_settle");
+    if (ntx_session_portmap_state(x.s) != NTX_PM_PENDING) fail("r11b_still_pending");
+    x.s->share[ti]->fstat_at = UINT64_MAX; /* the fstat is not what this case tests */
+
+    /* Walk the whole retransmission schedule of the silent gateway: step the
+     * virtual clock to each scheduled instant and let one tick do the one send it
+     * is allowed to do, exactly as t_portmap's case D drives it. */
+    int steps = 0;
+    while (ntx_session_portmap_state(x.s) == NTX_PM_PENDING && steps++ < 60) {
+        long w = (long)(x.s->pm->next_try - pm_now());
+        ntx_portmap_test_advance_ms((uint64_t)(w > 0 ? w + 5 : 5));
+        ntx_session_portmap_tick(x.s);
+    }
+    for (int i = 0; i < 10; i++) ntx_session_tick(x.s);
+    if (ntx_session_portmap_state(x.s) != NTX_PM_NONE) {
+        printf("PMSTATE=%d PH=%d TRIES=%d FAM=%d GAP=%u WAIT=%lld STEPS=%d\n", (int)ntx_session_portmap_state(x.s),
+               x.s->pm->phase, x.s->pm->tries, x.s->pm->fam, x.s->pm->gap,
+               (long long)(x.s->pm->next_try - pm_now()), steps);
+        fail("r11b_none_after_budget");
+    }
+    if (ntx_session_share_state(x.s, ti) != NTX_SHARE_READY &&
+        ntx_session_share_state(x.s, ti) != NTX_SHARE_ANNOUNCING)
+        fail("r11b_share_died_with_the_mapping");
+    if (ntx_session_adv_port(x.s) != (uint16_t)ntx_netx_port(x.n)) fail("r11b_adv_port");
+
+    int started = tr_count(&tr, "event=started");
+    for (int i = 0; i < 4; i++) {
+        ntx_session_tick(x.s);
+        pump_announces(&x, ti);
+    }
+    if (tr_count(&tr, "event=started") != started) fail("r11b_second_started_announce");
+    char want[64];
+    snprintf(want, sizeof want, "port=%u&", (unsigned)ntx_netx_port(x.n));
+    if (!strstr(tr.lines, want)) fail("r11b_not_on_listen_port");
+
+    ntx_session_remove(x.s, ti);
+    sess_close(&x);
+    tracker_stop(&tr);
+    close(gwd);
+    ntx_portmap_test_set_route_files(NULL, NULL);
+    ntx_portmap_test_set_gateway_port(0);
+    ok("silent_gateway_gives_up");
 }
 
 /* --- R5 helpers -------------------------------------------------------------
@@ -2620,6 +2890,8 @@ int main(void) {
     test_add_gates();
     test_hash_and_results();
     test_started_and_magnet();
+    test_silent_gateway_settles();
+    test_silent_gateway_gives_up();
     test_remove_during_hash();
     test_store_dir_on_demand();
     test_pin_fail();

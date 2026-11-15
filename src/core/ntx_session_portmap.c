@@ -23,10 +23,18 @@
  * schedule, the lifetime cap (RFC 6887 §8.3) and the epoch-rollback check
  * (§8.5). Everything static here is pm_-prefixed for the unity build. */
 
-#define PM_LIFE_S 7200u  /* §8: ask for two hours, renew at half the grant */
-#define PM_PROBE_MS 250u /* RFC 6887 §8.1.1: first retry, then doubled … */
-#define PM_MAX_TRIES 9u  /* … at most nine sends per query, hard cap */
-#define PM_RX_BUDGET 8   /* datagrams handled per read callback */
+#define PM_LIFE_S 7200u /* §8: ask for two hours, renew at half the grant */
+/* Retransmission pacing, per family. RFC 6887 §8.1.1: IRT 3 s, doubled per
+ * retransmission up to MRT 1024 s, each interval jittered by ±10%. RFC 6886 §3.1:
+ * 250 ms, doubled, nine attempts, no jitter and no MRT — nine sends from 250 ms
+ * end at 64 s, so the attempt cap is what stops NAT-PMP. (The one pair of
+ * constants this file used before was the NAT-PMP schedule labelled RFC 6887 —
+ * R11.) */
+#define PM_PCP_IRT_MS 3000u     /* RFC 6887 §8.1.1 IRT */
+#define PM_PCP_MRT_MS 1024000u  /* RFC 6887 §8.1.1 MRT */
+#define PM_NATPMP_IRT_MS 250u   /* RFC 6886 §3.1 initial interval */
+#define PM_MAX_TRIES 9u         /* nine sends per query, both families */
+#define PM_RX_BUDGET 8          /* datagrams handled per read callback */
 
 /* One outstanding query at a time, in this order. The NAT-PMP external-address
  * query exists only in the fallback: it is how CGNAT is found without PCP. */
@@ -260,6 +268,15 @@ static void pm_warn_cgnat(void) {
  * back verbatim precisely because the cap is a session policy, so it is ours. */
 static uint32_t pm_cap_life(uint32_t granted) { return granted > PM_LIFE_S ? PM_LIFE_S : granted; }
 
+/* RFC 6887 §8.1.1: every retransmission interval is jittered by up to 10%, so a
+ * fleet of clients behind one gateway does not retransmit in lockstep. Spread
+ * uniformly over [ms − ms/10, ms + ms/10]. */
+static uint32_t pm_jitter(uint32_t ms) {
+    if (ms < 10u) return ms;
+    uint32_t half = ms / 10u;
+    return ms - half + ntx_rand_u32() % (2u * half + 1u);
+}
+
 static int pm_udp_wanted(const struct ntx_portmap *pm) { return pm->cfg && pm->cfg->utp; }
 
 static uint8_t pm_op_of(int phase) { return (uint8_t)(phase == PM_PH_UDP ? 1 : 2); }
@@ -345,8 +362,11 @@ static void pm_send(struct ntx_portmap *pm) {
         return;
     }
     pm->tries++;
-    pm->next_try = pm_now() + pm->gap;
-    pm->gap *= 2;
+    /* The wait just spent is the schedule's current interval, jittered for PCP
+     * (§8.1.1); `gap` stays the un-jittered base and doubles for the next one,
+     * never past MRT. NAT-PMP doubles freely — nine sends from 250 ms end at 64 s. */
+    pm->next_try = pm_now() + (pm->fam == PM_PCP ? pm_jitter(pm->gap) : pm->gap);
+    pm->gap = (pm->fam == PM_PCP && pm->gap >= PM_PCP_MRT_MS / 2u) ? PM_PCP_MRT_MS : pm->gap * 2u;
 }
 
 /* Start a query from scratch: fresh nonce, fresh schedule, sent now. */
@@ -354,7 +374,7 @@ static void pm_start_query(struct ntx_portmap *pm, int phase, uint16_t sugg_port
     if (phase < 0 || pm->fd < 0) return;
     if (phase != PM_PH_ADDR) ntx_rand_bytes(pm->nonce, sizeof pm->nonce);
     pm->tries = 0;
-    pm->gap = PM_PROBE_MS;
+    pm->gap = pm->fam == PM_PCP ? PM_PCP_IRT_MS : PM_NATPMP_IRT_MS;
     pm_build(pm, phase, PM_LIFE_S, sugg_port);
     if (phase != PM_PH_ADDR) memcpy(pm->grant_nonce[phase], pm->nonce, sizeof pm->nonce);
     pm_send(pm);

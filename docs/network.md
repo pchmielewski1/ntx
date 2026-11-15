@@ -703,11 +703,20 @@ blocking calls.
   nonce, protocol and internal port all match the request; a result code other than `SUCCESS`
   is a failure, so a mapping is only what a grant says. Nothing past the declared length is
   read. The server's lifetime is taken verbatim and then capped by the driver (RFC 6887 §8.3).
-- **Retransmission and lifetime.** Nine sends per query at most, the gap starting at
-  `PM_PROBE_MS` (250 ms) and doubling (RFC 6887 §8.1.1). A grant is requested for 7200 s and
-  renewed at half the granted lifetime. A PCP epoch rollback resets the state. On exit
-  `ntx_session_portmap_stop()` sends lifetime-0 delete requests, bounded in time like the
-  `stopped` announces.
+- **Retransmission and lifetime.** Nine sends per query at most, with the pacing each
+  protocol specifies: PCP starts at IRT 3 s and doubles up to MRT 1024 s, every interval
+  jittered by ±10% (RFC 6887 §8.1.1, `PM_PCP_IRT_MS` / `PM_PCP_MRT_MS`); NAT-PMP starts at
+  250 ms and doubles, no jitter, so its nine sends end at 64 s (RFC 6886 §3.1,
+  `PM_NATPMP_IRT_MS`). A grant is requested for 7200 s and renewed at half the granted
+  lifetime. A PCP epoch rollback resets the state. On exit `ntx_session_portmap_stop()`
+  sends lifetime-0 delete requests, bounded in time like the `stopped` announces.
+- **A share does not wait for the gateway.** A `pending` mapping holds the `started`
+  announce (design §5.5) for at most `NTX_PM_SHARE_SETTLE_MS` (4 s): after that the announce
+  goes out with the **listen** port and the magnet is delivered, while the mapping keeps
+  running in the background. A grant that arrives later changes the port the share advertises,
+  which re-announces with the **external** port (R11 — without the cap, a gateway that answers
+  nothing delayed every magnet by the whole retransmission schedule, ~64 s over NAT-PMP and
+  ~128 s over PCP).
 - **Where the external port goes.** `ntx_session_adv_port()` returns the mapped external port
   while the TCP mapping is `active`, and the listen port otherwise. It is the port in every
   tracker announce — the `port=` parameter of an HTTP announce, the `port` field of a UDP

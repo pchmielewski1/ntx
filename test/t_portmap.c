@@ -107,6 +107,13 @@ static void ck_eq(long got, long want, const char *what) {
 #define SCRATCH "test/.scratch/portmap"
 #define EXT_PORT 40123
 
+/* The two schedules the RFCs mandate, spelled out here rather than read from the
+ * driver: a test that asked the driver for its own constants could not fail when
+ * the driver had the wrong ones (R11). */
+#define PCP_IRT_MS 3000u   /* RFC 6887 §8.1.1 initial retransmission timeout */
+#define PCP_MRT_MS 1024000u /* RFC 6887 §8.1.1 maximum retransmission timeout */
+#define NATPMP_IRT_MS 250u /* RFC 6886 §3.1 initial interval, doubled, nine sends */
+
 static char *read_all(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return NULL;
@@ -330,6 +337,87 @@ static void pm_tick(sess *x) { ntx_session_portmap_tick(x->s); }
 static void pm_start(sess *x) {
     ntx_session_portmap_want(x->s, 1);
     pm_tick(x);
+}
+
+/* ---- retransmission pacing probes (R11) -------------------------------------
+ * The schedule is read from the driver at the instant a datagram was observed,
+ * which is also the instant the driver computed the next one: `next_try - now` is
+ * then the interval just used and `gap` the un-jittered base of the next, so the
+ * assertions are exact instead of guessed from wall time. Nothing here sleeps. */
+
+/* ms still to wait before the outstanding query is retransmitted. */
+static long pm_wait_ms(const struct ntx_portmap *pm) { return (long)(pm->next_try - pm_now()); }
+
+/* The read above is taken some milliseconds after the driver computed the schedule
+ * with its own pm_now(), and the real clock moves under the virtual offset. Half a
+ * tick of slack covers it without hiding a schedule that is off by seconds. */
+#define PM_WAIT_SLACK 64
+
+/* 1 when the wait just used sits inside `base` ±10% (RFC 6887 §8.1.1 IRT/MRT with
+ * its jitter), plus the slack the real clock accrues between the driver's send and
+ * this read. Exactness of the schedule is pinned on pm->gap, where no clock can
+ * drift. */
+static int pm_wait_jittered(const struct ntx_portmap *pm, uint32_t base) {
+    long w = pm_wait_ms(pm);
+    long slack = (long)base / 10 + PM_WAIT_SLACK;
+    return w >= (long)base - slack && w <= (long)base + slack;
+}
+
+/* 1 when the wait just used is `base` — RFC 6886 §3.1 has no jitter, so the only
+ * tolerance is the slack; the doubling itself is pinned on pm->gap. */
+static int pm_wait_close(const struct ntx_portmap *pm, uint32_t base) {
+    long w = pm_wait_ms(pm);
+    return w >= (long)base - PM_WAIT_SLACK && w <= (long)base + PM_WAIT_SLACK;
+}
+
+/* The jitter itself, decided without any clock: every draw must land in the ±10%
+ * window of RFC 6887 §8.1.1 and the draws must not all be the same value (a
+ * schedule without jitter — the state before R11 — repeats one value forever).
+ * Sampled by putting the schedule at `ms` and letting the driver compute the wait
+ * for its next send, so it is the schedule the driver really uses. */
+static void pm_check_jitter(sess *x, uint32_t ms, const char *tag) {
+    uint32_t lo = ms - ms / 10u, hi = ms + ms / 10u;
+    uint8_t buf[2048];
+    long first = -1;
+    int distinct = 0;
+    for (int i = 0; i < 60; i++) {
+        gw_drain();
+        x->s->pm->gap = ms;
+        pm_send(x->s->pm);
+        long w = pm_wait_ms(x->s->pm);
+        if (w < (long)lo || w > (long)hi) {
+            printf("FAIL %s_out_of_window got=%ld want=%u..%u\n", tag, w, lo, hi);
+            fails++;
+            return;
+        }
+        if (first < 0) first = w;
+        else if (w != first) distinct = 1;
+    }
+    (void)gw_get(buf, sizeof buf);
+    if (!distinct) {
+        printf("FAIL %s_no_jitter all=%ld\n", tag, first);
+        fails++;
+    }
+}
+
+/* One retransmission: nothing may go out before the scheduled instant, and the
+ * datagram must go out once it is reached. 0 = sent early, never sent, or the
+ * schedule had already run out (a wait of 0 means the driver did not wait at all). */
+static int pm_send_at_due(sess *x) {
+    uint8_t buf[2048];
+    long w = pm_wait_ms(x->s->pm);
+    if (w <= 0) return 0;
+    ntx_portmap_test_advance_ms((uint64_t)w - 1);
+    pm_tick(x);
+    if (gw_get(buf, sizeof buf) >= 0) return 0;
+    /* The due instant, plus up to 5 ms of slack for the real clock the driver's
+     * pm_now() also sees (the virtual offset is the only thing the test moves). */
+    for (int i = 0; i < 6; i++) {
+        ntx_portmap_test_advance_ms(1);
+        pm_tick(x);
+        if (gw_get(buf, sizeof buf) >= 0) return 1;
+    }
+    return 0;
 }
 
 static int req_is(const uint8_t *b, ssize_t n, uint8_t proto, uint32_t lifetime) {
@@ -650,7 +738,10 @@ int main(void) {
         sess_close(&x);
     }
 
-    /* ---- D. no reply: 9 attempts (250 ms, doubled) then NONE ---- */
+    /* ---- D. no reply: PCP paces per RFC 6887 §8.1.1 (IRT 3 s, doubled) ----
+     * The gaps are read off the wire against the virtual clock: each one must land
+     * in base ±10% (the RFC's jitter), doubling from 3 s. Nine sends is the hard
+     * cap, so the schedule here is 3 s, 6, 12, 24, 48, 96, 192, 384 s. */
     {
         sess x;
         sess_open(&x, "d");
@@ -660,21 +751,31 @@ int main(void) {
         ck_eq(gw_wait(req, sizeof req, 300), 60, "D_attempt1");
         gw_drain();
         int attempts = 1;
-        uint32_t gap = 250;
+        uint32_t base = PCP_IRT_MS;
         for (int i = 0; i < 8; i++) {
-            ntx_portmap_test_advance_ms(gap - 1);
-            pm_tick(&x);
-            if (gw_pending()) break; /* retried early: the schedule is wrong */
-            ntx_portmap_test_advance_ms(1);
-            pm_tick(&x);
-            if (gw_get(req, sizeof req) < 0) break;
-            gw_drain();
+            uint32_t next = base * 2 > PCP_MRT_MS ? PCP_MRT_MS : base * 2;
+            if (!pm_wait_jittered(x.s->pm, base)) {
+                printf("FAIL D_wait_%d got=%ld want=%u+/-10%%\n", i, pm_wait_ms(x.s->pm), base);
+                fails++;
+                break;
+            }
+            if (x.s->pm->gap != next) {
+                printf("FAIL D_base_%d got=%u want=%u\n", i, x.s->pm->gap, next);
+                fails++;
+                break;
+            }
+            if (!pm_send_at_due(&x)) {
+                printf("FAIL D_send_at_due_%d base=%u wait=%ld\n", i, base, pm_wait_ms(x.s->pm));
+                fails++;
+                break;
+            }
             attempts++;
-            gap *= 2;
+            base = next;
         }
         ck_eq(attempts, 9, "D_nine_attempts");
+        ck(!gw_pending(), "D_no_tenth_attempt");
         ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "D_pending_until_budget_out");
-        ntx_portmap_test_advance_ms(gap);
+        ntx_portmap_test_advance_ms((uint64_t)base * 2); /* past the last scheduled gap */
         pm_tick(&x);
         ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "D_none");
         ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "D_none_adv_port");
@@ -687,6 +788,74 @@ int main(void) {
         }
         gw_drain();
         ck(quiet, "D_none_stays_quiet");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- D2. NAT-PMP paces per RFC 6886 §3.1: 250 ms, doubled, nine attempts.
+     * Reached the way a v1-only gateway is reached: the UNSUPP_VERSION answer.
+     * No jitter here — RFC 6886 knows none — so every gap is an equality. ---- */
+    {
+        sess x;
+        sess_open(&x, "d2");
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t req[2048];
+        ck_eq(gw_wait(req, sizeof req, 300), 60, "D2_pcp_request");
+        const uint8_t unsupp[4] = {0, 0, 0, 1}; /* Vers 0, OP 0, Result 1 = UNSUPP_VERSION */
+        gw_send(unsupp, 4);
+        pump_ms(x.n, 40);
+        ck_eq(gw_wait(req, sizeof req, 300), 2, "D2_natpmp_addr_request");
+        ck(req[0] == 0 && req[1] == 0, "D2_natpmp_addr_query");
+        gw_drain();
+        int attempts = 1;
+        uint32_t base = NATPMP_IRT_MS;
+        for (int i = 0; i < 8; i++) {
+            if (!pm_wait_close(x.s->pm, base)) {
+                printf("FAIL D2_wait_%d got=%ld want=%u\n", i, pm_wait_ms(x.s->pm), base);
+                fails++;
+                break;
+            }
+            if (x.s->pm->gap != base * 2) {
+                printf("FAIL D2_base_%d got=%u want=%u\n", i, x.s->pm->gap, base * 2);
+                fails++;
+                break;
+            }
+            if (!pm_send_at_due(&x)) {
+                printf("FAIL D2_send_at_due_%d base=%u wait=%ld\n", i, base, pm_wait_ms(x.s->pm));
+                fails++;
+                break;
+            }
+            attempts++;
+            base *= 2;
+        }
+        ck_eq(attempts, 9, "D2_nine_attempts_natpmp");
+        ck(!gw_pending(), "D2_no_tenth_attempt_natpmp");
+        ntx_portmap_test_advance_ms(base * 2); /* past the last scheduled gap */
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "D2_none_after_budget");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- D3. the PCP gap doubles but never past MRT (RFC 6887 §8.1.1, 1024 s).
+     * Nine sends per query cannot reach 1024 s on its own, so the doubling step is
+     * driven at the cap directly: with the gap already at MRT, the next step must
+     * stay AT MRT instead of doubling past it. ---- */
+    {
+        sess x;
+        sess_open(&x, "d3");
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t req[2048];
+        ck_eq(gw_wait(req, sizeof req, 300), 60, "D3_request");
+        gw_drain();
+        x.s->pm->gap = 1024000u; /* MRT: the step below would double this */
+        pm_send(x.s->pm);
+        ck_eq(x.s->pm->gap, 1024000u, "D3_doubling_caps_at_MRT");
+        ck_eq(gw_get(req, sizeof req), 60, "D3_send_still_goes_out");
+        pm_check_jitter(&x, PCP_IRT_MS, "D3_jitter_at_IRT");
+        pm_check_jitter(&x, 1024000u, "D3_jitter_at_MRT");
         ntx_session_portmap_stop(x.s);
         sess_close(&x);
     }
@@ -892,9 +1061,14 @@ int main(void) {
         ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "M_no_grant");
         ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "M_no_adv_port");
         ck(!gw_pending(), "M_no_immediate_resend");
-        ntx_portmap_test_advance_ms(260);
-        pm_tick(&x);
-        ck_eq(gw_get(req, sizeof req), 60, "M_resend_on_schedule");
+        /* The outstanding query is PCP, so the schedule it retransmits on is the
+         * RFC 6887 §8.1.1 one: base IRT 3 s, doubled after the first send — not the
+         * 250 ms of RFC 6886 §3.1 that this case used to pin (R11). The base is read
+         * from the driver because the pump below has already spent real clock, which
+         * a `next_try − now` probe could not discount. The jitter itself is pinned on
+         * the wire in case D, where nothing consumes real time around the send. */
+        ck_eq(x.s->pm->gap, 2u * PCP_IRT_MS, "M_resend_schedule");
+        ck(pm_send_at_due(&x), "M_resend_on_schedule");
         ntx_session_portmap_stop(x.s);
         sess_close(&x);
     }
@@ -1047,7 +1221,9 @@ int main(void) {
         pm_start(&x);
         ck_eq(x.s->pm->phase, PM_PH_TCP, "N2_pcp_tcp_outstanding");
         shutdown(x.s->pm->fd, SHUT_WR);
-        ntx_portmap_test_advance_ms(260);
+        /* The retransmission is what calls send() again, and the schedule is the PCP
+         * one now, so the clock has to reach the scheduled instant. */
+        ntx_portmap_test_advance_ms((uint64_t)(pm_wait_ms(x.s->pm) + 5));
         pm_tick(&x);
         ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "N2_hard_send_error_ends_attempt");
         ck_eq(x.s->pm->phase, -1, "N2_nothing_outstanding");

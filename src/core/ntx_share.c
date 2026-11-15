@@ -61,7 +61,12 @@ struct ntx_share_slot {
      * never been ready and reports only the error. */
     int ev_ready, ev_err;
     int started_pending; /* §5.5: wait for the port mapping before `started` */
-    uint64_t added_at, warn_at, fstat_at;
+    /* R11: `started` waits for the mapping only up to NTX_PM_SHARE_SETTLE_MS, and
+     * the port it went out with is remembered so a later grant re-announces. */
+    int announced;     /* `started` left this slot (the re-announce gate) */
+    int ann_event;     /* the event that announce carried, replayed by a re-announce */
+    uint16_t ann_port; /* the port the last announce carried */
+    uint64_t added_at, warn_at, fstat_at, settle_at;
     int warned;
     struct stat saved; /* §5.5: dev/ino/size/mtime/ctime to re-check */
     /* §5.5: share trackers never stay dead; per-tracker backoff lives here so
@@ -370,6 +375,11 @@ static void share_announce(struct ntx_session *s, struct ntx_share_slot *sl) {
     s->tts[sl->ti].state = NTX_TTS_DONE;
     sl->st = NTX_SHARE_ANNOUNCING;
     sl->started_pending = 1; /* §5.5: only after the port mapping settled */
+    sl->announced = 0;
+    sl->ann_port = 0;
+    /* R11: that wait is capped, so a gateway that answers nothing cannot hold the
+     * magnet for the length of its retransmission schedule. */
+    sl->settle_at = share_now_ms() + NTX_PM_SHARE_SETTLE_MS;
     sl->warn_at = share_now_ms() + NTX_SHARE_WARN_MS;
     sl->fstat_at = share_now_ms() + NTX_SHARE_FSTAT_MS;
 }
@@ -931,10 +941,29 @@ void ntx_session_share_tick(struct ntx_session *s) {
         if (sl->st != NTX_SHARE_ANNOUNCING && sl->st != NTX_SHARE_READY) continue;
 
         /* §5.5: `started` waits for the mapping to settle (never PENDING), and
-         * left=0 follows from verified_B == size set in share_finish. */
-        if (sl->started_pending && ntx_session_portmap_state(s) != NTX_PM_PENDING) {
+         * left=0 follows from verified_B == size set in share_finish.
+         * R11: the wait is capped at NTX_PM_SHARE_SETTLE_MS, so a gateway that
+         * answers nothing cannot hold the magnet for the whole retransmission
+         * schedule (~64 s NAT-PMP, ~128 s PCP) — after the cap the announce goes out
+         * with the listen port. The mapping keeps running in the background and the
+         * branch below re-announces when the port it advertises changes, which is
+         * how a late grant reaches the swarm. */
+        uint16_t ap = ntx_session_adv_port(s);
+        if (sl->started_pending &&
+            (ntx_session_portmap_state(s) != NTX_PM_PENDING || now >= sl->settle_at)) {
             sl->started_pending = 0;
+            sl->announced = 1;
+            sl->ann_port = ap;
+            sl->ann_event = NTX_TRACKER_EVENT_STARTED;
             ntx_session_trk_announce(s, ti, NTX_TRACKER_EVENT_STARTED);
+        } else if (sl->announced && !sl->started_pending && ap != sl->ann_port) {
+            /* Same event, new port: an announce queued by the branch above may not
+             * have gone out yet, and ntx_session_trk_announce keeps ONE event per
+             * slot — sending NONE here would silently turn a pending `started` into a
+             * periodic announce, and trk_started_ok (which makes the share READY) is
+             * only ever set by a `started` reply. */
+            sl->ann_port = ap;
+            ntx_session_trk_announce(s, ti, sl->ann_event);
         }
         /* §5.5: ready = hashed + .torrent written + mapping settled + one pinned
          * tracker answered `started`; then exactly one ok event with the magnet. */
