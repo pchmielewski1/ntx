@@ -113,6 +113,111 @@ expect share-missing    1 'cannot share'  -- --share="$TMP/nonexistent"
 expect share-ctrl-name  1 'cannot share'  -- --share="$TMP/$(printf 'a\001b')"
 expect share-from-junk  1 'cannot share'  -- --share="$TMP/plain.bin" --share-from="$TMP/junk.torrent"
 
+# ── the store directory of a share (design §5.4, docs/cli.md "Created on demand") ──
+# R2: `--share` promises the store dir is created on demand. Before the fix nothing
+# ever created it, so open() of the .torrent answered ENOENT after the WHOLE file
+# had been hashed, and the reason on stderr was "cannot read the file".
+#
+# Still no network here: the .torrent is written straight after hashing, so its
+# arrival proves the run got past the destination, and the negative case exits before
+# any hashing at all. --proxy points at a closed port and --no-port-map keeps the
+# gateway out, so no case needs a tracker to answer (and none needs 120 s of hashing
+# either: the polls below only ever wait for hashing to reach its end).
+dd if=/dev/urandom of="$TMP/big.bin" bs=1048576 count=8 >/dev/null 2>&1
+
+# poll_for <secs> <dir> — wait for one *.torrent to appear under <dir>
+poll_for() {
+  _s=$1 _d=$2 _i=0
+  while [ "$_i" -lt "$_s" ]; do
+    if [ -d "$_d" ] && [ -n "$(find "$_d" -maxdepth 1 -type f -name '*.torrent' 2>/dev/null)" ]; then
+      return 0
+    fi
+    sleep 1
+    _i=$((_i + 1))
+  done
+  return 1
+}
+
+# CLI: a store dir that does not exist yet is created and holds the .torrent, and
+# the share is never reported as a read failure. SIGTERM then ends it with exit 0.
+start_share() { # <store-dir> [flags...] — ./ntx --share in the background
+  sd=$1
+  shift
+  ./ntx --share="$TMP/big.bin" --store-dir="$sd" \
+    --no-port-map --port-lo=0 --port-hi=0 --proxy=socks5:127.0.0.1:9 "$@" \
+    >"$TMP/out" 2>"$TMP/err" </dev/null &
+  SHARE_PID=$!
+}
+stop_share() { # -> SHARE_RC of the started ntx, after a polite SIGTERM
+  kill -TERM "$SHARE_PID" 2>/dev/null
+  _i=0
+  while kill -0 "$SHARE_PID" 2>/dev/null && [ "$_i" -lt 20 ]; do sleep 0.25; _i=$((_i + 1)); done
+  kill -KILL "$SHARE_PID" 2>/dev/null
+  # wait must run in THIS shell: a $(...) subshell cannot reap the parent's child
+  wait "$SHARE_PID" 2>/dev/null
+  SHARE_RC=$?
+}
+
+start_share "$TMP/on-demand"
+rc=1
+if poll_for 40 "$TMP/on-demand"; then rc=0; fi
+mode=$(find "$TMP/on-demand" -maxdepth 1 -type f -name '*.torrent' -exec stat -c '%a' {} \; 2>/dev/null)
+count=$(find "$TMP/on-demand" -maxdepth 1 -type f -name '*.torrent' 2>/dev/null | wc -l)
+stop_share; src_rc=$SHARE_RC
+if [ "$rc" -eq 0 ] && [ "$count" -eq 1 ] && [ "$mode" = "600" ] && [ "$src_rc" -eq 0 ] \
+   && ! grep -Fq 'cannot read the file' "$TMP/err" \
+   && ! grep -Fq 'share failed' "$TMP/err"; then
+  echo "PASS share-store-created-on-demand"
+else
+  echo "FAIL share-store-created-on-demand: torrent=$count mode='$mode' rc=$src_rc, want one 0600 .torrent in the new dir and exit 0" >&2
+  sed 's/^/    | /' "$TMP/err" | head -5 >&2
+  fails=$((fails + 1))
+fi
+
+# JSON: the same with --stats-json — the destination is created, and no share event
+# reports ok=0. (The ready event needs a tracker to answer, which is share_e2e's
+# job; here the contract is "the store dir is never the reason the share dies".)
+start_share "$TMP/on-demand-json" --stats-json
+rc=1
+if poll_for 40 "$TMP/on-demand-json"; then rc=0; fi
+count=$(find "$TMP/on-demand-json" -maxdepth 1 -type f -name '*.torrent' 2>/dev/null | wc -l)
+stop_share; src_rc=$SHARE_RC
+if [ "$rc" -eq 0 ] && [ "$count" -eq 1 ] && [ "$src_rc" -eq 0 ] \
+   && ! grep -Eq '"type":"share","i":[0-9]+,"ok":0' "$TMP/out"; then
+  echo "PASS share-store-created-on-demand-json"
+else
+  echo "FAIL share-store-created-on-demand-json: torrent=$count rc=$src_rc, want one .torrent in the new dir, no failed share event, exit 0" >&2
+  tail -3 "$TMP/out" | cut -c1-200 | sed 's/^/    | /' >&2
+  sed 's/^/    | /' "$TMP/err" | head -5 >&2
+  fails=$((fails + 1))
+fi
+
+# A store dir that exists but is not writable is a clear, EARLY io error: the
+# reason names writing the .torrent, never reading the file, and it lands before
+# any hashing. Under --stats-json that is provable — the JSON loop is only entered
+# after ntx_session_share_add returned, so a synchronous verdict means not one
+# hello/stats line and no hashing at all.
+mkdir -p "$TMP/ro-store" && chmod 0500 "$TMP/ro-store"
+t0=$(date +%s)
+timeout -k 1 20 ./ntx --stats-json --share="$TMP/big.bin" --store-dir="$TMP/ro-store" \
+  --no-port-map --port-lo=0 --port-hi=0 --proxy=socks5:127.0.0.1:9 \
+  >"$TMP/out" 2>"$TMP/err" </dev/null
+rc=$?
+el=$(( $(date +%s) - t0 ))
+chmod 0700 "$TMP/ro-store"
+if [ "$rc" -eq 1 ] && [ "$el" -le 5 ] \
+   && grep -Fq 'cannot write the .torrent into' "$TMP/err" \
+   && grep -Fq "$TMP/ro-store" "$TMP/err" \
+   && ! grep -Fq 'cannot read the file' "$TMP/err" \
+   && ! grep -q '"type":"stats"' "$TMP/out"; then
+  echo "PASS share-store-unwritable-early"
+else
+  echo "FAIL share-store-unwritable-early: exit $rc after ${el}s, want 1 fast + 'cannot write the .torrent into' naming the dir, no stats line" >&2
+  sed 's/^/    | /' "$TMP/err" | head -5 >&2
+  tail -2 "$TMP/out" | cut -c1-200 | sed 's/^/    out| /' >&2
+  fails=$((fails + 1))
+fi
+
 # Valid spellings must still be accepted: the client keeps running until `timeout`
 # kills it (124). Proxy points at a closed local port, so nothing leaves the host.
 expect valid-options-run 124 - -- --port-lo=0 --port-hi=0 --max-peers=0 --down-limit=0 \

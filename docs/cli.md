@@ -32,7 +32,7 @@ Defaults are those of `ntx_main.c`. `ntx --help` prints the same list.
 
 | Option | Default | Behaviour |
 |--------|---------|-----------|
-| `--store-dir=DIR` | `downloads` | Directory for downloaded data. Also holds `https_tofu.bin` and, with `--dht`, `ntx_dht_state`. Created on demand. Layout: [storage.md](storage.md). |
+| `--store-dir=DIR` | `downloads` | Directory for downloaded data. Also holds `https_tofu.bin` and, with `--dht`, `ntx_dht_state`. Created on demand — also for `--share`, whose `.torrent` destination is created and proven writable before hashing starts. Layout: [storage.md](storage.md). |
 | `--port-lo=N` | `6881` | First port of the listen range (`0`-`65535`). |
 | `--port-hi=N` | `6891` | Last port of the listen range (`0`-`65535`). |
 | `--max-peers=N` | `128` | Cap on peer connections the session opens (outbound dials, counted over all torrents). `0` means the default. The practical ceiling is 128, the size of the connection table. Incoming connections are accepted while table slots are free (at most 8 per remote address). Range `0`-`2147483647`. |
@@ -76,7 +76,9 @@ Design:
 
 `--share=PATH` turns the session into a seeder for one local file. What happens, in order:
 
-1. Synchronous checks (open, `S_ISREG`, size, name, tracker table, a free slot). A
+1. Synchronous checks (open, `S_ISREG`, size, name, tracker table, a free slot) and
+   the `.torrent` destination: `<store-dir>` is created if missing (mode `0700`, since
+   it will hold access keys) and proven writable — all before a single byte is hashed. A
    failure here is fatal: `ntx: cannot share <path>: <reason>` on stderr, exit `1`.
 2. The file is hashed (phase `hash`, `@hash` in the status line). `ntx` holds the
    descriptor for the whole share, so renaming or unlinking the path does not break it.
@@ -156,7 +158,7 @@ Start-up failures (exit `1`):
 | magnet without a valid `xt=urn:btih:` / `urn:btmh:` | `ntx: invalid magnet link (needs xt=urn:btih:... or urn:btmh:...): ...` |
 | `.torrent` missing, empty or not valid metainfo | `ntx: cannot load .torrent file (missing, empty or not valid metainfo): ...` |
 | `--share` in a build with too few pinned share trackers | `ntx: cannot share: no HTTPS share trackers are pinned in this build` |
-| `--share` whose synchronous checks fail (unreadable, not a regular file, empty, bad name, a rejected `--share-from`, no slot) | `ntx: cannot share <path>: <reason>` where `<reason>` is the share module's text — `invalid share argument`, `cannot read the file`, `too many shared files`, `file too large to share`, `this file is already shared`, `the file changed while sharing`, `invalid file name` |
+| `--share` whose synchronous checks fail (unreadable, not a regular file, empty, bad name, a rejected `--share-from`, no slot, a `--store-dir` that cannot be created or written) | `ntx: cannot share <path>: <reason>` where `<reason>` is the share module's text — `invalid share argument`, `cannot read the file`, `cannot write the .torrent into <store-dir>`, `too many shared files`, `file too large to share`, `this file is already shared`, `the file changed while sharing`, `invalid file name` |
 | a `--share` that fails after it was added (CLI mode only — under `--stats-json` the failure is a JSON `share` event instead) | `ntx: share failed: <reason>`, same table of reasons |
 
 The tests for these cases live in `test/cli_errors.sh` (`make test-cli`).

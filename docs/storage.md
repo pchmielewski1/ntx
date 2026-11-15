@@ -12,7 +12,9 @@ Protocol details are in [protocol.md](protocol.md); sockets, uTP, DHT and proxie
 ## Directory and file layout
 
 The store directory is `--store-dir=DIR`, default `downloads` (relative to the working directory).
-Directories are created as needed (mode `0755`), files with mode `0644`.
+Directories are created as needed (mode `0755`), files with mode `0644`. The one exception is a
+`--share`: its `.torrent` destination is created during the synchronous checks with mode `0700`,
+because the `.torrent` files in it are access keys (see [Sharing a file](#sharing-a-file)).
 
 | Torrent | Path on disk |
 |---------|--------------|
@@ -83,6 +85,10 @@ memory, and one `.torrent` file written to the store directory.
   the file would only cost I/O. The hashes come from the streaming hasher
   (`ntx_share_hasher`), whose footprint is `O(piece length + pieces)` and never the file.
 - **The `.torrent` is written atomically with mode `0600`** (design §5.4).
+  Its directory is created by `ntx_session_share_add` before hashing starts, mode `0700`
+  (parents `0755`, a symlink in the last component is refused); a store dir that cannot be
+  created or written is the `io` error, stated as `cannot write the .torrent into <dir>`, and
+  it arrives before the first byte is hashed rather than after the last one.
   The name is `<store-dir>/<stem>-<8 hex of ih>.torrent`, where `stem` is the longest
   whole-UTF-8-character prefix of the file name that still leaves room for the suffix inside
   `NAME_MAX`; the name **inside** the torrent is never cut. The bytes are checked first: the

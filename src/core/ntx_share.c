@@ -84,6 +84,20 @@ typedef struct {
 } share_evt;
 static share_evt share_evq[NTX_SESSION_MAX_TTS * 2];
 
+static char share_io_msg[NTX_SHARE_PATH_MAX + 64];
+
+/* §5.4 (R2): the destination is named when the .torrent could not be written;
+ * every other io failure clears the sentence back to the generic text.
+ * ponytail: ceiling = the text belongs to the most recent share_fail. Upgrade
+ * path: carry the reason in ntx_share_event instead of a module static. */
+static void share_io_msg_set(const char *dir) {
+    if (!dir || !dir[0]) {
+        share_io_msg[0] = 0;
+        return;
+    }
+    snprintf(share_io_msg, sizeof share_io_msg, "cannot write the .torrent into %s", dir);
+}
+
 static const char *const share_codes[] = {"ok", "bad_arg", "io",     "full",       "no_trackers",
                                           "too_big", "exists", "changed", "bad_arg"};
 static const char *const share_msgs[] = {
@@ -104,7 +118,63 @@ const char *ntx_share_err_code(ntx_share_err e) {
 
 const char *ntx_share_err_msg(ntx_share_err e) {
     if ((unsigned)e >= sizeof share_msgs / sizeof share_msgs[0]) return share_msgs[NTX_SHARE_E_BAD_ARG];
+    /* §5.4 (R2): while set, the last io failure was the .torrent not reaching disk. */
+    if (e == NTX_SHARE_E_IO && share_io_msg[0]) return share_io_msg;
     return share_msgs[e];
+}
+
+/* §5.4 (R2): the store dir is created on demand — docs/cli.md promises it. The last
+ * component is 0700 (it holds the operator's .torrent files, which are access keys)
+ * and a symlink there is refused, never followed; the parents are 0755, the mode
+ * ntx_store.c gives the directories it creates for downloads. */
+static int share_mkdir_one(const char *path, mode_t mode) {
+    if (mkdir(path, mode) == 0) {
+        /* the mode is a security property, so it may not depend on the umask */
+        return chmod(path, mode) == 0 ? 0 : -1;
+    }
+    if (errno != EEXIST) return -1;
+    struct stat st;
+    if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return -1; /* symlink or file: ours to refuse */
+    return 0;
+}
+
+/* One O_EXCL file is the honest answer to "can a .torrent land here", for root
+ * and for a 0500 directory alike. */
+static int share_dir_writable(const char *dir) {
+    char probe[NTX_SHARE_PATH_MAX];
+    int w = snprintf(probe, sizeof probe, "%s/.ntx-writable-%d", dir, (int)getpid());
+    if (w < 0 || (size_t)w >= sizeof probe) return -1;
+    int fd = open(probe, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0 && errno == EEXIST) { /* a probe from a killed run is not a verdict */
+        unlink(probe);
+        fd = open(probe, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    }
+    if (fd < 0) return -1;
+    close(fd);
+    unlink(probe);
+    return 0;
+}
+
+static int share_store_prepare(const char *dir) {
+    char tmp[NTX_SHARE_PATH_MAX];
+    size_t n = strlen(dir);
+    if (n == 0 || n >= sizeof tmp) return -1;
+    memcpy(tmp, dir, n + 1);
+    while (n > 1 && tmp[n - 1] == '/') tmp[--n] = 0;
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = 0;
+        if (share_mkdir_one(tmp, 0755) != 0) return -1;
+        *p = '/';
+    }
+    if (share_mkdir_one(tmp, 0700) != 0) return -1;
+    return share_dir_writable(tmp);
+}
+
+/* The store dir this share writes its .torrent into (§5.4); the single place the
+ * default is spelled, shared by the gate below and by share_finish. */
+static const char *share_store_dir(const ntx_session *s) {
+    return (s->cfg && s->cfg->store_dir && s->cfg->store_dir[0]) ? s->cfg->store_dir : "downloads";
 }
 
 /* Full built-in share list, in list order (§5.4: announce + announce-list + magnet `tr`). */
@@ -178,6 +248,9 @@ static void share_free_slot(struct ntx_session *s, int ti) {
 
 static void share_fail(struct ntx_session *s, struct ntx_share_slot *sl, ntx_share_err e) {
     if (!sl || sl->st == NTX_SHARE_FAILED) return;
+    /* R2: the destination-naming text is written by the caller that knows the dir,
+     * after this returns — every other failure starts from the generic reason. */
+    share_io_msg_set(NULL);
     sl->st = NTX_SHARE_FAILED;
     sl->err = e;
     sl->started_pending = 0;
@@ -440,7 +513,7 @@ static int share_finish(struct ntx_session *s, struct ntx_share_slot *sl) {
         }
     }
 
-    const char *dir = (s->cfg && s->cfg->store_dir && s->cfg->store_dir[0]) ? s->cfg->store_dir : "downloads";
+    const char *dir = share_store_dir(s);
     if (ntx_share_torrent_path(sl->torrent_path, sizeof sl->torrent_path, dir, sl->name, ih) != 0) {
         ntx_store_close(&t->store);
         free(tbuf);
@@ -451,6 +524,10 @@ static int share_finish(struct ntx_session *s, struct ntx_share_slot *sl) {
     if (we != NTX_SHARE_OK) {
         ntx_store_close(&t->store);
         share_fail(s, sl, we);
+        /* §5.4 (R2): only a write failure gets the destination-naming text; the
+         * exists verdict keeps its own wording (§9). Set after share_fail, which
+         * clears the sentence for every other code. */
+        if (we == NTX_SHARE_E_IO) share_io_msg_set(dir);
         return -1;
     }
     if (ntx_share_magnet(sl->magnet, sizeof sl->magnet, ih, ih2, sl->name, trks, ntrk) != 0) {
@@ -589,6 +666,7 @@ static ntx_share_err share_from_read(const char *path, uint64_t fsize, ntx_torre
 int ntx_session_share_add(ntx_session *s, const char *path, const char *from_torrent, ntx_share_err *err) {
     if (err) *err = NTX_SHARE_E_BAD_ARG;
     if (!s || !path || !path[0]) return -1;
+    share_io_msg_set(NULL); /* the reason belongs to this attempt only */
 
     /* §6.4: a build with no usable pinned share-tracker table does not have this
      * feature, so it is decided before the caller's path is touched — nothing is
@@ -643,6 +721,20 @@ int ntx_session_share_add(ntx_session *s, const char *path, const char *from_tor
         close(fd);
         if (err) *err = NTX_SHARE_E_TOO_BIG;
         return -1;
+    }
+    /* §5.4 (R2): the .torrent destination is created and proven writable here, at
+     * the end of the synchronous gate — hashing is the expensive part and
+     * docs/cli.md promises the store dir is created on demand, so a destination
+     * that can never hold the file must not cost the whole hash first. With
+     * --share-from nothing is written (§5.6), so it is not that share's business. */
+    if (!from_torrent) {
+        const char *dir = share_store_dir(s);
+        if (share_store_prepare(dir) != 0) {
+            close(fd); /* src is NULL on this branch — it only exists with a .torrent */
+            share_io_msg_set(dir);
+            if (err) *err = NTX_SHARE_E_IO;
+            return -1;
+        }
     }
     int ti = ntx_session_free_slot(s);
     if (ti < 0) {

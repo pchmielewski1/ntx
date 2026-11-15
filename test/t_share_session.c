@@ -165,7 +165,7 @@ static void scratch(void) {
     if (mkdir(scratch_root, 0755) != 0 && errno != EEXIST) fail("scratch");
     static const char *const tags[] = {"gates","hash","started","rmhash","pin","revive","ratio","a4","ceil","fdheld",
                                        "from","fromchg","fromerr","fromdup","fromio","fromserve",
-                                       "frompread"};
+                                       "frompread","store"};
     for (size_t k = 0; k < sizeof tags / sizeof tags[0]; k++) {
         char d[640];
         snprintf(d, sizeof d, "%s/%s", scratch_root, tags[k]);
@@ -856,6 +856,111 @@ static void test_remove_during_hash(void) {
     sess_close(&x);
     tracker_stop(&tr);
     ok("remove_during_hash");
+}
+
+/* ---- case 6b (R2): the .torrent destination is prepared before hashing ----
+ * docs/cli.md promises the store dir is "Created on demand" and §5.4 writes the
+ * .torrent into it, so ntx_session_share_add must create it and prove it writable
+ * synchronously: a destination that can never hold the file is an `io` verdict
+ * before the first byte is hashed, and its text names the write, not a read. */
+static void test_store_dir_on_demand(void) {
+    scratch();
+    tracker tr;
+    memset(&tr, 0, sizeof tr);
+    tracker_start(&tr);
+    set_test_trackers(&tr, 2);
+    sess x;
+    sess_open(&x, "store");
+
+    char p[256];
+    snprintf(p, sizeof p, "%s/store/h.bin", scratch_root);
+    mk_file(p, 4000, 71);
+
+    /* (a) three levels that do not exist are created by the add itself, the last
+     * one 0700 (it will hold .torrent files, which are access keys — §5.4). */
+    char sd[640];
+    snprintf(sd, sizeof sd, "%s/store/new/er/deep", scratch_root);
+    free((void *)x.cfg.store_dir);
+    x.cfg.store_dir = strdup(sd);
+    ntx_share_err e = NTX_SHARE_OK;
+    int ti = ntx_session_share_add(x.s, p, NULL, &e);
+    if (ti < 0 || e != NTX_SHARE_OK) {
+        printf("ADD e=%s\n", ntx_share_err_code(e));
+        fail("store_missing_add");
+    }
+    struct stat st;
+    if (stat(sd, &st) != 0 || !S_ISDIR(st.st_mode)) fail("store_dir_not_created");
+    if ((st.st_mode & 0777) != 0700) {
+        printf("MODE=%o\n", (unsigned)(st.st_mode & 0777));
+        fail("store_dir_mode");
+    }
+    char par[640];
+    snprintf(par, sizeof par, "%s/store/new", scratch_root);
+    if (stat(par, &st) != 0 || !S_ISDIR(st.st_mode)) fail("store_parent_not_created");
+    if (ntx_session_share_state(x.s, ti) != NTX_SHARE_HASHING) fail("store_missing_not_hashing");
+    ntx_session_remove(x.s, ti);
+
+    /* (b) an existing store dir with no write permission is io, synchronously:
+     * no slot was taken, so nothing could have started hashing. */
+    char ro[640];
+    snprintf(ro, sizeof ro, "%s/store/ro", scratch_root);
+    if (mkdir(ro, 0500) != 0 && errno != EEXIST) fail("ro_mkdir");
+    free((void *)x.cfg.store_dir);
+    x.cfg.store_dir = strdup(ro);
+    e = NTX_SHARE_OK;
+    int rj = ntx_session_share_add(x.s, p, NULL, &e);
+    if (geteuid() != 0) { /* root ignores the mode, so the gate cannot be forced there */
+        if (rj != -1 || e != NTX_SHARE_E_IO) {
+            printf("RJ=%d e=%s\n", rj, ntx_share_err_code(e));
+            fail("store_ro_not_early_io");
+        }
+        const char *m = ntx_share_err_msg(NTX_SHARE_E_IO);
+        if (!strstr(m, "cannot write the .torrent into") || !strstr(m, ro)) {
+            printf("MSG=%s\n", m);
+            fail("store_ro_msg_wording");
+        }
+        if (strstr(m, "cannot read the file")) fail("store_ro_blames_read");
+        if (ntx_session_share_state(x.s, rj) != NTX_SHARE_NONE) fail("store_ro_took_a_slot");
+    } else if (rj >= 0) {
+        ntx_session_remove(x.s, rj);
+    }
+    if (chmod(ro, 0755) != 0) fail("ro_chmod_back");
+
+    /* (c) the same dir made unwritable AFTER the gate: the .torrent write is what
+     * fails, and its message still reads like a write into <dir>. */
+    free((void *)x.cfg.store_dir);
+    x.cfg.store_dir = strdup(ro);
+    e = NTX_SHARE_OK;
+    ti = ntx_session_share_add(x.s, p, NULL, &e);
+    if (ti < 0 || e != NTX_SHARE_OK) fail("store_writefail_add");
+    if (geteuid() != 0) {
+        if (chmod(ro, 0500) != 0) fail("ro_chmod_off");
+        (void)pump_until_hashed(&x, ti, 2000, NULL);
+        if (ntx_session_share_state(x.s, ti) != NTX_SHARE_FAILED) fail("store_writefail_not_failed");
+        if (x.s->share[ti]->err != NTX_SHARE_E_IO) fail("store_writefail_not_io");
+        const char *m = ntx_share_err_msg(NTX_SHARE_E_IO);
+        if (!strstr(m, "cannot write the .torrent into") || !strstr(m, ro)) {
+            printf("MSG=%s\n", m);
+            fail("store_writefail_msg_wording");
+        }
+        if (chmod(ro, 0755) != 0) fail("ro_chmod_back2");
+    }
+    ntx_session_remove(x.s, ti);
+
+    /* (d) an unrelated io failure is back to the generic reason: the destination
+     * sentence never outlives the add that set it. */
+    free((void *)x.cfg.store_dir);
+    x.cfg.store_dir = strdup(sd);
+    e = NTX_SHARE_OK;
+    if (ntx_session_share_add(x.s, "test/.scratch/no-such-share-target.bin", NULL, &e) != -1 ||
+        e != NTX_SHARE_E_IO || strcmp(ntx_share_err_msg(NTX_SHARE_E_IO), "cannot read the file") != 0) {
+        printf("GENERIC e=%s msg=%s\n", ntx_share_err_code(e), ntx_share_err_msg(NTX_SHARE_E_IO));
+        fail("stale_io_message");
+    }
+
+    sess_close(&x);
+    tracker_stop(&tr);
+    ok("store_dir_on_demand");
 }
 
 /* -------- case 7: pin fail (E_PIN seam) — never revived this session -------- */
@@ -1735,6 +1840,7 @@ int main(void) {
     test_hash_and_results();
     test_started_and_magnet();
     test_remove_during_hash();
+    test_store_dir_on_demand();
     test_pin_fail();
     test_revival();
     test_ratio_exempt();
