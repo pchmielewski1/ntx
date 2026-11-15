@@ -323,8 +323,27 @@ static void share_revive_trackers(struct ntx_session *s, struct ntx_share_slot *
 
 static int share_hash_tick(struct ntx_session *s, struct ntx_share_slot *sl);
 
-/* §5.5 readiness tail: the fd snapshot the 1 s fstat compares against, then
- * ANNOUNCING with `started` held back for the mapping. */
+static int share_stat_differs(const struct stat *a, const struct stat *b) {
+    return a->st_dev != b->st_dev || a->st_ino != b->st_ino || a->st_size != b->st_size ||
+           a->st_mtim.tv_sec != b->st_mtim.tv_sec || a->st_mtim.tv_nsec != b->st_mtim.tv_nsec ||
+           a->st_ctim.tv_sec != b->st_ctim.tv_sec || a->st_ctim.tv_nsec != b->st_ctim.tv_nsec;
+}
+
+/* R3 (§5.3/§5.5): the gate every share passes before a single byte of it is
+ * published. sl->saved is the snapshot taken on the held fd in
+ * ntx_session_share_add, so an edit made WHILE the bytes were being hashed —
+ * same size, different bytes, or a truncate — is caught here, where the hash
+ * that was computed no longer describes what is on disk. A failed fstat counts
+ * as a change: nothing is published over a file we cannot prove unchanged. */
+static int share_changed_during_hash(struct ntx_session *s, struct ntx_share_slot *sl) {
+    struct stat cur;
+    if (fstat(sl->fd, &cur) != 0 || share_stat_differs(&sl->saved, &cur))
+        return share_fail(s, sl, NTX_SHARE_E_CHANGED), 1;
+    return 0;
+}
+
+/* §5.5 readiness tail: ANNOUNCING with `started` held back for the mapping. The
+ * 1 s fstat compares against the snapshot ntx_session_share_add took (R3). */
 static void share_announce(struct ntx_session *s, struct ntx_share_slot *sl) {
     s->tts[sl->ti].state = NTX_TTS_DONE;
     sl->st = NTX_SHARE_ANNOUNCING;
@@ -356,6 +375,7 @@ static int share_finish_from(struct ntx_session *s, struct ntx_share_slot *sl) {
     ntx_torrent *t = &s->tts[sl->ti];
     ntx_torrent *src = sl->src;
 
+    if (share_changed_during_hash(s, sl)) return -1; /* R3: before anything is published */
     if (share_verify_cmp(sl) != 0) return share_fail(s, sl, NTX_SHARE_E_CHANGED), -1;
 
     /* Review focus 5: one info-hash may live in exactly one slot, because
@@ -415,7 +435,6 @@ static int share_finish_from(struct ntx_session *s, struct ntx_share_slot *sl) {
         return share_fail(s, sl, NTX_SHARE_E_BAD_ARG), -1;
     memcpy(sl->sess_ih, sl->src_ih, 20);
     memcpy(sl->ih2, sl->src_ih2, 32);
-    if (fstat(sl->fd, &sl->saved) != 0) return share_fail(s, sl, NTX_SHARE_E_IO), -1;
     share_announce(s, sl);
     if (s->cfg && s->cfg->verbose)
         ntx_diag("ntx: share %s verified against %s\n", sl->name, sl->torrent_path);
@@ -426,6 +445,7 @@ static int share_finish_from(struct ntx_session *s, struct ntx_share_slot *sl) {
  * as a download -> read-only store over the held fd -> atomic .torrent. */
 static int share_finish(struct ntx_session *s, struct ntx_share_slot *sl) {
     if (sl->src) return share_finish_from(s, sl);
+    if (share_changed_during_hash(s, sl)) return -1; /* R3: before anything is published */
     ntx_torrent *t = &s->tts[sl->ti];
     const char *trks[NTX_SESSION_MAX_TRK];
     int ntrk = share_trk_list(trks, NTX_SESSION_MAX_TRK);
@@ -536,10 +556,6 @@ static int share_finish(struct ntx_session *s, struct ntx_share_slot *sl) {
     }
     memcpy(sl->sess_ih, ih, 20);
     memcpy(sl->ih2, ih2, 32);
-    if (fstat(sl->fd, &sl->saved) != 0) {
-        ntx_store_close(&t->store);
-        return share_fail(s, sl, NTX_SHARE_E_IO), -1;
-    }
     share_announce(s, sl); /* §5.5: the same readiness tail as --share-from */
     return 0;
 }
@@ -550,7 +566,10 @@ static int share_hash_tick(struct ntx_session *s, struct ntx_share_slot *sl) {
         size_t want = (size_t)(sl->size - sl->fed);
         if (want > NTX_SHARE_READ_BUF) want = NTX_SHARE_READ_BUF;
         ssize_t r = pread(sl->fd, sl->buf, want, (off_t)sl->fed);
-        if (r <= 0) return share_fail(s, sl, NTX_SHARE_E_IO), -1;
+        /* R3: 0 means the file lost bytes under us mid-hash — the same `changed`
+         * verdict the fstat gate gives, never an I/O error. */
+        if (r == 0) return share_fail(s, sl, NTX_SHARE_E_CHANGED), -1;
+        if (r < 0) return share_fail(s, sl, NTX_SHARE_E_IO), -1;
         /* -1 means the file grew, shrank or a fold failed: never retry it. */
         if (ntx_share_hasher_feed(sl->h, sl->buf, (size_t)r) != 0)
             return share_fail(s, sl, NTX_SHARE_E_CHANGED), -1;
@@ -573,12 +592,6 @@ static void share_changed(struct ntx_session *s, struct ntx_share_slot *sl) {
     ntx_diag("ntx: share %s changed on disk, stopping\n", sl->name);
     if (t->state != NTX_TTS_DEAD) ntx_session_trk_stop(s, sl->ti); /* §5.5: stopped */
     share_fail(s, sl, NTX_SHARE_E_CHANGED);
-}
-
-static int share_stat_differs(const struct stat *a, const struct stat *b) {
-    return a->st_dev != b->st_dev || a->st_ino != b->st_ino || a->st_size != b->st_size ||
-           a->st_mtim.tv_sec != b->st_mtim.tv_sec || a->st_mtim.tv_nsec != b->st_mtim.tv_nsec ||
-           a->st_ctim.tv_sec != b->st_ctim.tv_sec || a->st_ctim.tv_nsec != b->st_ctim.tv_nsec;
 }
 
 /* §5.6.1: read and accept the .torrent a --share-from must match. Everything
@@ -770,6 +783,7 @@ int ntx_session_share_add(ntx_session *s, const char *path, const char *from_tor
     sl->buf = rbuf;
     sl->size = (uint64_t)sb.st_size;
     sl->ps = ps;
+    sl->saved = sb; /* R3: the baseline every later fstat is compared against (§5.5) */
     sl->added_at = share_now_ms();
     if (src) { /* §5.6: the name and the path stay the ones of the .torrent */
         sl->src = src;

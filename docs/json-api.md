@@ -260,7 +260,7 @@ table, `ntx_share_err_code()` in `src/core/ntx_share.c`:
 | `"no_trackers"` | Too few pinned HTTPS share trackers in this build. |
 | `"too_big"` | The file would need more than 32 768 pieces, so no piece length in the supported range fits the metainfo limits. Only on the `--share` path; with a `torrent` the piece length comes from that file, and one outside the supported range is `bad_arg`. |
 | `"exists"` | `<store-dir>/<name>-<8 hex>.torrent` already exists on disk and its bytes do not hash to this info hash. On the `torrent` path, the same info hash is already shared from another slot — one hash may live in exactly one slot, and the share that got there first is untouched. |
-| `"changed"` | The shared file changed after hashing: `st_dev`, `st_ino`, `st_size`, `st_mtime` or `st_ctime` differ from the values recorded at open (checked once per second). On the `torrent` path also when the hashes the file produced do not match the `pieces` list and the BEP 52 layers it claims. |
+| `"changed"` | The shared file changed while it was being hashed or afterwards: `st_dev`, `st_ino`, `st_size`, `st_mtime` or `st_ctime` differ from the values recorded at open (re-checked before the share is published, then once per second). A `pread` that returns 0 during hashing — the file was shortened — is also `changed`. On the `torrent` path also when the hashes the file produced do not match the `pieces` list and the BEP 52 layers it claims. |
 
 `"changed"` and `"exists"` can only arrive on the asynchronous `share` event; the
 synchronous `err` ack only ever carries `"bad_arg"`, `"io"`, `"full"` or `"no_trackers"`.

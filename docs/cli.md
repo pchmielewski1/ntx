@@ -96,10 +96,12 @@ Design:
 
 Behaviour worth knowing:
 
-- The file is opened read-only and is never written to. It is re-`fstat`ed once a
-  second; a change in `st_dev`, `st_ino`, `st_size`, `st_mtime` or `st_ctime` ends the
-  share — the row shows `shr!`, peers are choked, a `stopped` announce is sent, and
-  CLI mode exits `1` with `ntx: share failed: the file changed while sharing`.
+- The file is opened read-only and is never written to. Its `st_dev`, `st_ino`, `st_size`,
+  `st_mtime` and `st_ctime` are recorded at that moment, re-`fstat`ed when hashing ends and then
+  once a second; a change ends the share — the row shows `shr!`, peers are choked, a `stopped`
+  announce is sent, and CLI mode exits `1` with `ntx: share failed: the file changed while
+  sharing`. A file edited *while* it is being hashed never gets a `.torrent` written or a magnet
+  printed.
 - Share slots are exempt from the upload-ratio cap: `--share` seeds until the file
   changes or the process is stopped, whatever `--up-limit` or the ratio does to a
   normal seed.

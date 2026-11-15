@@ -106,12 +106,17 @@ memory, and one `.torrent` file written to the store directory.
   the streaming hasher's SHA-1 list and its BEP 52 layers must both equal what the `.torrent`
   claims, or the share fails with `changed`. Only the magnet is rebuilt, from the currently
   pinned tracker list, so a re-share follows key rotation without touching the link.
-- **Change detection.** Once the metainfo is built, `fstat` of the held descriptor is compared
-  once a second (`NTX_SHARE_FSTAT_MS`) against the saved `st_dev`, `st_ino`, `st_size`,
-  `st_mtime` and `st_ctime`. Any difference fails the share with `changed`: peers are choked,
-  a `stopped` announce is sent, and the slot stops serving (`ntx_session_share_serving` returns
-  0, so block requests are refused). The descriptor and the store stay alive so the UI can
-  still show what happened.
+- **Change detection.** The `st_dev`, `st_ino`, `st_size`, `st_mtime` and `st_ctime` of the held
+  descriptor are snapshotted by the `fstat` in `ntx_session_share_add` — before the first byte is
+  hashed — and every later check compares against that one snapshot, never against a state taken
+  after the hash. When hashing ends, `share_finish` and `share_finish_from` `fstat` again and
+  refuse the share with `changed` if anything moved: a `.torrent` is written and a magnet is
+  printed only for a file that is still what was hashed. While the share serves, the same
+  comparison runs once a second (`NTX_SHARE_FSTAT_MS`); any difference fails the share with
+  `changed`: peers are choked, a `stopped` announce is sent, and the slot stops serving
+  (`ntx_session_share_serving` returns 0, so block requests are refused). The descriptor and the
+  store stay alive so the UI can still show what happened. A `pread` that returns 0 during hashing
+  — the file lost bytes underneath us — is the same `changed` verdict, not `io`.
 - **A read that fails while serving stops the share.** Serving reads the file through `pread` on
   the held descriptor. When one comes back short or with `EIO`, `data_serve` refuses the request
   (BEP 6 `reject_request`) and calls `ntx_session_share_io_failed`, which fails the share with

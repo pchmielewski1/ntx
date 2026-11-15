@@ -165,7 +165,7 @@ static void scratch(void) {
     if (mkdir(scratch_root, 0755) != 0 && errno != EEXIST) fail("scratch");
     static const char *const tags[] = {"gates","hash","started","rmhash","pin","revive","ratio","a4","ceil","fdheld",
                                        "from","fromchg","fromerr","fromdup","fromio","fromserve",
-                                       "frompread","store"};
+                                       "frompread","store","during","durtrunc"};
     for (size_t k = 0; k < sizeof tags / sizeof tags[0]; k++) {
         char d[640];
         snprintf(d, sizeof d, "%s/%s", scratch_root, tags[k]);
@@ -1831,6 +1831,123 @@ static void test_from_serve_io(void) {
     ok("from_serve_read_io");
 }
 
+/* R3: nothing may be published for a file that was edited while it was being
+ * hashed. The store dir of the session must stay empty and the one event the
+ * share gets must carry no magnet. `stem` is the .torrent's expected prefix. */
+static void assert_nothing_published(sess *x, int ti, const char *stem, const char *tag) {
+    char m[64];
+    snprintf(m, sizeof m, "%s_serving_after_fail", tag);
+    if (ntx_session_share_serving(x->s, ti) != 0) fail(m);
+    snprintf(m, sizeof m, "%s_magnet_produced", tag);
+    if (x->s->share[ti]->magnet[0]) fail(m);
+    snprintf(m, sizeof m, "%s_torrent_left", tag);
+    DIR *d = opendir(x->cfg.store_dir);
+    if (!d) fail("opendir_store");
+    struct dirent *de;
+    while ((de = readdir(d)))
+        if (strncmp(de->d_name, stem, strlen(stem)) == 0) {
+            closedir(d);
+            printf("LEFT[%s]\n", de->d_name);
+            fail(m);
+        }
+    closedir(d);
+    ntx_share_event ev;
+    memset(&ev, 0, sizeof ev);
+    snprintf(m, sizeof m, "%s_no_event", tag);
+    if (ntx_session_share_poll_event(x->s, &ev) != 1) fail(m);
+    snprintf(m, sizeof m, "%s_event_fields", tag);
+    if (ev.ok || ev.err != NTX_SHARE_E_CHANGED || ev.magnet[0] || ev.torrent_path[0]) {
+        printf("EV ok=%d code=%s magnet=%d path=%d\n", ev.ok, ntx_share_err_code(ev.err),
+               (int)!!ev.magnet[0], (int)!!ev.torrent_path[0]);
+        fail(m);
+    }
+    snprintf(m, sizeof m, "%s_two_events", tag);
+    if (ntx_session_share_poll_event(x->s, &ev) != 0) fail(m);
+}
+
+/* ---- R3 case a: one byte rewritten MID-HASH (same size) → CHANGED ----
+ * §5.3/§5.5: the snapshot the change check compares against has to be the one
+ * taken when the descriptor was opened. Taken after the hash — as it was — every
+ * edit made DURING hashing is invisible, and the .torrent plus the magnet then
+ * describe bytes that no longer exist on disk. The byte lands far behind the
+ * pump, so the hash the share publishes is the one from before the edit. */
+static void test_edit_during_hash(void) {
+    scratch();
+    tracker tr;
+    memset(&tr, 0, sizeof tr);
+    tracker_start(&tr);
+    set_test_trackers(&tr, 2);
+    sess x;
+    sess_open(&x, "during");
+    char p[256];
+    snprintf(p, sizeof p, "%s/during/e.bin", scratch_root);
+    mk_file(p, (uint64_t)32 << 20, 73);
+
+    ntx_share_err e = NTX_SHARE_OK;
+    int ti = share_add_parked(&x, p, NULL, &e);
+    if (ti < 0 || e != NTX_SHARE_OK) fail("during_add");
+    for (int i = 0; i < 3; i++) ntx_session_tick(x.s);
+    if (ntx_session_share_state(x.s, ti) != NTX_SHARE_HASHING) fail("during_hashed_too_fast");
+    {
+        int fd = open(p, O_WRONLY); /* the share's own fd is O_RDONLY */
+        if (fd < 0) fail("during_edit_open");
+        uint8_t one = 0x5A;
+        if (pwrite(fd, &one, 1, ((uint64_t)16 << 20) + 7) != 1) fail("during_edit_pwrite");
+        close(fd);
+    }
+    (void)pump_until_hashed(&x, ti, 6000, NULL);
+    if (ntx_session_share_state(x.s, ti) != NTX_SHARE_FAILED) {
+        printf("ST=%d (want FAILED)\n", (int)ntx_session_share_state(x.s, ti));
+        fail("during_edit_not_failed");
+    }
+    if (x.s->share[ti]->err != NTX_SHARE_E_CHANGED) {
+        printf("CODE=%s (want changed)\n", ntx_share_err_code(x.s->share[ti]->err));
+        fail("during_edit_not_changed");
+    }
+    assert_nothing_published(&x, ti, "e.bin", "during_edit");
+    ntx_session_remove(x.s, ti);
+    sess_close(&x);
+    tracker_stop(&tr);
+    ok("edit_during_hash_is_changed");
+}
+
+/* ---- R3 case b: the file is SHORTENED mid-hash → CHANGED, never IO ----
+ * A pread that comes back 0 while hashing means the file lost bytes underneath
+ * us: that is the same `changed` verdict as an in-place edit, not an I/O error. */
+static void test_trunc_during_hash(void) {
+    scratch();
+    tracker tr;
+    memset(&tr, 0, sizeof tr);
+    tracker_start(&tr);
+    set_test_trackers(&tr, 2);
+    sess x;
+    sess_open(&x, "durtrunc");
+    char p[256];
+    snprintf(p, sizeof p, "%s/durtrunc/t.bin", scratch_root);
+    mk_file(p, (uint64_t)32 << 20, 74);
+
+    ntx_share_err e = NTX_SHARE_OK;
+    int ti = share_add_parked(&x, p, NULL, &e);
+    if (ti < 0 || e != NTX_SHARE_OK) fail("durtrunc_add");
+    for (int i = 0; i < 3; i++) ntx_session_tick(x.s);
+    if (ntx_session_share_state(x.s, ti) != NTX_SHARE_HASHING) fail("durtrunc_hashed_too_fast");
+    if (trunc_to(p, (off_t)(9 << 20)) != 0) fail("durtrunc_ftruncate");
+    (void)pump_until_hashed(&x, ti, 6000, NULL);
+    if (ntx_session_share_state(x.s, ti) != NTX_SHARE_FAILED) {
+        printf("ST=%d (want FAILED)\n", (int)ntx_session_share_state(x.s, ti));
+        fail("durtrunc_not_failed");
+    }
+    if (x.s->share[ti]->err != NTX_SHARE_E_CHANGED) {
+        printf("CODE=%s (want changed, not io)\n", ntx_share_err_code(x.s->share[ti]->err));
+        fail("durtrunc_not_changed");
+    }
+    assert_nothing_published(&x, ti, "t.bin", "durtrunc");
+    ntx_session_remove(x.s, ti);
+    sess_close(&x);
+    tracker_stop(&tr);
+    ok("truncate_during_hash_is_changed");
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     scratch_root_init();
@@ -1853,6 +1970,8 @@ int main(void) {
     test_from_duplicate();
     test_from_truncated();
     test_from_serve_io();
+    test_edit_during_hash();
+    test_trunc_during_hash();
     ntx_share_trackers_test_set(NULL, -1);
     printf("ALL PASS\n");
     return 0;
