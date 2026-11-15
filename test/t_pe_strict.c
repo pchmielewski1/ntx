@@ -533,6 +533,145 @@ static void test_mse_hash_mismatch_silent_drop(void) {
     printf("PASS strict_mse_hash_mismatch_silent_drop\n");
 }
 
+/* ---- R6: a share slot that is still hashing must not be matchable ----------
+ * While hashing, ntx_session_share_add leaves the tts slot with info_hash == 40
+ * zeros and ntx_session_share_serving() == 0 (§5.3), yet every matcher used to
+ * accept any slot != DEAD. A peer could therefore offer the (publicly known)
+ * zero hash and land on a share whose bytes are not verified yet.
+ *
+ * The slot is built by the real ntx_session_share_add — the honest way in, so
+ * tts_enc_strict/priv/state are exactly what production sets — and never ticked,
+ * so it stays in the hashing phase. */
+static int share_hashing_slot(ntx_session *s, const char *tag) {
+    char p[256];
+    snprintf(p, sizeof p, "%s/%s.bin", SCRATCH, tag);
+    FILE *f = fopen(p, "wb");
+    if (!f) fail("share_file");
+    for (int i = 0; i < 64; i++) fputc(i & 0xff, f);
+    if (fclose(f) != 0) fail("share_file_close");
+    ntx_share_err e = NTX_SHARE_OK;
+    int ti = ntx_session_share_add(s, p, NULL, &e);
+    if (ti < 0) fail("share_add");
+    static const uint8_t zeros[20];
+    if (memcmp(s->tts[ti].info_hash, zeros, 20) != 0) fail("share_ih_not_zeros");
+    if (ntx_session_share_serving(s, ti) != 0) fail("share_already_serving");
+    return ti;
+}
+
+/* The publishing share_finish does, done by hand: the real hash on the slot and
+ * the share serving. The positive control needs a slot that MUST match. */
+static void share_slot_ready(ntx_session *s, int ti, uint8_t seed) {
+    uint8_t ih[20];
+    memset(ih, (uint8_t)(0x30 + seed), sizeof ih);
+    ih[0] = seed;
+    memcpy(s->tts[ti].info_hash, ih, 20);
+    s->tts[ti].state = NTX_TTS_DONE;
+    s->share[ti]->st = NTX_SHARE_READY;
+}
+
+/* Matcher and SKEY candidates: neither the zero v1 hash nor a zero (or even
+ * published) v2 root of a hashing share may resolve, and the accepted peer's
+ * MSE candidate list — filled by the production on_accept path — may not carry
+ * them either. The wire case is asserted on top of that. */
+static void test_hashing_share_not_matchable(void) {
+    ntx_config cfg;
+    cfg_base(&cfg, 0);
+    ntx_netx *n;
+    ntx_session *s = mk(&cfg, &n);
+    set_slot(s, 0, 0xD1, 0); /* public download control slot */
+    int ti = share_hashing_slot(s, "r6_match");
+
+    static const uint8_t zeros[20];
+    if (sp_match_tts(s, zeros) != -1) fail("zero_hash_matches_hashing_share");
+    /* The second (v2) loop: a share that published its v2 root before the slot
+     * started serving must stay unmatchable through that loop too. */
+    s->tts[ti].meta_version = 2;
+    for (int k = 0; k < 32; k++) s->tts[ti].info_hash_v2[k] = (uint8_t)(0x71 + k);
+    if (sp_match_tts(s, s->tts[ti].info_hash_v2) != -1) fail("v2_root_matches_hashing_share");
+    s->tts[ti].meta_version = 0;
+    memset(s->tts[ti].info_hash_v2, 0, 32);
+
+    ntx_addr a = lo4(8);
+    int cli = -1;
+    int pi = accept_peer(s, &a, 51007, &cli); /* peer_tts == -1: candidates from all slots */
+    if (memcmp(s->pe[pi].infohash, zeros, 20) == 0) fail("zero_hash_is_primary_skey");
+    for (int k = 0; k < s->pe[pi].infohash_cand_n; k++)
+        if (memcmp(s->pe[pi].infohash_cand[k], zeros, 20) == 0) fail("zero_hash_is_skey_candidate");
+    if (memcmp(s->pe[pi].infohash, s->tts[0].info_hash, 20) != 0) fail("public_slot_lost_from_skey");
+
+    uint8_t hs[68];
+    mk_hs(hs, zeros, (const uint8_t *)"-peer0000000000000000");
+    if (send_all(cli, hs, sizeof hs) != 0) fail("write_zero_hs");
+    for (int k = 0; k < 3; k++) ntx_session_peer_hs_tick(s);
+    uint8_t got[2048];
+    size_t gn = recv_all(cli, got, sizeof got);
+    if (s->peers[pi].fd != -1) fail("zero_hash_kept");
+    if (gn != 0) fail("zero_hash_answered");
+    if (s->peer_tts[pi] == ti) fail("zero_hash_bound_to_hashing_share");
+    close(cli);
+    drop(s, n);
+    printf("PASS strict_hashing_share_not_matchable\n");
+}
+
+/* §7 (R6): MSE whose SKEY is computed over the all-zero hash of a hashing share
+ * must not reach PH_OK. Pre-fix the zero hash is one of the responder's SKEY
+ * candidates, so pe_verify_skey accepts it and the peer is promoted. */
+static void test_mse_zero_skey_dropped(void) {
+    ntx_config cfg;
+    cfg_base(&cfg, 0);
+    ntx_netx *n;
+    ntx_session *s = mk(&cfg, &n);
+    set_slot(s, 0, 0xD2, 0);
+    int ti = share_hashing_slot(s, "r6_mse");
+
+    ntx_addr a = lo4(9);
+    int cli = -1;
+    int pi = accept_peer(s, &a, 51008, &cli);
+
+    static const uint8_t zeros[20];
+    uint8_t reply[20];
+    memset(reply, 0xEE, sizeof reply);
+    if (mse_reply_hash(s, cli, zeros, zeros, reply)) fail("mse_zero_skey_answered");
+    if (s->peers[pi].fd != -1) fail("mse_zero_skey_kept");
+    if (s->peer_phase[pi] == PH_OK) fail("mse_zero_skey_promoted");
+    if (s->peer_tts[pi] == ti) fail("mse_zero_skey_bound_to_hashing_share");
+    if (s->tts_in_ok[ti] != 0) fail("mse_zero_skey_counted_in_ok");
+    uint8_t got[2048];
+    if (has_magic(got, recv_all(cli, got, sizeof got))) fail("mse_zero_skey_sent_handshake");
+    close(cli);
+    drop(s, n);
+    printf("PASS strict_mse_zero_skey_dropped\n");
+}
+
+/* Positive control for both tests above: the same slot, once READY with its real
+ * hash, matches — MSE answers with it. Without this the two negatives could be
+ * satisfied by breaking matching altogether. */
+static void test_share_ready_matches_real_hash(void) {
+    ntx_config cfg;
+    cfg_base(&cfg, 0);
+    ntx_netx *n;
+    ntx_session *s = mk(&cfg, &n);
+    set_slot(s, 0, 0xD3, 0);
+    int ti = share_hashing_slot(s, "r6_ready");
+    share_slot_ready(s, ti, 0xD4);
+    if (ntx_session_share_serving(s, ti) != 1) fail("ready_not_serving");
+    if (sp_match_tts(s, s->tts[ti].info_hash) != ti) fail("real_hash_does_not_match");
+
+    ntx_addr a = lo4(10);
+    int cli = -1;
+    int pi = accept_peer(s, &a, 51009, &cli);
+    uint8_t reply[20];
+    if (!mse_reply_hash(s, cli, s->tts[ti].info_hash, s->tts[ti].info_hash, reply))
+        fail("ready_mse_no_reply_hs");
+    if (memcmp(reply, s->tts[ti].info_hash, 20) != 0) fail("ready_mse_reply_wrong_hash");
+    if (s->peers[pi].fd == -1) fail("ready_mse_dropped");
+    if (s->peer_phase[pi] != PH_OK) fail("ready_mse_not_ok");
+    if (s->peer_tts[pi] != ti) fail("ready_mse_wrong_slot");
+    close(cli);
+    drop(s, n);
+    printf("PASS strict_share_ready_matches_real_hash\n");
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     ntx_rng_init();
@@ -545,6 +684,10 @@ int main(void) {
     test_mse_to_strict_counts_in_ok();
     test_mse_responder_names_matched_slot();
     test_mse_hash_mismatch_silent_drop();
+    test_hashing_share_not_matchable();
+    test_mse_zero_skey_dropped();
+    test_mse_zero_skey_dropped();
+    test_share_ready_matches_real_hash();
     printf("ALL PASS\n");
     return 0;
 }

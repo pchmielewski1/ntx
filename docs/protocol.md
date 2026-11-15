@@ -305,6 +305,15 @@ The policy functions live in `src/core/ntx_session_pe.c` and `src/core/ntx_sessi
   read a second share's hash out of our reply, and a refusal costs it zero bytes (nothing is
   sent before the decision). The plaintext path is unaffected: it still answers from
   `sp_bths_try`.
+- **A slot has to be matchable before it can answer (`sp_slot_matchable`, R6).** Both the
+  handshake matcher (`sp_match_tts`, including its v2 upgrade loop) and the MSE SKEY candidate
+  list (`sp_pe_set_infohash`) skip a slot that is `NTX_TTS_DEAD`, whose `info_hash` is all
+  zeros, or that is owned by a share which does not serve (`ntx_session_share_serving` == 0 —
+  still hashing, or failed). While `--share` hashes its file the slot carries 40 zero bytes as
+  its info hash (§5.3) and the zero hash is public knowledge, so without this gate a peer could
+  complete a plaintext handshake or MSE against bytes we have not verified. Plain download
+  torrents are unaffected: `ntx_session_share_serving` answers 1 for them, so only the
+  all-zero rule can ever hide one.
 - MSE itself is unchanged: RC4 only, 768-bit DH, no authentication. Strict mode raises the
   bar against passive off-path observation and against an on-path peer that simply refuses to
   encrypt; it does not authenticate the peer.
@@ -592,7 +601,9 @@ way. After assembly (the hash gate `SHA-256(info) == info_hash_v2` runs before p
 - **Receiving (mid-connection upgrade).** A handshake answered with
   `trunc20(SHA-256(info))` is accepted when the exact v1 match failed and the candidate torrent
   has `meta_version == 2` with a non-zero `info_hash_v2` (`sp_match_tts`). A pure v1 torrent can
-  never match this way. Acceptance does not depend on the reserved bits.
+  never match this way. Acceptance does not depend on the reserved bits. The slot must also pass
+  the matchability gate above (`sp_slot_matchable`), so a zero v2 root — or a share that is not
+  serving yet — never matches here either.
 - **Not implemented:** answering a v1 handshake with the v2 hash (the TX side of the upgrade) is
   optional in BEP 52 and `ntx` does not do it.
 - **Hybrid swarms.** A hybrid torrent joins the swarm through its SHA-1 info hash, like v1.

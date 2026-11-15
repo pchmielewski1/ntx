@@ -332,6 +332,9 @@ void sp_pe_set_infohash(struct ntx_session *s, int pi);
 void sp_note_peer_fast(struct ntx_session *s, int pi, const uint8_t hs[68]);
 int sp_setup_phave(struct ntx_session *s, int pi, int ti);
 /* bt_hs (bodies in ntx_session_bt_hs.c) */
+/* R6: 1 when slot i may answer a handshake or an MSE SKEY — not DEAD, no all-zero
+ * info_hash, and (share slots only) ntx_session_share_serving. */
+int sp_slot_matchable(const struct ntx_session *s, int i);
 int sp_match_tts(struct ntx_session *s, const uint8_t hash[20]);
 int sp_promote_peer_ok(struct ntx_session *s, int pi, const uint8_t hs[68]);
 void sp_bths_resync(uint8_t *buf, size_t *bl);

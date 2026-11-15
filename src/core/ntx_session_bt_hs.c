@@ -7,10 +7,23 @@
 /* BitTorrent handshake (sp_build_bt_handshake, sp_bths_*, sp_peer_ok_*, ...)
    — split out of ntx_session_peer.c. */
 
+/* R6 (design §5.3): the one predicate that says which slot a handshake or an MSE
+ * SKEY may be resolved against. A share that is still hashing (or failed) carries
+ * an info_hash of 40 zeros and serves nothing — ntx_session_share_serving is 0 —
+ * yet the zero hash is publicly known, so without this gate a peer completes a
+ * handshake against bytes we have not verified. ntx_session_share_serving answers
+ * 1 for a plain torrent (sl == NULL), so downloads keep their old behaviour and
+ * are gated only by the all-zero rule. */
+int sp_slot_matchable(const struct ntx_session *s, int i) {
+    static const uint8_t zeros[20];
+    if (s->tts[i].state == NTX_TTS_DEAD) return 0;
+    if (memcmp(s->tts[i].info_hash, zeros, 20) == 0) return 0;
+    return ntx_session_share_serving(s, i);
+}
+
 int sp_match_tts(struct ntx_session *s, const uint8_t hash[20]) {
     for (int i = 0; i < s->n_tts; i++) {
-        if (s->tts[i].state != NTX_TTS_DEAD && memcmp(s->tts[i].info_hash, hash, 20) == 0)
-            return i;
+        if (sp_slot_matchable(s, i) && memcmp(s->tts[i].info_hash, hash, 20) == 0) return i;
     }
     /* BEP52 mid-connection upgrade RX: a hybrid swarm
      * joined by SHA-1 may answer our HS with the truncated SHA-256(info) hash.
@@ -19,7 +32,7 @@ int sp_match_tts(struct ntx_session *s, const uint8_t hash[20]) {
      * carry info_hash_v2 == 0 so this path cannot match them; a v2 answer for a
      * pure-v2 torrent still equals its exact info_hash (first loop). */
     for (int i = 0; i < s->n_tts; i++) {
-        if (s->tts[i].state == NTX_TTS_DEAD || s->tts[i].meta_version != 2) continue;
+        if (!sp_slot_matchable(s, i) || s->tts[i].meta_version != 2) continue;
         int any_v2 = 0;
         for (int k = 0; k < 32; k++)
             if (s->tts[i].info_hash_v2[k]) { any_v2 = 1; break; }

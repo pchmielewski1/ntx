@@ -11,14 +11,19 @@
 void sp_pe_set_infohash(struct ntx_session *s, int pi) {
     ntx_pe *pe = &s->pe[pi];
     int ti = s->peer_tts[pi];
-    if (ti >= 0 && ti < s->n_tts) {
+    /* R6: a bound slot that is not matchable (a share that stopped serving after the peer
+     * was promoted) must not become our SKEY hash — fall through to the live candidates. */
+    if (ti >= 0 && ti < s->n_tts && sp_slot_matchable(s, ti)) {
         ntx_pe_set_infohash(pe, s->tts[ti].info_hash);
         return;
     }
     pe->infohash_cand_n = 0;
     int nactive = 0;
     for (int i = 0; i < s->n_tts; i++) {
-        if (s->tts[i].state == NTX_TTS_DEAD) continue;
+        /* R6: never offer a hashing/failed share or a zero hash as an SKEY
+         * candidate — the zero hash is public knowledge, so offering it lets any
+         * peer pass MSE and land on a slot whose bytes are not verified yet. */
+        if (!sp_slot_matchable(s, i)) continue;
         if (nactive == 0)
             ntx_pe_set_infohash(pe, s->tts[i].info_hash);
         else if (pe->infohash_cand_n < NTX_PE_INFOHASH_CAND)
