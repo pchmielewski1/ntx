@@ -20,8 +20,8 @@
  * the existing ntx_netx loop, non-blocking, no threads. The codec in
  * src/proto/ntx_pcp.c is deliberately stateless, so every policy lives here: the
  * socket and its gateway-source check, the 12-byte nonce, the retransmission
- * schedule, the lifetime cap (RFC 6887 §8.3) and the epoch-rollback check
- * (§8.5). Everything static here is pm_-prefixed for the unity build. */
+ * schedule, the lifetime cap (RFC 6887 §8.3) and the restart test of §8.5.
+ * Everything static here is pm_-prefixed for the unity build. */
 
 #define PM_LIFE_S 7200u /* §8: ask for two hours, renew at half the grant */
 /* Retransmission pacing, per family. RFC 6887 §8.1.1: IRT 3 s, doubled per
@@ -40,6 +40,16 @@
  * Lifetime field. The wait is honoured, but never taken below this floor — a gateway
  * handing out lifetime 0 would otherwise buy a tight retry loop. */
 #define PM_RETRY_MIN_S 60u
+/* The §8.5 restart test compares the Epoch the gateway reports against what the
+ * client's own clock says it must be, so a gateway whose Epoch just stands still is
+ * judged a restart on every answer — and each judgement means one re-request. The
+ * legitimate case needs one (the reply to the re-request carries a boot-time Epoch
+ * that then becomes the baseline and passes), so this caps only the pathological one:
+ * after that many detections in a row the sequence ends like any other refusal.
+ * ponytail: the ceiling is per sequence, so a gateway that restarts once every few
+ * minutes is met by one query per restart, forever — which is right. The upgrade path
+ * if a flapping gateway ever proves noisy is a backoff on `restarts`, not more sends. */
+#define PM_MAX_RESTARTS 3u
 
 /* One outstanding query at a time, in this order. The NAT-PMP external-address
  * query exists only in the fallback: it is how CGNAT is found without PCP. */
@@ -74,10 +84,13 @@ struct ntx_portmap {
     uint64_t renew_at[PM_NPH]; /* virtual ms */
     uint32_t epoch;
     int epoch_seen;            /* 0 until the first PCP answer: no baseline */
+    uint64_t epoch_at;         /* virtual ms the baseline Epoch was received (§8.5) */
     int fallback_used;    /* the one PCP → NAT-PMP step of this sequence is spent (R9) */
     int retry_ph;         /* query the gateway told us to ask for again, -1 = none (R14) */
     uint64_t retry_at;    /* virtual ms that retry may go out (never sooner than PM_RETRY_MIN_S) */
     int retried;          /* the one deferred retry of this sequence is spent (R14) */
+    int lost;             /* §8.5 rollback: the tick owes the sequence one fresh query (R10) */
+    int restarts;         /* consecutive §8.5 restart detections; a grant resets them */
 };
 
 /* Process globals because the test hooks take no session. Production never sets
@@ -266,6 +279,8 @@ static void pm_reset(struct ntx_portmap *pm, ntx_pm_state st) {
     pm->retry_ph = -1;
     pm->retry_at = 0;
     pm->retried = 0;
+    pm->lost = 0;
+    pm->restarts = 0;
     pm->st = st;
 }
 
@@ -440,6 +455,7 @@ static void pm_send(struct ntx_portmap *pm) {
 /* Start a query from scratch: fresh nonce, fresh schedule, sent now. */
 static void pm_start_query(struct ntx_portmap *pm, int phase, uint16_t sugg_port) {
     if (phase < 0 || pm->fd < 0) return;
+    pm->lost = 0; /* any fresh query is the sequence starting again (R10) */
     if (phase != PM_PH_ADDR) ntx_rand_bytes(pm->nonce, sizeof pm->nonce);
     pm->tries = 0;
     pm->gap = pm->fam == PM_PCP ? PM_PCP_IRT_MS : PM_NATPMP_IRT_MS;
@@ -479,8 +495,12 @@ static void pm_grant(struct ntx_portmap *pm, int phase, uint16_t ext_port, uint3
     if (pm->active[PM_PH_TCP]) pm->st = NTX_PM_ACTIVE; /* §8: announces carry the ext port */
 }
 
-/* The gateway says the mapping is gone (lifetime 0), or rebooted (epoch went
- * backwards, RFC 6887 §8.5): drop every grant and establish it again. */
+/* The gateway restarted (its Epoch failed the RFC 6887 §8.5 test): drop every grant
+ * and establish the mapping again. Nothing is sent from here — this runs inside the
+ * receive callback, and a request out of the rx path is the request loop of R10.
+ * `lost` is what the tick drives the fresh sequence from: leaving `phase` pending
+ * would have the same effect, but "the grants are gone" is the fact to record, and the
+ * tick's renewal loop only reaches `active`/`failed` mappings. */
 static void pm_lost(struct ntx_portmap *pm) {
     pm_clear_grants(pm);
     for (int i = 0; i < PM_NPH; i++) pm->failed[i] = 0;
@@ -489,8 +509,8 @@ static void pm_lost(struct ntx_portmap *pm) {
     pm->retried = 0;
     pm->phase = -1;
     pm->tries = 0;
+    pm->lost = 1;
     pm->st = NTX_PM_PENDING;
-    pm_start_query(pm, PM_PH_TCP, ntx_netx_port(pm->netx));
 }
 
 static void pm_cgnat(struct ntx_portmap *pm) {
@@ -511,6 +531,44 @@ static int pm_src_ok(const struct ntx_portmap *pm, const struct sockaddr_in *sa)
     return ntohs(sa->sin_port) == pm_gw_port();
 }
 
+/* RFC 6887 §8.5: the client keeps the Epoch of the last answer (seconds since the
+ * gateway's boot, §8.7) and the instant it received it, then compares the two
+ * differences — how far the gateway's counter moved against how far our own clock
+ * moved. A restart is either side of that agreement failing:
+ *   server_delta + 1 <  client_delta − client_delta/16   (the counter went backwards
+ *                                                         or stands still)
+ *   server_delta >      client_delta + client_delta/16 + 1   (it claims more uptime
+ *                                                             than has elapsed here)
+ * The plain `epoch < baseline` this driver used instead sees only a rollback, so a
+ * gateway that came back with a bigger, absurd Epoch was taken as a healthy grant and
+ * the stale port stayed advertised (R10). Whole seconds, as the RFC counts them. */
+static int pcp_epoch_restarted(const struct ntx_portmap *pm, uint32_t epoch) {
+    if (!pm->epoch_seen) return 0;
+    if (epoch < pm->epoch) return 1;
+    uint64_t cd = (pm_now() - pm->epoch_at) / 1000u;
+    if (cd > 0xffffffffu) cd = 0xffffffffu; /* asleep for 49 days: no usable expectation */
+    uint64_t sd = (uint64_t)(epoch - pm->epoch);
+    return sd + 1u < cd - cd / 16u || sd > cd + cd / 16u + 1u;
+}
+
+static void pm_no_mapping(struct ntx_portmap *pm, int ph, const char *why) {
+    pm->phase = -1;
+    pm->tries = 0;
+    ntx_diag("ntx: port map: %s %s\n", pm->fam == PM_PCP ? "PCP" : "NAT-PMP", why);
+    pm_give_up_phase(pm, ph);
+}
+
+/* A SUCCESS MAP reply whose Lifetime is 0 grants nothing — §11.1 makes lifetime 0 the
+ * delete and RFC 6886 §3.3 gives its mapping reply the same meaning — so both families
+ * answer it the same way: as the refusal it is, on the R14 rule. It used to be
+ * pm_lost, which re-requested from inside the receive path and was answered with
+ * another lifetime 0, requests and refusals chasing each other at the pace of the RTT
+ * (R10). As a refusal it needs no wait from the reply: lifetime 0 names none, so the
+ * sequence is simply over. */
+static void pm_zero_lifetime(struct ntx_portmap *pm, int ph) {
+    pm_no_mapping(pm, ph, "granted lifetime 0");
+}
+
 static void pm_rx(struct ntx_portmap *pm, const uint8_t *b, size_t n) {
     int ph = pm->phase;
     if (ph < 0) return; /* nothing outstanding: nothing to match an answer against */
@@ -529,15 +587,29 @@ static void pm_rx(struct ntx_portmap *pm, const uint8_t *b, size_t n) {
             return;
         }
         if (rc != 0) return; /* -1 garbage, -2 not an answer to our query */
-        if (pm->epoch_seen && r.epoch < pm->epoch) {
+        if (pcp_epoch_restarted(pm, r.epoch)) {
+            /* The baseline takes this reply's Epoch BEFORE the sequence is dropped, so
+             * the reply that detected the restart cannot detect it again — the defect
+             * of R10 was that every later reply re-entered pm_lost. `restarts` bounds
+             * the one gateway this still cannot satisfy: a counter that never agrees
+             * with our clock (a frozen Epoch), where each answer would otherwise arm
+             * one more re-request. */
+            pm->epoch = r.epoch;
+            pm->epoch_at = pm_now();
+            if ((uint32_t)++pm->restarts > PM_MAX_RESTARTS) {
+                pm_no_mapping(pm, ph, "epoch never agrees with our clock");
+                return;
+            }
             pm_lost(pm);
             return;
         }
+        pm->restarts = 0;
         pm->epoch_seen = 1;
         pm->epoch = r.epoch;
+        pm->epoch_at = pm_now();
         uint32_t life = pm_cap_life(r.lifetime);
         if (life == 0) {
-            pm_lost(pm);
+            pm_zero_lifetime(pm, ph);
             return;
         }
         if (pcp_ip_is_cgnat_or_private(r.ext_ip16)) {
@@ -576,7 +648,7 @@ static void pm_rx(struct ntx_portmap *pm, const uint8_t *b, size_t n) {
     if (rc != 0) return;
     life = pm_cap_life(life);
     if (life == 0) {
-        pm_lost(pm);
+        pm_zero_lifetime(pm, ph);
         return;
     }
     pm_grant(pm, ph, ext, life);
@@ -715,6 +787,15 @@ void ntx_session_portmap_tick(struct ntx_session *s) {
     }
     if (!pm->started && !pm_open(pm)) return;
     if (pm->fd < 0) return;
+
+    /* The §8.5 rollback (R10): the receive path armed this, and the request goes out
+     * here — one query per rollback, on a schedule of its own, instead of a datagram
+     * from inside pm_on_rw. The fresh query starts the sequence again from TCP. */
+    if (pm->lost) {
+        pm->lost = 0;
+        pm_start_query(pm, PM_PH_TCP, ntx_netx_port(pm->netx));
+        return;
+    }
 
     uint64_t now = pm_now();
     if (pm->phase >= 0) {

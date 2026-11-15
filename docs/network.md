@@ -717,7 +717,15 @@ blocking calls.
   to MRT 1024 s, every interval jittered by ±10% (RFC 6887 §8.1.1, `PM_PCP_IRT_MS` /
   `PM_PCP_MRT_MS`); NAT-PMP starts at 250 ms and doubles, no jitter, so its nine sends end at 64 s
   (RFC 6886 §3.1, `PM_NATPMP_IRT_MS`). A grant is requested for 7200 s and renewed at half the
-  granted lifetime. A PCP epoch rollback resets the state. On exit `ntx_session_portmap_stop()`
+  granted lifetime. A PCP **restart** is detected the way RFC 6887 §8.5 defines it — the Epoch the
+  gateway reports must stay in step with the client's own clock, so either the counter going
+  backwards or claiming more uptime than has elapsed here means the state is dropped and the
+  mapping asked for again. The new Epoch is recorded before that, so the reply which revealed the
+  restart cannot reveal it again; the re-request goes out from the tick, one per restart, and a
+  counter that never agrees with our clock ends the sequence after `PM_MAX_RESTARTS` of them
+  (R10). A `MAP` reply whose Lifetime is 0 grants nothing and is treated as the refusal it is
+  (like a result code, R14), in both families — never as a reason to re-request. On exit
+  `ntx_session_portmap_stop()`
   sends lifetime-0 delete requests, bounded in time like the `stopped` announces.
 - **A share does not wait for the gateway.** A `pending` mapping holds the `started`
   announce (design §5.5) for at most `NTX_PM_SHARE_SETTLE_MS` (4 s): after that the announce

@@ -182,6 +182,20 @@ static int gwd;
 static uint16_t gw_port;
 static struct sockaddr_in g_from; /* who sent the last request: replies go back there */
 
+/* The fake gateway's Epoch (RFC 6887 §8.7: seconds since it booted). A healthy
+ * gateway's counter advances with the same seconds the client's clock advances, so the
+ * harness reports the baseline it handed out last plus the seconds since that answer —
+ * the figure the client must expect, with no real-clock jitter to read as a §8.5
+ * restart. A case that wants the opposite hands pcp_grant_epoch / pcp_answer_all an
+ * explicit value: 0 for a gateway that just rebooted, or one claiming an Epoch that
+ * cannot be its own boot (the §8.5 upper bound), or a frozen counter. */
+static uint64_t gw_reply_at;
+
+static uint32_t gw_epoch_live(const struct ntx_portmap *pm) {
+    if (!pm || !pm->epoch_seen) return 100;
+    return pm->epoch + (uint32_t)((pm_now() - gw_reply_at) / 1000u);
+}
+
 static void gw_start(void) {
     gwd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     struct sockaddr_in sa;
@@ -244,6 +258,7 @@ static void gw_send(const uint8_t *b, size_t n) { gw_to(b, n, gwd); }
 
 static void pcp_resp(uint8_t out[60], const uint8_t req[60], uint16_t ext_port, const uint8_t ext_ip[16],
                      uint32_t lifetime, uint32_t epoch) {
+    gw_reply_at = pm_now(); /* the Epoch on the wire is read from the instant of this answer */
     memset(out, 0, 60);
     out[0] = 2;
     out[1] = 0x81; /* R set | opcode MAP */
@@ -489,7 +504,8 @@ static uint16_t req_int_port(const uint8_t *b) {
 /* One PCP exchange for one protocol: wait for its request, answer SUCCESS. */
 static uint8_t granted_nonce[256][12]; /* by protocol: the delete must repeat it (§11.1) */
 
-static void pcp_grant(sess *x, uint8_t proto, uint16_t ext_port, const uint8_t ext_ip[16], uint32_t lifetime) {
+static void pcp_grant_epoch(sess *x, uint8_t proto, uint16_t ext_port, const uint8_t ext_ip[16],
+                            uint32_t lifetime, uint32_t epoch) {
     uint8_t req[2048], rsp[64];
     for (int spins = 0; spins < 400; spins++) {
         ssize_t n = gw_get(req, sizeof req);
@@ -501,13 +517,65 @@ static void pcp_grant(sess *x, uint8_t proto, uint16_t ext_port, const uint8_t e
         }
         if (!req_is(req, n, proto, 7200)) continue;
         memcpy(granted_nonce[proto], req + 24, 12);
-        pcp_resp(rsp, req, ext_port, ext_ip, lifetime, 7);
+        pcp_resp(rsp, req, ext_port, ext_ip, lifetime, epoch);
         gw_send(rsp, 60);
         pump_ms(x->n, 20);
         return;
     }
     printf("FAIL no pcp request proto=%u\n", proto);
     fails++;
+}
+
+static void pcp_grant(sess *x, uint8_t proto, uint16_t ext_port, const uint8_t ext_ip[16], uint32_t lifetime) {
+    pcp_grant_epoch(x, proto, ext_port, ext_ip, lifetime, gw_epoch_live(x->s->pm));
+}
+
+/* pcp_answer_all: answer every PCP MAP query that goes out over `steps` × `step_ms`
+ * of clock, and return how many QUERIES were seen — a query being a nonce, so a
+ * retransmission of the outstanding one is not a second query. The request-loop probe
+ * of R10: a driver that re-requests from inside its receive path without moving its
+ * Epoch baseline is handed a fresh rollback with every answer, so this counts one
+ * fresh nonce per round trip instead of the one re-request the schedule allows. The
+ * pump is bounded (`cap`): a looping driver must show up as a failure, not as a
+ * hanging test. PCP_EPOCH_LIVE answers with what a healthy gateway reports — its
+ * counter in step with the client's clock — so recovery rounds are never mistaken for
+ * a second restart. */
+#define PCP_EPOCH_LIVE 0xffffffffu
+
+static int pcp_answer_all(sess *x, uint8_t proto, uint16_t ext_port, const uint8_t ext_ip[16], uint32_t lifetime,
+                          uint32_t epoch, const char *tag, uint64_t step_ms, int steps) {
+    const int cap = 64; /* nothing legitimately asks this often in the window below */
+    uint8_t req[2048], rsp[64];
+    uint8_t seen[cap][12];
+    int q = 0;
+    for (int i = 0; i < steps; i++) {
+        ssize_t r;
+        /* The datagrams of the step the caller just pumped are the FIRST ones counted:
+         * draining them here would hide a driver that answers a rollback by sending
+         * from inside the receive path, which is the exact behaviour probed. */
+        while ((r = gw_get(req, sizeof req)) > 0) {
+            if (!req_is(req, r, proto, 7200)) continue;
+            int fresh = 1;
+            for (int k = 0; k < q; k++)
+                if (memcmp(seen[k], req + 24, 12) == 0) fresh = 0;
+            if (fresh) {
+                if (q >= cap) {
+                    printf("  (%s: %d queries in %d ms — request loop)\n", tag, q, (int)(step_ms * steps));
+                    gw_drain();
+                    return q;
+                }
+                memcpy(seen[q++], req + 24, 12);
+            }
+            pcp_resp(rsp, req, ext_port, ext_ip, lifetime,
+                     epoch == PCP_EPOCH_LIVE ? gw_epoch_live(x->s->pm) : epoch);
+            gw_send(rsp, 60);
+        }
+        ntx_portmap_test_advance_ms(step_ms);
+        pm_tick(x);
+        pump_ms(x->n, 10);
+    }
+    gw_drain();
+    return q;
 }
 
 static void both_active(sess *x, uint16_t ext, const uint8_t ip[16]) {
@@ -1046,7 +1114,18 @@ int main(void) {
         sess_close(&x);
     }
 
-    /* ---- H. epoch rollback (RFC 6887 §8.5) re-requests ---- */
+    /* ---- H. epoch rollback (RFC 6887 §8.5) re-requests — exactly once.
+
+     * The gateway reboots between two replies: its Epoch counter starts over (RFC
+     * 6887 §8.7), so the renewal answer carries an Epoch far below the baseline. The
+     * case used to answer the grant with Epoch 7, the rollback with 3 and the
+     * re-request with 7 again — the last one above the baseline, so the reply that had
+     * to re-trigger the defect never did and the loop of R10 was invisible (the review
+     * says the same: "Test H odtwarza epokę 7 = bazowej, więc pętli nie widzi"). The
+     * gateway here is rebooted for good — every answer it gives is 0 — which is what
+     * turns "re-request from inside the receive path" into a datagram per round trip.
+     * Pre-fix: H_one_re_request_not_a_loop got=30 want=1, H_recovered and
+     * H_recovered_adv_port got=6881 want=40124. */
     {
         sess x;
         sess_open(&x, "h");
@@ -1061,16 +1140,194 @@ int main(void) {
         pm_tick(&x);
         uint8_t req[2048], rsp[64];
         ck_eq(gw_get(req, sizeof req), 60, "H_renew_sent");
-        pcp_resp(rsp, req, EXT_PORT, pub, 7200, 3); /* epoch went backwards: gateway rebooted */
+        pcp_resp(rsp, req, EXT_PORT, pub, 7200, 0); /* counter starts over: §8.5 restart */
         gw_send(rsp, 60);
         pump_ms(x.n, 40);
         pm_tick(&x);
         ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "H_rollback_pending");
         ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "H_rollback_no_adv_port");
-        gw_drain();
-        pcp_grant(&x, NTX_PCP_PROTO_TCP, 40124, pub, 7200);
+        /* One re-request for one rollback, on the schedule — not one per round trip.
+         * The gateway is still the rebooted one, so its counter is near zero; the
+         * first answer to the re-request becomes the new baseline and is granted. */
+        ck_eq(pcp_answer_all(&x, NTX_PCP_PROTO_TCP, 40124, pub, 7200, 0, "H", 1000, 30), 1,
+              "H_one_re_request_not_a_loop");
         ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "H_recovered");
         ck_eq(ntx_session_adv_port(x.s), 40124, "H_recovered_adv_port");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- H2. an Epoch too LARGE for the elapsed time is a restart too (§8.5).
+
+     * The rollback alone cannot see a gateway claiming far more uptime than the
+     * client's own clock says has passed since the last answer — §8.5's second
+     * condition. Pre-fix only `epoch < baseline` counted, so this reply was a plain
+     * grant: the state stayed ACTIVE on a stale port and nothing was ever re-requested
+     * (H2_rollback_pending, H2_rollback_no_adv_port got=40123 want=6881,
+     * H2_one_re_request got=0 want=1, H2_recovered_adv_port got=40123 want=40125). */
+    {
+        sess x;
+        sess_open(&x, "h2");
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "H2_active");
+        gw_drain();
+        ntx_portmap_test_advance_ms(3601000);
+        pm_tick(&x);
+        uint8_t req[2048], rsp[64];
+        ck_eq(gw_get(req, sizeof req), 60, "H2_renew_sent");
+        /* 3 000 000 000 s ≈ 95 years of uptime, seconds after an answer that said
+         * ~3600: the counter cannot have moved that far, so this is a restart. */
+        pcp_resp(rsp, req, EXT_PORT, pub, 7200, 3000000000u);
+        gw_send(rsp, 60);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "H2_rollback_pending");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "H2_rollback_no_adv_port");
+        ck_eq(pcp_answer_all(&x, NTX_PCP_PROTO_TCP, 40125, pub, 7200, PCP_EPOCH_LIVE, "H2", 1000, 30), 1,
+              "H2_one_re_request_not_a_loop");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "H2_recovered");
+        ck_eq(ntx_session_adv_port(x.s), 40125, "H2_recovered_adv_port");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- H3. lifetime 0 in a MAP reply is a refusal, not a re-request (R10).
+
+     * RFC 6887 §11.1 makes Lifetime 0 the delete, so a SUCCESS MAP reply carrying it
+     * grants nothing. Pre-fix this went to pm_lost, which sent a fresh query from
+     * inside the receive path — and the fresh query was answered with lifetime 0
+     * again, so requests and refusals chased each other. As a refusal (the S10 rule)
+     * the schedule ends and nothing more goes out: lifetime 0 names no wait, so there
+     * is no deferred retry either. Pre-fix: H3_none, H3_nothing_outstanding got=1
+     * want=-1, H3_no_retries got=1 want=0, H3_no_further_resend got=6 want=0,
+     * H3_stays_none. */
+    {
+        sess x;
+        sess_open(&x, "h3");
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        uint8_t req[2048], rsp[64];
+        ck_eq(gw_wait(req, sizeof req, 300), 60, "H3_request");
+        pcp_resp(rsp, req, EXT_PORT, pub, 0, gw_epoch_live(x.s->pm));
+        gw_send(rsp, 60);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "H3_none");
+        ck_eq(x.s->pm->phase, -1, "H3_nothing_outstanding");
+        ck_eq(x.s->pm->tries, 0, "H3_no_retries");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "H3_none_adv_port");
+        ck_eq(pm_sends_in(&x, 60000, 6), 0, "H3_no_further_resend");
+        /* And it stays that way while the gateway keeps answering: a driver that
+         * re-requests from the rx path is handed a fresh refusal with every answer. */
+        ck_eq(pcp_answer_all(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 0, PCP_EPOCH_LIVE, "H3b", 1000, 30), 0,
+              "H3_zero_lifetime_no_loop");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "H3_stays_none");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- H4. NAT-PMP: lifetime 0 in the mapping reply is the same refusal (R10).
+
+     * RFC 6886 §3.3 puts the Lifetime in the mapping response and 0 means the mapping
+     * is not held, so both families must answer it the same way. Pre-fix both called
+     * pm_lost — NAT-PMP at its 250 ms schedule (H4_none, H4_nothing_outstanding got=1
+     * want=-1, H4_no_further_resend got=8 want=0). ---- */
+    {
+        sess x;
+        sess_open(&x, "h4");
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t req[2048], rsp[16];
+        ck_eq(gw_to_natpmp_map(&x, req, sizeof req), 12, "H4_natpmp_map_request");
+        natpmp_map_resp(rsp, 2, (uint16_t)ntx_netx_port(x.n), EXT_PORT, 0);
+        gw_send(rsp, sizeof rsp);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "H4_none");
+        ck_eq(x.s->pm->phase, -1, "H4_nothing_outstanding");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "H4_none_adv_port");
+        gw_send(rsp, sizeof rsp); /* the same refusal again: still nothing goes out */
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck_eq(pm_sends_in(&x, 60000, 6), 0, "H4_no_further_resend");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- H5. the same rollbacked reply five times: still one re-request (R10).
+
+     * Re-delivery is what UDP under loss does, and it is what multiplied the requests
+     * pre-fix: every copy re-entered pm_lost and pm_lost sent. Pre-fix:
+     * H5_one_re_request_for_five_replies got=30 want=1. ---- */
+    {
+        sess x;
+        sess_open(&x, "h5");
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        gw_drain();
+        ntx_portmap_test_advance_ms(3601000);
+        pm_tick(&x);
+        uint8_t req[2048], rsp[64];
+        ck_eq(gw_get(req, sizeof req), 60, "H5_renew_sent");
+        pcp_resp(rsp, req, EXT_PORT, pub, 7200, 0);
+        for (int i = 0; i < 5; i++) {
+            gw_send(rsp, 60);
+            pump_ms(x.n, 20);
+        }
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "H5_rollback_pending");
+        ck_eq(pcp_answer_all(&x, NTX_PCP_PROTO_TCP, 40126, pub, 7200, PCP_EPOCH_LIVE, "H5", 1000, 30), 1,
+              "H5_one_re_request_for_five_replies");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "H5_recovered");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- H6. an Epoch that never agrees with our clock ends the sequence.
+
+     * A gateway whose counter stands still is a restart on every answer (§8.5's lower
+     * bound), and each detection legitimately arms one re-request — so a driver that
+     * only re-requests cannot loop, but it can still be walked forever by a broken
+     * counter. PM_MAX_RESTARTS bounds the consecutive detections: a handful of
+     * queries, then the sequence is over and the state says none, like any other
+     * refusal. Pre-fix: one request per answer, forever (the probe hit its cap). ---- */
+    {
+        sess x;
+        sess_open(&x, "h6");
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        gw_drain();
+        ntx_portmap_test_advance_ms(3601000);
+        pm_tick(&x);
+        uint8_t req[2048], rsp[64];
+        ck_eq(gw_get(req, sizeof req), 60, "H6_renew_sent");
+        pcp_resp(rsp, req, EXT_PORT, pub, 7200, 5); /* frozen counter, far below base */
+        gw_send(rsp, 60);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        /* 3 s per step: every answer then lands far enough after the previous baseline
+         * to be judged a restart again, which is the pathological gateway. */
+        int q = pcp_answer_all(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200, 5, "H6", 3000, 40);
+        if (q > 5) {
+            printf("FAIL H6_bounded_queries got=%d want<=5\n", q);
+            fails++;
+        }
+        ck(q >= 1, "H6_re-requested_at_all");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "H6_none_after_bound");
+        ck_eq(x.s->pm->phase, -1, "H6_nothing_outstanding");
+        ck_eq(pm_sends_in(&x, 60000, 6), 0, "H6_stays_quiet");
         ntx_session_portmap_stop(x.s);
         sess_close(&x);
     }
