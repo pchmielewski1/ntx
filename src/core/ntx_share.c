@@ -580,18 +580,43 @@ static int share_hash_tick(struct ntx_session *s, struct ntx_share_slot *sl) {
     return 0;
 }
 
-static void share_changed(struct ntx_session *s, struct ntx_share_slot *sl) {
-    ntx_torrent *t = &s->tts[sl->ti];
-    for (int pi = 0; pi < NTX_SESSION_MAX_PEERS; pi++) {
-        if (s->peer_tts[pi] != sl->ti || s->peer_phase[pi] != PH_OK || s->peers[pi].fd == -1) continue;
-        if (!s->peers[pi].we_choke) {
-            ntx_peer_set_we_choke(&s->peers[pi], 1);
-            ntx_session_peer_send_choke(s, pi, 1);
-        }
+/* R5 (§5.5): the one halt of a share that stopped serving, used by `changed` and
+ * by a read that failed while serving. Parking the slot in FAILED is not enough
+ * on its own: the slot keeps the metainfo share_finish published, so it still
+ * looks like a live seed. Together with the caller's share_fail (st == FAILED,
+ * which is what makes ntx_session_share_serving answer 0) this leaves the slot in
+ * the state the R7 gate trk_share_off expects, and does the four things that
+ * belong to one act:
+ *   - exactly one `stopped`, and only for a `started` that really went out
+ *     (trk_stop_one decides on trk_started_ok, which the send below spends);
+ *   - no announce left scheduled or queued — trk_share_off blocks the tick and
+ *     the boost for a share that is not serving, so nothing re-arms them;
+ *   - every peer bound to the slot is gone, through the production drop so the
+ *     per-peer bookkeeping (rarity, PEX, requests) stays right;
+ *   - new handshakes naming the real hash are refused by sp_slot_matchable,
+ *     which reads the same ntx_session_share_serving — no second flag.
+ * Called after share_fail, never before: the gate above only holds for FAILED. */
+static void share_halt(struct ntx_session *s, struct ntx_share_slot *sl) {
+    if (!s || !sl) return;
+    int ti = sl->ti;
+    if (s->tts[ti].state != NTX_TTS_DEAD) ntx_session_trk_stop(s, ti);
+    s->trk_started_ok[ti] = 0; /* the goodbye above was this share's only one */
+    for (int pi = 0; pi < NTX_SESSION_MAX_PEERS; pi++)
+        if (s->peer_tts[pi] == ti && s->peers[pi].fd != -1) sp_drop(s, pi, "share_halt");
+    /* A peer that left unchoked re-arms the schedule for its slot, so the
+     * schedule goes last: a share that serves nothing waits on no announce. */
+    s->trk_next[ti] = 0;
+    for (int k = 0; k < NTX_SESSION_MAX_TRK; k++) {
+        s->trk_http_pending[ti][k] = 0;
+        s->trk_http_due[ti][k] = 0;
+        s->trk_udp_pending[ti][k] = 0;
     }
+}
+
+static void share_changed(struct ntx_session *s, struct ntx_share_slot *sl) {
     ntx_diag("ntx: share %s changed on disk, stopping\n", sl->name);
-    if (t->state != NTX_TTS_DEAD) ntx_session_trk_stop(s, sl->ti); /* §5.5: stopped */
     share_fail(s, sl, NTX_SHARE_E_CHANGED);
+    share_halt(s, sl); /* §5.5: stopped, peers, announce schedule, matchability */
 }
 
 /* §5.6.1: read and accept the .torrent a --share-from must match. Everything
@@ -853,17 +878,17 @@ int ntx_session_share_serving(const ntx_session *s, int ti) {
 
 /* §5.6: a pread that came back short or with EIO *while serving*. data_serve has
  * already refused the request; the share itself must not keep advertising itself
- * as serving, so it parks in FAILED/IO. No-op for plain torrents (sl == NULL),
- * which is what keeps the call free for the download path.
- * ponytail: no choke/stopped here, unlike share_changed — §5.6 asks only for the
- * refusal plus FAILED/IO, and ntx_session_share_serving gates every later
- * request. Upgrade path: route this through share_changed if a read error should
- * also send `stopped`. */
+ * as serving, so it parks in FAILED/IO and halts exactly the way `changed` does
+ * (R5): one `stopped`, no announce left, its peers gone, no new handshake.
+ * No-op for plain torrents (sl == NULL), which is what keeps the call free for
+ * the download path. */
 void ntx_session_share_io_failed(struct ntx_session *s, int ti) {
     if (!s || ti < 0 || ti >= NTX_SESSION_MAX_TTS) return;
     struct ntx_share_slot *sl = s->share[ti];
     if (!sl) return;
+    if (ntx_session_share_state(s, ti) == NTX_SHARE_FAILED) return; /* FAILED: already halted */
     share_fail(s, sl, NTX_SHARE_E_IO);
+    share_halt(s, sl);
 }
 
 void ntx_session_share_tick(struct ntx_session *s) {

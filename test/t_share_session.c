@@ -166,7 +166,8 @@ static void scratch(void) {
     static const char *const tags[] = {"gates","hash","started","rmhash","pin","revive","ratio","a4","ceil","fdheld",
                                        "from","fromchg","fromerr","fromdup","fromio","fromserve",
                                        "frompread","store","during","durtrunc",
-                                       "r7dead","r7hash","r7pend"};
+                                       "r7dead","r7hash","r7pend",
+                                       "r5chg","r5io"};
     for (size_t k = 0; k < sizeof tags / sizeof tags[0]; k++) {
         char d[640];
         snprintf(d, sizeof d, "%s/%s", scratch_root, tags[k]);
@@ -607,6 +608,218 @@ static uint64_t pump_until_hashed(sess *x, int ti, int max_ticks, int *out_ticks
 static void pump_announces(sess *x, int ti) {
     for (int k = 0; k < NTX_SESSION_MAX_TRK; k++) x->s->trk_http_due[ti][k] = 0;
     ntx_session_trk_pump_http(x->s, NTX_SESSION_MAX_TRK);
+}
+
+/* --- R5 helpers -------------------------------------------------------------
+ * How many of the requests the fake tracker saw carry `needle` (an announce
+ * carries its event in the query string, so "event=stopped" counts goodbyes). */
+static int tr_count(tracker *t, const char *needle) {
+    tracker_drain(t);
+    int c = 0;
+    size_t nl = strlen(needle);
+    for (size_t i = 0; i + nl <= t->n_lines; i++)
+        if (memcmp(t->lines + i, needle, nl) == 0) c++;
+    return c;
+}
+
+static void r5_nb(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) fail("r5_nonblock");
+}
+
+/* A promoted peer of slot ti on a socketpair; *cli is the end the test owns.
+ * The same shaping the from_serve cases use, so data_serve() is the real path. */
+static int r5_attach_peer(sess *x, int ti, int *cli) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) fail("r5_socketpair");
+    /* both ends nonblocking: the halt assertions drive ntx_session_tick, whose OK
+     * peer poll reads this fd, and a blocking socketpair would stall the loop */
+    r5_nb(sv[0]);
+    r5_nb(sv[1]);
+    ntx_addr pa;
+    ntx_addr_set_v4(&pa, htonl(0x7f000001));
+    int pi = ntx_session_peer_alloc(x->s, sv[0], &pa, 6881, ti);
+    if (pi < 0) fail("r5_peer_alloc");
+    x->s->peer_phase[pi] = PH_OK;
+    x->s->peer_plain[pi] = 1;
+    x->s->peer_hello_sent[pi] = 1;
+    x->s->peer_fast[pi] = 1;
+    ntx_peer_set_we_choke(&x->s->peers[pi], 0);
+    ntx_peer_set_int_us(&x->s->peers[pi], 1);
+    *cli = sv[1];
+    return pi;
+}
+
+/* Everything the peer end received, with a short timeout so "nothing was sent"
+ * is an assertion and not a blocked read. */
+static size_t r5_recv_all(int fd, uint8_t *buf, size_t cap) {
+    size_t got = 0;
+    for (;;) {
+        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        if (poll(&pfd, 1, 60) <= 0) break;
+        ssize_t r = read(fd, buf + got, cap - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+        if (got == cap) break;
+    }
+    return got;
+}
+
+static int r5_send_all(int fd, const uint8_t *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, buf + off, n - off);
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
+        return -1;
+    }
+    return 0;
+}
+
+/* The peer end of an inbound probe: alloc + the production on_accept, so the
+ * responder path (sp_pe_set_infohash, sp_pe_step, sp_bths_try) is what answers. */
+static int r5_accept_probe(sess *x, int *cli) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) fail("r5_hs_socketpair");
+    r5_nb(sv[0]);
+    r5_nb(sv[1]);
+    ntx_addr pa;
+    ntx_addr_set_v4(&pa, htonl(0x7f000002));
+    int pi = ntx_session_peer_alloc(x->s, sv[0], &pa, 6882, -1);
+    if (pi < 0) fail("r5_hs_peer_alloc");
+    ntx_session_peer_on_accept(x->s, x->s->netx, sv[0], NULL);
+    *cli = sv[1];
+    return pi;
+}
+
+static void r5_mk_hs(uint8_t m[68], const uint8_t ih[20]) {
+    memset(m, 0, 68);
+    m[0] = 19;
+    memcpy(m + 1, "BitTorrent protocol", 19);
+    m[25] = 0x10;
+    m[27] = 0x04;
+    memcpy(m + 28, ih, 20);
+    memcpy(m + 48, "-peer0000000000000000", 20);
+}
+
+/* R5, last half of the halt: a new inbound connection that names the share with
+ * its REAL hash must be refused. Both wire forms are asked: plaintext (the
+ * reply would be the first byte we send, so nothing may go at all) and MSE (the
+ * responder has to send its DH key before the decision, so what must not happen
+ * is a reply handshake naming the dead slot). sp_slot_matchable is the gate. */
+static void assert_new_handshake_refused(sess *x, int ti) {
+    int cli = -1;
+    int pi = r5_accept_probe(x, &cli);
+    uint8_t hs[68];
+    r5_mk_hs(hs, x->s->tts[ti].info_hash);
+    if (r5_send_all(cli, hs, sizeof hs) != 0) fail("r5_hs_write");
+    for (int k = 0; k < 3; k++) ntx_session_peer_hs_tick(x->s);
+    static uint8_t got[2048];
+    size_t gn = r5_recv_all(cli, got, sizeof got);
+    if (x->s->peers[pi].fd != -1) {
+        printf("R5HS_PL fd=%d bl=%zu\n", x->s->peers[pi].fd, x->s->peer_buflen[pi]);
+        fail("r5_new_handshake_kept");
+    }
+    if (gn != 0) {
+        printf("R5HS_PL bytes=%zu\n", gn);
+        fail("r5_new_handshake_answered");
+    }
+    close(cli);
+
+    cli = -1;
+    pi = r5_accept_probe(x, &cli);
+    ntx_pe cand;
+    if (pi >= 0 && x->s->peer_phase[pi] == PH_PE) cand = x->s->pe[pi];
+    else memset(&cand, 0, sizeof cand);
+    ntx_pe cli_pe;
+    ntx_pe_init(&cli_pe, NTX_PE_INITIATOR, cli);
+    ntx_pe_set_infohash(&cli_pe, x->s->tts[ti].info_hash);
+    r5_mk_hs(hs, x->s->tts[ti].info_hash);
+    ntx_pe_set_bt_handshake(&cli_pe, hs);
+    int idle = 0;
+    for (int k = 0; k < 20000 && !cli_pe.done && !cli_pe.failed; k++) {
+        int r = ntx_pe_step(&cli_pe);
+        if (r < 0) break;
+        ntx_session_peer_hs_tick(x->s);
+        if (r == 0) {
+            if (++idle > 2000) break;
+        } else idle = 0;
+    }
+    if (cli_pe.bt_hs_got) fail("r5_mse_handshake_answered");
+    if (x->s->peers[pi].fd != -1) fail("r5_mse_handshake_kept");
+    if (x->s->pe[pi].bt_hs_sent) fail("r5_mse_reply_hs_sent");
+    if (x->s->peer_phase[pi] == PH_OK) fail("r5_mse_handshake_promoted");
+    /* the dead slot must not even be offered as an SKEY candidate */
+    for (int k = 0; k < cand.infohash_cand_n; k++)
+        if (memcmp(cand.infohash_cand[k], x->s->tts[ti].info_hash, 20) == 0)
+            fail("r5_dead_slot_is_skey_candidate");
+    close(cli);
+}
+
+/* The whole R5 contract, asserted on a share that was READY and is now gone:
+ * ONE `stopped` per tracker (a `started` did go out), the announce schedule
+ * gone, no announce at all for 2 x the tracker interval, the slot's peers
+ * dropped, new handshakes refused, and no second goodbye when the slot is
+ * finally removed. `pre` is the request count taken before the failed share. */
+static void assert_halted(sess *x, int ti, tracker *tr, int pre, int pi, const char *tag) {
+    char m[96];
+    if (ntx_session_share_state(x->s, ti) != NTX_SHARE_FAILED) fail("halt_not_failed");
+    if (ntx_session_share_serving(x->s, ti) != 0) fail("halt_still_serving");
+
+    snprintf(m, sizeof m, "%s_peer_alive", tag);
+    if (pi >= 0 && x->s->peers[pi].fd != -1) {
+        printf("TAG=%s PI=%d FD=%d\n", tag, pi, x->s->peers[pi].fd);
+        fail(m);
+    }
+
+    /* One goodbye per tracker that ever answered this slot — trk_stop_one is the
+     * only sender and it skips the ones that never answered. */
+    int live = 0;
+    for (int k = 0; k < x->s->trk_n[ti]; k++)
+        if (!x->s->trk_fail[ti][k]) live++;
+    snprintf(m, sizeof m, "%s_exactly_one_stopped", tag);
+    int stopped = tr_count(tr, "event=stopped");
+    if (stopped != live || tracker_count(tr) != pre + live) {
+        printf("TAG=%s STOPPED=%d want=%d REQS=%d TRK[%s]\n", tag, stopped, live,
+               tracker_count(tr) - pre, tr->lines);
+        fail(m);
+    }
+    snprintf(m, sizeof m, "%s_announce_scheduled", tag);
+    if (x->s->trk_next[ti] != 0) {
+        printf("TAG=%s NEXT=%llu\n", tag, (unsigned long long)x->s->trk_next[ti]);
+        fail(m);
+    }
+
+    /* Nothing may go out for 2 x the interval the tracker granted (60 s in the
+     * fake answer), from the periodic tick or from the peer boost — even with an
+     * announce left scheduled, which is exactly the pre-fix state. */
+    int base = tracker_count(tr);
+    for (int r = 0; r < 2; r++) {
+        x->s->trk_next[ti] = 1; /* as if one were still scheduled */
+        ntx_share_test_advance_ms(61000);
+        for (int i = 0; i < 3; i++) ntx_session_tick(x->s);
+        ntx_session_trk_tick(x->s);
+        ntx_session_trk_boost_peers(x->s);
+        pump_announces(x, ti);
+    }
+    snprintf(m, sizeof m, "%s_announced_after_halt", tag);
+    if (tracker_count(tr) != base) {
+        printf("TAG=%s MORE=%d TRK[%s]\n", tag, tracker_count(tr) - base, tr->lines);
+        fail(m);
+    }
+
+    assert_new_handshake_refused(x, ti);
+
+    /* Removal must not add a goodbye: the one `stopped` above was the share's
+     * only one (share_halt clears trk_started_ok, the fact trk_stop_one gates on). */
+    base = tracker_count(tr);
+    ntx_session_trk_stop_all(x->s);
+    ntx_session_remove(x->s, ti);
+    snprintf(m, sizeof m, "%s_second_stopped", tag);
+    if (tracker_count(tr) != base) {
+        printf("TAG=%s STOP2=%d TRK[%s]\n", tag, tracker_count(tr) - base, tr->lines);
+        fail(m);
+    }
 }
 
 /* ---------------- case 1: §5.1 input gates ---------------- */
@@ -1718,21 +1931,19 @@ static void test_from_truncated(void) {
     if (ntx_session_share_poll_event(y.s, &ev3) != 0) fail("fromserve_second_event");
     if (y.s->share[si]->err != NTX_SHARE_E_CHANGED) fail("fromserve_err_not_changed");
     uint64_t up_before = y.s->tts_up[si];
+    /* R5 replaced the old choke-and-keep here: share_halt drops the peer instead
+     * of choking it, so the connection is gone and a further request reaches a
+     * dead slot — no byte may leave, and nothing may be counted as uploaded. */
+    if (y.s->peers[pi].fd != -1) fail("fromserve_peer_kept_after_change");
     ntx_session_data_on_request(y.s, pi, 0, 0, 1024);
     ntx_session_peer_out_flush(y.s, pi);
     rn = recv(sv[1], rx, sizeof rx, MSG_DONTWAIT);
-    { /* §5.5: the change path choked the peer first, then data_serve refused with
-       * BEP6 reject_request (16) — the bytes must be choke(5) + reject(17). */
-        size_t o = 0;
-        if (rn >= 5 && rx[4] == MSG_CHOKE) o = 5;
-        if (rn != (ssize_t)(o + 17) || rx[o + 4] != 16 || o + 17 != 22) { /* 16 = BEP6 reject */
+    {
+        if (rn > 0) { /* the peer end was closed by the halt: EOF, never a message */
             printf("POST rn=%zd id=%d up=%llu\n", rn, rn > 4 ? rx[4] : -1,
                    (unsigned long long)y.s->tts_up[si]);
             fail("fromserve_served_after_change");
         }
-        if (ntx_wire_rd32(rx + o + 5) != 0 || ntx_wire_rd32(rx + o + 9) != 0 ||
-            ntx_wire_rd32(rx + o + 13) != 1024)
-            fail("fromserve_reject_fields");
     }
     if (y.s->tts_up[si] != up_before) fail("fromserve_up_counted");
     close(sv[0]);
@@ -1807,17 +2018,20 @@ static void test_from_serve_io(void) {
     ntx_session_peer_out_flush(z.s, pi);
     static uint8_t rx[4096];
     ssize_t rn = recv(sv[1], rx, sizeof rx, MSG_DONTWAIT);
-    if (rn != 17 || rx[4] != 16 /* BEP6 reject */) {
-        printf("IO rn=%zd id=%d\n", rn, rn > 4 ? rx[4] : -1);
-        fail("frompread_not_rejected");
+    { /* R5 replaced the old refuse-only answer here: data_serve hooks
+       * ntx_session_share_io_failed BEFORE the refuse, so share_halt has already
+       * dropped this peer and neither a piece nor a reject can reach the wire. */
+        if (rn > 0) {
+            printf("IO rn=%zd id=%d\n", rn, rn > 4 ? rx[4] : -1);
+            fail("frompread_answered_after_halt");
+        }
     }
-    if (ntx_wire_rd32(rx + 5) != 2 || ntx_wire_rd32(rx + 9) != 0 || ntx_wire_rd32(rx + 13) != 1024)
-        fail("frompread_reject_fields");
     if (z.s->tts_up[si] != up_before) fail("frompread_up_counted");
     if (ntx_session_share_state(z.s, si) != NTX_SHARE_FAILED) fail("frompread_not_failed");
     if (z.s->share[si]->err != NTX_SHARE_E_IO)
         fail("frompread_err_not_io");
     if (ntx_session_share_serving(z.s, si) != 0) fail("frompread_still_serving");
+    if (z.s->peers[pi].fd != -1) fail("frompread_peer_kept_after_io");
     /* one event per share (§5.5): the failure is in the stats, not a second line */
     ntx_share_event ev1;
     if (ntx_session_share_poll_event(z.s, &ev1) != 0) fail("frompread_second_event");
@@ -2121,6 +2335,94 @@ static void test_failed_share_is_dead(void) {
     ok("failed_share_is_dead");
 }
 
+/* ---- R5 a: a READY share whose file CHANGES on disk ----
+ * share_changed used to park the slot in FAILED and send a `stopped` while the
+ * announce schedule stayed armed, its peers stayed promoted and a new handshake
+ * naming the real hash was still answered. The halt must be one coherent act. */
+static void test_halt_after_change(void) {
+    scratch();
+    tracker tr;
+    memset(&tr, 0, sizeof tr);
+    tracker_start(&tr);
+    set_test_trackers(&tr, 2);
+    sess x;
+    sess_open(&x, "r5chg");
+    char p[256];
+    snprintf(p, sizeof p, "%s/r5chg/c.bin", scratch_root);
+    mk_file(p, 300000, 95);
+
+    ntx_share_err e = NTX_SHARE_OK;
+    int ti = share_add_parked(&x, p, NULL, &e);
+    if (ti < 0 || e != NTX_SHARE_OK) fail("r5chg_add");
+    (void)pump_until_hashed(&x, ti, 2000, NULL);
+    if (!pump_to_ready(&x, ti)) fail("r5chg_not_ready");
+    ntx_share_event ev;
+    if (ntx_session_share_poll_event(x.s, &ev) != 1 || !ev.ok) fail("r5chg_ready_event");
+    if (x.s->trk_started_ok[ti] != 1) fail("r5chg_no_started");
+    if (ntx_session_share_serving(x.s, ti) != 1) fail("r5chg_not_serving");
+
+    int cli = -1;
+    int pi = r5_attach_peer(&x, ti, &cli);
+
+    int pre = tracker_count(&tr);
+    { /* the byte edit of the §5.5 gate: same size, different bytes */
+        int fd = open(p, O_WRONLY);
+        if (fd < 0) fail("r5chg_edit_open");
+        uint8_t one = 0xA5;
+        if (pwrite(fd, &one, 1, 7) != 1) fail("r5chg_edit_pwrite");
+        close(fd);
+    }
+    ntx_share_test_advance_ms(1500); /* past the 1 s fstat interval */
+    ntx_session_share_tick(x.s);
+    assert_halted(&x, ti, &tr, pre, pi, "r5chg");
+    close(cli);
+    sess_close(&x);
+    tracker_stop(&tr);
+    ok("halt_after_change");
+}
+
+/* ---- R5 b: the same after a read that fails while serving ----
+ * The short pread seam of the frompread case: the last piece disappears under a
+ * serving share, data_serve refuses the block and calls
+ * ntx_session_share_io_failed. Pre-fix that hook only parked the share in
+ * FAILED/IO — no `stopped` at all, no peer drop, handshakes still answered. */
+static void test_halt_after_io(void) {
+    scratch();
+    tracker tr;
+    memset(&tr, 0, sizeof tr);
+    tracker_start(&tr);
+    set_test_trackers(&tr, 2);
+    sess x;
+    sess_open(&x, "r5io");
+    char p[256];
+    snprintf(p, sizeof p, "%s/r5io/d.bin", scratch_root);
+    mk_file(p, 40000, 96); /* 3 pieces: 16384 + 16384 + 7232 */
+
+    ntx_share_err e = NTX_SHARE_OK;
+    int ti = share_add_parked(&x, p, NULL, &e);
+    if (ti < 0 || e != NTX_SHARE_OK) fail("r5io_add");
+    (void)pump_until_hashed(&x, ti, 2000, NULL);
+    if (!pump_to_ready(&x, ti)) fail("r5io_not_ready");
+    ntx_share_event ev;
+    if (ntx_session_share_poll_event(x.s, &ev) != 1 || !ev.ok) fail("r5io_ready_event");
+    if (x.s->trk_started_ok[ti] != 1) fail("r5io_no_started");
+
+    int cli = -1;
+    int pi = r5_attach_peer(&x, ti, &cli);
+    x.s->share[ti]->fstat_at = UINT64_MAX; /* only the read may fail the share */
+
+    int pre = tracker_count(&tr);
+    if (trunc_to(p, 20000) != 0) fail("r5io_ftruncate"); /* abs of piece 2 is past EOF */
+    ntx_session_data_on_request(x.s, pi, 2, 0, 1024);
+    if (ntx_session_share_state(x.s, ti) != NTX_SHARE_FAILED) fail("r5io_not_failed");
+    if (x.s->share[ti]->err != NTX_SHARE_E_IO) fail("r5io_err_not_io");
+    assert_halted(&x, ti, &tr, pre, pi, "r5io");
+    close(cli);
+    sess_close(&x);
+    tracker_stop(&tr);
+    ok("halt_after_io");
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     scratch_root_init();
@@ -2146,6 +2448,8 @@ int main(void) {
     test_edit_during_hash();
     test_trunc_during_hash();
     test_failed_share_is_dead();
+    test_halt_after_change();
+    test_halt_after_io();
     ntx_share_trackers_test_set(NULL, -1);
     printf("ALL PASS\n");
     return 0;
