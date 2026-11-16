@@ -11,6 +11,7 @@
 #include "ntx_session_internal.h"
 #include "ntx_share_meta.h"
 #include "ntx_share_out.h"
+#include "ntx_utf8.h"
 #include "ntx_store.h"
 #include "ntx_time.h"
 #include "../crypto/ntx_rng.h"
@@ -232,7 +233,9 @@ static void share_evq_push(struct ntx_share_slot *sl) {
         ev->err = ok ? NTX_SHARE_OK : sl->err;
         memcpy(ev->ih, sl->sess_ih, 20); /* zeros while hashing, the real hash at READY */
         memcpy(ev->ih2, sl->ih2, 32);
-        snprintf(ev->name, sizeof ev->name, "%s", sl->name);
+        /* R8: cut on a UTF-8 character boundary, never in the middle of one —
+         * the ready line goes to a strict NDJSON parser. */
+        ntx_utf8_copy(ev->name, sizeof ev->name, sl->name);
         snprintf(ev->magnet, sizeof ev->magnet, "%s", sl->magnet);
         snprintf(ev->torrent_path, sizeof ev->torrent_path, "%s", sl->torrent_path);
         share_evq[i].owner = sl;
@@ -846,10 +849,10 @@ int ntx_session_share_add(ntx_session *s, const char *path, const char *from_tor
         sl->src = src;
         memcpy(sl->src_ih, src_ih, 20);
         memcpy(sl->src_ih2, src_ih2, 32);
-        snprintf(sl->name, sizeof sl->name, "%s", src->name);
+        ntx_utf8_copy(sl->name, sizeof sl->name, src->name);
         snprintf(sl->torrent_path, sizeof sl->torrent_path, "%s", from_torrent);
     } else {
-        snprintf(sl->name, sizeof sl->name, "%s", bn);
+        ntx_utf8_copy(sl->name, sizeof sl->name, bn);
     }
 
     ntx_session_hash_reset(s, ti);

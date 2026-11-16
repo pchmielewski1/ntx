@@ -6,6 +6,7 @@
 #include "../proto/ntx_dht.h"
 #include "../proto/ntx_doh.h"
 #include "ntx_time.h"
+#include "ntx_utf8.h"
 
 /* stats/UI refresh (ntx_session_stats_refresh + helpers) — split out of ntx_session.c. */
 
@@ -228,7 +229,10 @@ void ntx_session_stats_refresh(struct ntx_session *s, int rotate_ring) {
 
         ntx_tts_stat *tt = &st->t[st->n];
         tt->slot = (uint8_t)i; /* JSON-API v1 §5.2/§11.3: control key travels in the object */
-        snprintf(tt->name, sizeof tt->name, "%s", t->name);
+        /* R8: never cut char name[48] in the middle of a UTF-8 character — a
+         * torn tail made every stats line undecodable to a strict NDJSON
+         * parser for the whole life of the share. */
+        ntx_utf8_copy(tt->name, sizeof tt->name, t->name);
         memcpy(tt->h, t->info_hash, 20);
         tt->meta_version = t->meta_version;
         tt->hybrid = t->hybrid;

@@ -192,7 +192,7 @@ The line is built in a 24 KiB buffer. Torrent objects are added one by one; one 
 
 #### String encoding
 
-Strings (`name`, `doh`, `build`, echoed `cmd`) escape `"`, `\`, newline, carriage return and tab, and write other control characters as `\u00xx`. Bytes of `0x80` and above are written as they are and are not validated, so a torrent name that is not UTF-8 (or that was cut at 47 bytes inside a multi-byte character) yields output that is not valid UTF-8. Clients should decode leniently.
+Strings (`name`, `doh`, `build`, echoed `cmd`) escape `"`, `\`, newline, carriage return and tab, and write other control characters as `\u00xx`. Bytes of `0x80` and above are written as they are **only as part of a well-formed UTF-8 sequence**; an ill-formed one (a name that is not UTF-8, or a name cut by byte count) is replaced by exactly one U+FFFD (`\xef\xbf\xbd`) per bad run, so **every line is valid UTF-8** and a strict decoder accepts the whole stream. Names are also cut on a character boundary wherever a byte limit applies — the 47-byte stats `name`, the `share` event's 511-byte `name`, the CLI's 20-byte name column — so no cut ever splits a character. A byte that cannot start a sequence (a lone continuation byte, `0xC0`, `0xC1`, `0xF5`-`0xFF`) is one bad run; a lead byte followed by continuation bytes is one more.
 
 ## Commands (stdin)
 

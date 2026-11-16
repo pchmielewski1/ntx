@@ -94,7 +94,7 @@ for ln in lines:
 # DEAD slot with err/no_slot — the reply still echoes seq+cmd, so it is recorded
 # from the err branch above (the brief's own wait_for pins '"code":"no_slot"').
 want = {1: "ping", 2: "add", 3: "pause", 4: "pause", 5: "resume", 6: "remove",
-        7: "remove", 8: "quit", 9: "share", 10: "share"}
+        7: "remove", 8: "quit", 9: "share", 10: "share", 11: "add"}
 for seq, cmd in want.items():
     if replies.get(seq) != cmd:
         die(f"FAIL ack seq={seq} want={cmd} got={replies.get(seq)}")

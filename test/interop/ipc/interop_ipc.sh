@@ -126,6 +126,14 @@ say '{"cmd":"pause","seq":4,"i":0}'               # idempotent (§6.2)
 wait_for '"seq":4,"cmd":"pause"' 3 "$MAIN_OUT" main
 say '{"cmd":"resume","seq":5,"i":0}'
 wait_for '"seq":5,"cmd":"resume","i":0,"ok":1,"state":0' 3 "$MAIN_OUT" main  # paused_from = META
+# R8: a second torrent whose dn is 60 × U+00E9 (120 bytes of 2-byte characters).
+# The stats `name` field is 48 bytes, so the name MUST be cut on a character
+# boundary and every emitted line must stay decodable — assert_ipc.py parses the
+# whole stream with a strict decoder, which is exactly what R8 broke.
+DNR=""
+for _r8 in $(seq 1 60); do DNR="${DNR}%C3%A9"; done
+say "{\"cmd\":\"add\",\"seq\":11,\"magnet\":\"magnet:?xt=urn:btih:1123456789abcdef0123456789abcdef01234567&dn=$DNR\"}"
+wait_for '"seq":11,"cmd":"add"' 3 "$MAIN_OUT" main
 say '{"cmd":"status"}'                            # §6.2: a snapshot outside the 100 ms tick
 wait_for '"type":"stats"' 1 "$MAIN_OUT" main      # immediately — 100 ms margin
 say 'junk-no-braces'                              # §6.4: gate before any mutation

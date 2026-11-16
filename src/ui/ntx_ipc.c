@@ -1,5 +1,7 @@
 #include "ntx_ipc.h"
 
+#include "../core/ntx_utf8.h"
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,9 +15,33 @@
 int ntx_json_escape(char *out, size_t cap, const char *s) {
     size_t pos = 0;
     if (!s) { if (cap == 0) return -1; out[0] = 0; return 0; }
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-        unsigned char c = *p;
+    size_t n = strlen(s), i = 0;
+    while (i < n) {
+        unsigned char c = (unsigned char)s[i];
         int w;
+        if (c >= 0x80) {
+            /* R8: bytes >= 0x80 pass raw only as a WHOLE valid sequence. An
+             * ill-formed one (torn by a byte cut, or straight from disk)
+             * becomes exactly one U+FFFD — maximal-subpart style: the lead plus
+             * the continuation bytes that follow it count as one bad run, a
+             * lone continuation byte as one more. Valid high bytes stay raw
+             * (§3.4: non-ASCII travels raw), so the common case is unchanged. */
+            size_t left = n - i;
+            size_t len = ntx_utf8_seq_ok(s + i, left);
+            if (len) {
+                if (pos + len >= cap) goto refuse;
+                memcpy(out + pos, s + i, len);
+                pos += len;
+                i += len;
+                continue;
+            }
+            if (pos + 3 >= cap) goto refuse;
+            out[pos++] = (char)0xEF;
+            out[pos++] = (char)0xBF;
+            out[pos++] = (char)0xBD;
+            i += ntx_utf8_bad_len(s + i, left);
+            continue;
+        }
         if (c == '"' || c == '\\')
             w = snprintf(out + pos, cap - pos, "\\%c", c);
         else if (c == '\n')
@@ -29,10 +55,12 @@ int ntx_json_escape(char *out, size_t cap, const char *s) {
         else {
             if (pos + 1 >= cap) goto refuse;
             out[pos++] = (char)c;
+            i++;
             continue;
         }
         if (w < 0 || pos + (size_t)w >= cap) goto refuse; /* clean refusal */
         pos += (size_t)w;
+        i++;
     }
     if (pos >= cap) goto refuse;
     out[pos] = 0;

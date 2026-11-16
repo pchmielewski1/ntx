@@ -1,4 +1,5 @@
 #include "ntx_share_out.h"
+#include "ntx_utf8.h"
 #include "../crypto/ntx_sha1.h"
 #include "../proto/ntx_bencode.h"
 
@@ -26,37 +27,8 @@
  * of ours. */
 #define SOUT_MAX_TORRENT (4u * 1024u * 1024u)
 
-static int sout_char_len(unsigned char c) {
-    if (c < 0x80) return 1;
-    if (c >= 0xC2 && c <= 0xDF) return 2;
-    if (c >= 0xE0 && c <= 0xEF) return 3;
-    if (c >= 0xF0 && c <= 0xF4) return 4;
-    return 0;
-}
-
-/* Strict UTF-8: no overlong forms, no surrogates, nothing above U+10FFFF. */
-static int sout_utf8_ok(const char *s, size_t n) {
-    const unsigned char *u = (const unsigned char *)s;
-    size_t i = 0;
-    while (i < n) {
-        int need = sout_char_len(u[i]);
-        if (need == 0 || i + (size_t)need > n) return 0;
-        for (int k = 1; k < need; k++)
-            if (u[i + k] < 0x80 || u[i + k] > 0xBF) return 0;
-        unsigned cp;
-        if (need == 2) cp = u[i] & 0x1Fu;
-        else if (need == 3) cp = u[i] & 0x0Fu;
-        else if (need == 4) cp = u[i] & 0x07u;
-        else cp = 0;
-        for (int k = 1; k < need; k++) cp = (cp << 6) | (unsigned)(u[i + k] & 0x3F);
-        if (need == 3 && cp < 0x800) return 0;
-        if (need == 4 && cp < 0x10000) return 0;
-        if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return 0;
-        i += (size_t)need;
-    }
-    return 1;
-}
-
+/* The strict UTF-8 verdict moved to ntx_utf8.h (R8), where the stats cut, the
+ * CLI cut and the JSON emitter use the same rules as this name gate. */
 int ntx_share_name_ok(const char *name) {
     if (!name) return 0;
     size_t n = strlen(name);
@@ -65,7 +37,7 @@ int ntx_share_name_ok(const char *name) {
         unsigned char c = (unsigned char)name[i];
         if (c < 0x20 || c == 0x7f || c == '/') return 0;
     }
-    return sout_utf8_ok(name, n);
+    return ntx_utf8_valid(name, n);
 }
 
 static int sout_append(char *out, size_t cap, size_t *o, const char *s, size_t n) {
@@ -140,14 +112,9 @@ int ntx_share_torrent_path(char *out, size_t cap, const char *dir, const char *n
     if (!out || cap == 0 || !dir || !dir[0] || !ih || !ntx_share_name_ok(name)) return -1;
 
     /* Longest whole-character prefix of name that still leaves room for the
-     * suffix in a NAME_MAX basename. The name in the torrent is never cut. */
-    size_t n = strlen(name);
-    size_t stem = 0;
-    while (stem < n) {
-        size_t step = (size_t)sout_char_len((unsigned char)name[stem]);
-        if (step == 0 || stem + step > n || stem + step > (size_t)NAME_MAX - SOUT_SUFFIX_LEN) break;
-        stem += step;
-    }
+     * suffix in a NAME_MAX basename (R8: one helper for every byte cut). The
+     * name in the torrent is never cut. */
+    size_t stem = ntx_utf8_cut(name, strlen(name), (size_t)NAME_MAX - SOUT_SUFFIX_LEN);
 
     char hex[8 + 1];
     size_t ho = 0;

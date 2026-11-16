@@ -85,6 +85,8 @@
 #include "../src/proto/ntx_pcp.c"
 #undef NTX_NO_MAIN
 
+#include "util.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -140,6 +142,38 @@ static const char *code_name(ntx_ipc_code c) { /* same strings as §8.1 */
     case NTX_IPC_E_IO: return "io";
     default: return "internal";
     }
+}
+
+/* R8: strict UTF-8 witness for the NDJSON lines the share path emits, over the
+   whole string. test_utf8_strict (test/util.h) is the independent decoder — the
+   shipped one is static-inline in ntx_utf8.h, so reusing it would test it
+   against itself (same reason test_utf8_ok exists in t_share_out.c). */
+static int utf8_strict(const char *s, size_t *bad) {
+    return test_utf8_strict(s, strlen(s), bad);
+}
+
+/* one emitted line: structurally sound JSON and strictly decodable UTF-8 */
+static int r8_line(const char *tag, const char *line) {
+    size_t bad = 0;
+    if (!ipc_ok_local(line)) {
+        printf("R8 %s: torn JSON line: %s\n", tag, line);
+        return 1;
+    }
+    if (!utf8_strict(line, &bad)) {
+        printf("R8 %s: line byte %zu (0x%02x) is not valid UTF-8: %s\n", tag, bad,
+               (unsigned)(unsigned char)line[bad], line);
+        return 1;
+    }
+    return 0;
+}
+
+/* Byte-exact stand-in for snprintf "%s" truncation (the production cuts), without
+   the -Wformat-truncation complaint about the deliberately short destination. */
+static void r8_cut(char *dst, size_t capsz, const char *src) {
+    size_t n = strlen(src);
+    if (n > capsz - 1) n = capsz - 1;
+    memcpy(dst, src, n);
+    dst[n] = 0;
 }
 
 static int hexb(const char *hx, unsigned char *dst, size_t cap) {
@@ -810,6 +844,207 @@ int main(void) {
             drop(s, nx);
         }
         if (ok("c3_dispatch_share")) return 1;
+    }
+
+    { /* ── R8: a name cut by BYTE count must not split a UTF-8 character, and the
+         emitter must not leak invalid sequences into the NDJSON stream.
+         Every line here goes through the strict validator above — the same verdict
+         a strict NDJSON parser (Python/Go/Node) makes on the IPC channel. ── */
+        ntx_stats st;
+        char js[40960];
+        char big[704];
+
+        /* (a) THE REAL CUT: a live session slot whose torrent name is 60 ×
+           U+00E9 (120 B) is cut into char name[48] by
+           ntx_session_stats_refresh — the old snprintf left "\xc3" as byte 47
+           and every stats line for the whole share was undecodable. */
+        {
+            ntx_config cfg;
+            ntx_netx *nx;
+            memset(&cfg, 0, sizeof cfg);
+            cfg.store_dir = "/tmp/ntx-ipc-t6";
+            ntx_session *s = mk(&nx, &cfg);
+            char line[256];
+            snprintf(line, sizeof line,
+                     "{\"cmd\":\"add\",\"magnet\":\"magnet:?xt=urn:btih:%s\"}",
+                     "0123456789abcdef0123456789abcdef01234567");
+            ntx_ipc_req r;
+            ntx_ipc_parse(line, &r);
+            if (ntx_session_add_magnet(s, r.magnet) != 0) { drop(s, nx); return fail("r8_sess_add"); }
+            for (int k = 0; k < 60; k++) memcpy(big + (size_t)k * 2, "\xc3\xa9", 2);
+            big[120] = 0;
+            memcpy(s->tts[0].name, big, 121); /* what a 120-B torrent name looks like */
+            ntx_session_stats_refresh(s, 0);
+            ntx_session_snapshot(s, &st);
+            drop(s, nx);
+            if (st.n != 1) return fail("r8_sess_n");
+            if (ntx_stats_to_json(&st, js, sizeof js) <= 0) return fail("r8_stats_len_session");
+            if (r8_line("stats session 60x e-acute", js)) return fail("r8_stats_session_name");
+            if (strstr(js, "\xef\xbf\xbd")) return fail("r8_stats_session_fffd"); /* no cut to repair */
+            {
+                char want[64], fld[128];
+                for (int k = 0; k < 23; k++) memcpy(want + (size_t)k * 2, "\xc3\xa9", 2);
+                want[46] = 0; /* 23 × é fits in 47 B, the 24th would not */
+                snprintf(fld, sizeof fld, "\"name\":\"%s\"", want);
+                if (!strstr(js, fld)) { printf("R8 session 23x prefix missing: %s\n", js); return fail("r8_stats_session_cut"); }
+            }
+        }
+
+        /* (b) emitter path: a name already cut mid-character (a share name read
+           off disk, or any other byte-cut producer) must still yield a line a
+           strict parser accepts. */
+        memset(&st, 0, sizeof st);
+        st.n = 1;
+        for (int k = 0; k < 60; k++) memcpy(big + (size_t)k * 2, "\xc3\xa9", 2);
+        big[120] = 0;
+        r8_cut(st.t[0].name, sizeof st.t[0].name, big);
+        if (ntx_stats_to_json(&st, js, sizeof js) <= 0) return fail("r8_stats_len_2byte");
+        if (r8_line("stats 60x e-acute", js)) return fail("r8_stats_2byte_name");
+        /* the escaper replaced exactly the torn tail with one U+FFFD and kept
+           the 23 whole characters that fit in the field */
+        {
+            char want[80];
+            want[0] = 0;
+            for (int k = 0; k < 23; k++) memcpy(want + (size_t)k * 2, "\xc3\xa9", 2);
+            memcpy(want + 46, "\xef\xbf\xbd\"", 4);
+            want[50] = 0;
+            char fld[128];
+            snprintf(fld, sizeof fld, "\"name\":\"%s", want);
+            if (!strstr(js, fld)) { printf("R8 stats 23x prefix missing: %s\n", js); return fail("r8_stats_2byte_cut"); }
+        }
+
+        /* (c) stats name with a 4-byte character straddling the 47/48 B boundary
+           (45 ASCII, then the emoji occupies bytes 45..48 of the 47-byte field). */
+        memset(&st, 0, sizeof st);
+        st.n = 1;
+        memset(big, 'a', 45); big[45] = 0;
+        snprintf(big + 45, sizeof big - 45, "\xf0\x9f\x98\x80tail");
+        r8_cut(st.t[0].name, sizeof st.t[0].name, big);
+        if (ntx_stats_to_json(&st, js, sizeof js) <= 0) return fail("r8_stats_len_4byte");
+        if (r8_line("stats 4-byte at 47/48", js)) return fail("r8_stats_4byte_boundary");
+        {
+            char want[80];
+            memset(want, 'a', 45);
+            memcpy(want + 45, "\xef\xbf\xbd\"", 4); /* one run, one U+FFFD */
+            want[49] = 0;
+            char fld[128];
+            snprintf(fld, sizeof fld, "\"name\":\"%s", want);
+            if (!strstr(js, fld)) { printf("R8 stats 45x a prefix missing: %s\n", js); return fail("r8_stats_4byte_cut"); }
+        }
+
+        /* (d) share event name: 300 × é is 600 B, so the copy into char name[512]
+           is itself cut mid-character; the line must still decode. */
+        {
+            ntx_share_event ev;
+            char line[40960];
+            memset(&ev, 0, sizeof ev);
+            ev.i = 5; ev.ok = 1;
+            for (int k = 0; k < 20; k++) ev.ih[k] = (uint8_t)(0x10 + k);
+            for (int k = 0; k < 32; k++) ev.ih2[k] = (uint8_t)(0x20 + k);
+            for (int k = 0; k < 300; k++) memcpy(big + (size_t)k * 2, "\xc3\xa9", 2);
+            big[600] = 0;
+            r8_cut(ev.name, sizeof ev.name, big);
+            snprintf(ev.magnet, sizeof ev.magnet, "magnet:?xt=urn:btih:%040x", 7);
+            snprintf(ev.torrent_path, sizeof ev.torrent_path, "/tmp/r8.torrent");
+            /* the input really is a torn 511-byte cut — without this the emitter
+               case below would pass trivially */
+            if (utf8_strict(ev.name, NULL)) return fail("r8_event_input_whole");
+            if (ntx_ipc_share_event_json(line, sizeof line, &ev) <= 0) return fail("r8_event_len");
+            if (r8_line("share event 300x e-acute", line)) return fail("r8_event_long_name");
+
+            /* the REAL producer: share_evq_push (static, this TU includes
+               ntx_share.c) copies sl->name into ev->name. A 600-B name on a
+               FAILED slot must reach the queue cut on a boundary, so the
+               emitted line needs no repair at all (no U+FFFD). */
+            {
+                ntx_config cfg;
+                ntx_netx *nx;
+                memset(&cfg, 0, sizeof cfg);
+                cfg.store_dir = "/tmp/ntx-ipc-t6";
+                ntx_session *s = mk(&nx, &cfg);
+                FILE *wf = fopen("/tmp/ntx-ipc-t6/r8-share.bin", "wb");
+                if (!wf) { drop(s, nx); return fail("r8_prod_file"); }
+                fputs("0123456789", wf);
+                fclose(wf);
+                ntx_ipc_req r;
+                ntx_ipc_parse("{\"cmd\":\"share\",\"path\":\"/tmp/ntx-ipc-t6/r8-share.bin\"}", &r);
+                ntx_share_err se = NTX_SHARE_OK;
+                int ti = ntx_session_share_add(s, r.path, NULL, &se);
+                if (ti < 0) { drop(s, nx); printf("R8 share_add err=%d\n", (int)se); return fail("r8_prod_add"); }
+                struct ntx_share_slot *sl = s->share[ti];
+                /* the pre-fix producer did exactly this: snprintf "%s" into
+                   char name[512] cut the 600-B name in mid-character */
+                r8_cut(sl->name, sizeof sl->name, big);
+                if (utf8_strict(sl->name, NULL)) return fail("r8_prod_setup");
+                sl->st = NTX_SHARE_FAILED;
+                sl->err = NTX_SHARE_E_CHANGED;
+                share_evq_push(sl);
+                ntx_share_event pev;
+                if (ntx_session_share_poll_event(s, &pev) != 1) { drop(s, nx); return fail("r8_prod_event"); }
+                drop(s, nx);
+                size_t pl = strlen(pev.name);
+                if (pl != 510 || !utf8_strict(pev.name, NULL)) {
+                    printf("R8 producer cut: len=%zu valid=%d tail=%02x %02x\n", pl,
+                           utf8_strict(pev.name, NULL), (unsigned)(unsigned char)pev.name[509],
+                           (unsigned)(unsigned char)pev.name[510]);
+                    return fail("r8_event_producer_cut");
+                }
+                snprintf(pev.magnet, sizeof pev.magnet, "magnet:?xt=urn:btih:%040x", 8);
+                snprintf(pev.torrent_path, sizeof pev.torrent_path, "/tmp/r8-prod.torrent");
+                pev.ok = 1;
+                if (ntx_ipc_share_event_json(line, sizeof line, &pev) <= 0) return fail("r8_prod_evt_len");
+                if (r8_line("share event producer 300x e-acute", line)) return fail("r8_prod_event_line");
+                if (strstr(line, "\xef\xbf\xbd")) return fail("r8_prod_event_fffd");
+            }
+
+            /* (e) invalid bytes in name / magnet / torrent become U+FFFD, never a
+               rejected line (§11.1 keeps the escaping discipline). */
+            memset(&ev, 0, sizeof ev);
+            ev.i = 6; ev.ok = 1;
+            snprintf(ev.name, sizeof ev.name, "ok\xc3\x28tail");        /* C3 + '(' = invalid */
+            snprintf(ev.magnet, sizeof ev.magnet, "m?\xfe\xff");          /* impossible lead bytes */
+            snprintf(ev.torrent_path, sizeof ev.torrent_path, "/p/\xe2\x82"); /* truncated 3-byte */
+            if (ntx_ipc_share_event_json(line, sizeof line, &ev) <= 0) return fail("r8_event_bad_len");
+            if (r8_line("share event invalid bytes", line)) return fail("r8_event_sanitize");
+            if (!strstr(line, "\"name\":\"ok\xef\xbf\xbd(") && !strstr(line, "\"name\":\"ok\xef\xbf\xbd\xef\xbf\xbd(")) {
+                printf("R8 no U+FFFD in name: %s\n", line);
+                return fail("r8_event_sanitize_name");
+            }
+            if (!strstr(line, "\xef\xbf\xbd") ) return fail("r8_event_sanitize_missing");
+
+            /* (f) guard: an ASCII name and a short, already-valid UTF-8 name come
+               out byte-for-byte unchanged. */
+            memset(&ev, 0, sizeof ev);
+            ev.i = 7; ev.ok = 1;
+            snprintf(ev.name, sizeof ev.name, "Plain.Name-01.txt");
+            snprintf(ev.magnet, sizeof ev.magnet, "magnet:?xt=urn:btih:%040x", 9);
+            snprintf(ev.torrent_path, sizeof ev.torrent_path, "/tmp/plain.torrent");
+            if (ntx_ipc_share_event_json(line, sizeof line, &ev) <= 0) return fail("r8_evt_ascii_len");
+            if (!strstr(line, "\"name\":\"Plain.Name-01.txt\"")) return fail("r8_event_ascii_guard");
+            if (strstr(line, "\xef\xbf\xbd")) return fail("r8_event_ascii_fffd");
+            snprintf(ev.name, sizeof ev.name, "za\xC5\xBC\xC3\xB3\xC5\x82\xC4\x87.txt");
+            if (ntx_ipc_share_event_json(line, sizeof line, &ev) <= 0) return fail("r8_evt_utf8_len");
+            if (!strstr(line, "\"name\":\"za\xC5\xBC\xC3\xB3\xC5\x82\xC4\x87.txt\""))
+                return fail("r8_event_utf8_guard");
+            if (strstr(line, "\xef\xbf\xbd")) return fail("r8_event_utf8_fffd");
+            if (r8_line("share event ascii", line)) return fail("r8_event_ascii_line");
+        }
+
+        /* (g) guard: a short, already-valid stats name is byte-for-byte unchanged. */
+        memset(&st, 0, sizeof st);
+        st.n = 1;
+        snprintf(st.t[0].name, sizeof st.t[0].name, "za\xC5\xBC\xC3\xB3\xC5\x82\xC4\x87.txt");
+        if (ntx_stats_to_json(&st, js, sizeof js) <= 0) return fail("r8_stats_short_len");
+        if (!strstr(js, "\"name\":\"za\xC5\xBC\xC3\xB3\xC5\x82\xC4\x87.txt\"")) return fail("r8_stats_short_guard");
+        if (strstr(js, "\xef\xbf\xbd")) return fail("r8_stats_short_fffd");
+        memset(&st, 0, sizeof st);
+        st.n = 1;
+        memset(big, 'x', 47); big[47] = 0; /* the t_cli_tags.c 47-char name */
+        r8_cut(st.t[0].name, sizeof st.t[0].name, big);
+        if (ntx_stats_to_json(&st, js, sizeof js) <= 0) return fail("r8_stats_ascii47_len");
+        if (!strstr(js, "\"name\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""))
+            return fail("r8_stats_ascii47_guard");
+        if (ok("r8_utf8_stats_event")) return 1;
     }
 
     return 0; /* tasks append here; keep the final line intact */

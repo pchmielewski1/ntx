@@ -189,7 +189,7 @@ ubuntu-24.04.iso     100% [==========]   1.82G/1.82G  up2.54G ^44K/s r1.4 @seed 
 ubuntu-24.04.iso     100% [==========]   1.82G/1.82G  up5.45G ^0B/s  r3.0 @ratio-done trk09/18p00 pe60/05/55u12i03 dnsQ9
 ```
 
-Layout of the downloading line: name (first 20 bytes, padded), percentage, 10-cell bar, `verified/total` size, `v<down rate>` and `^<up rate>`, ETA (`--:--` when unknown), `pieces done/total`, `@phase`, then the diagnostic tags below. While waiting for metadata the line is `name META:<phase>` followed by the tags and the uptime in seconds. When the torrent is complete, the rate / ETA / piece-count fields are replaced by `up<total uploaded>`, `^<up rate>` and `r<ratio>` (uploaded / size).
+Layout of the downloading line: name (first 20 bytes, cut on a UTF-8 character boundary so a multi-byte name never renders as garbage, padded), percentage, 10-cell bar, `verified/total` size, `v<down rate>` and `^<up rate>`, ETA (`--:--` when unknown), `pieces done/total`, `@phase`, then the diagnostic tags below. While waiting for metadata the line is `name META:<phase>` followed by the tags and the uptime in seconds. When the torrent is complete, the rate / ETA / piece-count fields are replaced by `up<total uploaded>`, `^<up rate>` and `r<ratio>` (uploaded / size).
 
 On exit a summary line is printed to stderr (not with `--stats-json`):
 

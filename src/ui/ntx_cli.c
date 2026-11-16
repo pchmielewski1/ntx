@@ -2,6 +2,7 @@
 #include "ntx_diag.h"
 
 #include "../core/ntx_torrent.h"
+#include "../core/ntx_utf8.h"
 
 /* Only the NTX_PM_* enum is needed here; ntx_session_portmap.h declares the
  * ntx_session_portmap_* fns taking `struct ntx_session *` but does not
@@ -84,7 +85,12 @@ static void cli_name_short(const char *src, char *out, size_t cap) {
         snprintf(out, cap, "(torrent)");
         return;
     }
-    snprintf(out, cap, "%.*s", CLI_NAME_W, src);
+    /* R8: the column budget stays CLI_NAME_W BYTES (docs/cli.md pins the layout
+     * on it), but the cut lands on a UTF-8 character boundary — the status line
+     * is a terminal stream and a torn character renders as garbage. A name that
+     * is already valid ASCII/UTF-8 and short comes out byte-for-byte unchanged. */
+    size_t fit = cap - 1 < (size_t)CLI_NAME_W ? cap - 1 : (size_t)CLI_NAME_W;
+    ntx_utf8_copy(out, fit + 1, src);
 }
 
 static void cli_flags_compact(const ntx_stats *st, const ntx_tts_stat *t, char *out, size_t cap) {

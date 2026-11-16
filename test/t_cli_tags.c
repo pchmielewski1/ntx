@@ -3,6 +3,8 @@
 #include "../src/ui/ntx_cli.c"
 #include "../src/ui/ntx_diag.c"
 
+#include "util.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -353,6 +355,85 @@ int main(void) {
             if (n > (size_t)CLI_MAX_LINE) return fail("writer_len");
         }
         if (ok("writer_len")) return 1;
+    }
+
+    /* ── R8: the 20-byte name column must never be cut inside a UTF-8 character,
+     * so the status line stays decodable (§10 layout, docs/cli.md "first 20
+     * bytes"). A strict decoder is the witness. ── */
+    {
+        char utf[128], pad[96];
+
+        /* odd offset: "a" + 30 × é (61 B) → the 20-byte budget must stop at 19
+         * bytes ("a" + 9 × é), not tear the 10th. */
+        utf[0] = 'a';
+        for (int k = 0; k < 30; k++) memcpy(utf + 1 + (size_t)k * 2, "\xc3\xa9", 2);
+        utf[61] = 0;
+        seed(&st, utf);
+        ntx_cli_status_format(&st, line, sizeof line);
+        {
+            size_t bad = 0;
+            if (!test_utf8_strict(line, strcspn(line, "\n"), &bad)) {
+                fprintf(stderr, "line: %s\nbyte %zu: %02x\n", line, bad,
+                        (unsigned)(unsigned char)line[bad]);
+                return fail("r8_cli_name_2byte");
+            }
+        }
+        {
+            char want[32], col[64];
+            want[0] = 'a';
+            for (int k = 0; k < 9; k++) memcpy(want + 1 + (size_t)k * 2, "\xc3\xa9", 2);
+            want[19] = 0;
+            snprintf(col, sizeof col, "%s ", want); /* %-*s pads to 20 with one space */
+            if (strncmp(line, col, strlen(col)) != 0) {
+                fprintf(stderr, "line: %s\nwant: [%s]\n", line, col);
+                return fail("r8_cli_name_2byte_cut");
+            }
+        }
+
+        /* 4-byte character straddling the 20th byte: 17 ASCII + U+1F600 (4 B). */
+        memset(utf, 'b', 17); utf[17] = 0;
+        memcpy(utf + 17, "\xf0\x9f\x98\x80", 4);
+        seed(&st, utf);
+        ntx_cli_status_format(&st, line, sizeof line);
+        {
+            size_t bad = 0;
+            if (!test_utf8_strict(line, strcspn(line, "\n"), &bad)) {
+                fprintf(stderr, "line: %s\nbyte %zu: %02x\n", line, bad,
+                        (unsigned)(unsigned char)line[bad]);
+                return fail("r8_cli_name_4byte");
+            }
+        }
+        memset(pad, 'b', 17); pad[17] = 0;
+        {
+            char col[64];
+            snprintf(col, sizeof col, "%s   ", pad); /* 17 kept + 3 pad to 20 */
+            if (strncmp(line, col, strlen(col)) != 0) {
+                fprintf(stderr, "line: %s\nwant: [%s]\n", line, col);
+                return fail("r8_cli_name_4byte_cut");
+            }
+        }
+
+        /* guard: an ASCII name and a short valid UTF-8 name are unchanged. */
+        {
+            static const char *const plain[] = { "Plain.Name-01.txt",
+                                                 "za\xC5\xBC\xC3\xB3\xC5\x82\xC4\x87.txt" };
+            for (int k = 0; k < 2; k++) {
+                char col[64];
+                size_t pl = strlen(plain[k]);
+                if (pl > (size_t)CLI_NAME_W) return fail("r8_cli_guard_setup");
+                memcpy(col, plain[k], pl);
+                memset(col + pl, ' ', (size_t)CLI_NAME_W - pl);
+                col[CLI_NAME_W] = 0;
+                seed(&st, plain[k]);
+                ntx_cli_status_format(&st, line, sizeof line);
+                if (memcmp(line, col, (size_t)CLI_NAME_W) != 0) {
+                    fprintf(stderr, "line: %s\nwant: [%s]\n", line, col);
+                    return fail(k ? "r8_cli_utf8_guard" : "r8_cli_ascii_guard");
+                }
+                if (strstr(line, "\xef\xbf\xbd")) return fail("r8_cli_guard_fffd");
+            }
+        }
+        if (ok("r8_cli_name_boundary")) return 1;
     }
 
     return 0;
