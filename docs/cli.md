@@ -173,7 +173,13 @@ On every start except `--version`, `ntx` first prints one banner line to stderr:
 
 Without `--stats-json`, the status of the torrent is written to **stderr** about ten times per second (every 100 ms).
 
-- On a terminal the line is redrawn in place (`\r` + clear line) and cut to the terminal width.
+- On a terminal the line is redrawn in place (`\r` + clear line) and cut to the terminal width. The cut
+  lands on a **tag boundary** — a tag is either printed whole or not at all, never torn in half — and the
+  removed part is marked with ` ..`.
+- On a terminal, the tags that tell you a **share is not healthy** (`prv`, `shr`/`shr!`, `enc!`, `pin!N`,
+  `map…`, `inN`) are printed directly after the name column, *before* the counters, so a narrow terminal
+  gives up `trk…`, `pe…`, `m…`, `dns…`, `utp…` and `punch…` first and never a warning (R17). Without a
+  share, and in every non-terminal line, the tags keep the plain order of the table below.
 - When stderr is not a terminal, every refresh is a separate line ending in `\n` (about ten lines per second).
 - A line is at most 176 characters (`CLI_MAX_LINE`).
 - Progress is **verified bytes** (after the SHA-1 or merkle check), not bytes received from the wire.
@@ -187,9 +193,14 @@ ubuntu-24.04.iso     META:meta      trk08/18p00 pe43/00/08u02i00 m04/15 dnsQ9  1
 ubuntu-24.04.iso      21% [==>       ]  391.0M/1.82G  v8.1M/s^0B/s   3:12  215/934  @dl   trk09/18p00 pe60/05/55u12i03 dnsQ9
 ubuntu-24.04.iso     100% [==========]   1.82G/1.82G  up2.54G ^44K/s r1.4 @seed trk09/18p00 pe60/05/55u12i03 dnsQ9
 ubuntu-24.04.iso     100% [==========]   1.82G/1.82G  up5.45G ^0B/s  r3.0 @ratio-done trk09/18p00 pe60/05/55u12i03 dnsQ9
+ubuntu-24.04.iso     prv shr enc! pin!1 map:40123 in2 100% [==========]   2.00G/2.00G  up2.54G ^44K/s r1.3 @seed trk00/05p00 pe06/00/00u00i00
 ```
 
-Layout of the downloading line: name (first 20 bytes, cut on a UTF-8 character boundary so a multi-byte name never renders as garbage, padded), percentage, 10-cell bar, `verified/total` size, `v<down rate>` and `^<up rate>`, ETA (`--:--` when unknown), `pieces done/total`, `@phase`, then the diagnostic tags below. While waiting for metadata the line is `name META:<phase>` followed by the tags and the uptime in seconds. When the torrent is complete, the rate / ETA / piece-count fields are replaced by `up<total uploaded>`, `^<up rate>` and `r<ratio>` (uploaded / size).
+The last line is a `--share` slot: the safety block sits behind the name. Cut to an 80-column terminal it
+becomes `ubuntu-24.04.iso     prv shr! enc! pin!1 map!cg in2 100% [==========]` — the counters are gone,
+every warning is still there.
+
+Layout of the downloading line: name (first 20 bytes, cut on a UTF-8 character boundary so a multi-byte name never renders as garbage, padded), on a terminal the safety block of a share slot, percentage, 10-cell bar, `verified/total` size, `v<down rate>` and `^<up rate>`, ETA (`--:--` when unknown), `pieces done/total`, `@phase`, then the remaining diagnostic tags below. While waiting for metadata the line is `name META:<phase>` followed by the tags and the uptime in seconds. When the torrent is complete, the rate / ETA / piece-count fields are replaced by `up<total uploaded>`, `^<up rate>` and `r<ratio>` (uploaded / size).
 
 On exit a summary line is printed to stderr (not with `--stats-json`):
 
@@ -201,7 +212,11 @@ ntx: stopped — <name> (metadata not fetched, phase <phase>)
 
 ### Diagnostic tags
 
-Tags are appended in this order. Counters are capped at 99.
+Tags are appended in this order. Counters are capped at 99. The rows from `prv` to `inN` are the **safety
+block** of a share slot: on a terminal that block is printed directly after the name column, ahead of the
+counter tags above, so a cut to the terminal width drops counters before it drops a warning (R17). The order
+inside the block is the order of the table and is the same in both positions; outside a share the block stays
+at the end of the list, exactly where the table puts it.
 
 | Tag | Meaning |
 |-----|---------|

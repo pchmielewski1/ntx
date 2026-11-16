@@ -32,6 +32,52 @@ static int ordered(const char *line, const char *const *tags, int n) {
  * overshoots the 176-char budget. Measured would-be lengths are in the table below. */
 typedef struct { int dns, utp, punch, dead, lpend; } maxload;
 
+/* R17: the tty path of ntx_cli_status_update() is cli_status_tty() — budget cap
+ * plus the cut to the terminal width. The width itself comes from
+ * ioctl(stderr), which a test cannot set, so the renderer is driven directly. */
+static size_t render_at(ntx_stats *st, char *out, size_t cap, int cols) {
+    return cli_status_tty(st, out, cap, cols);
+}
+
+/* No tag torn in half: every occurrence that starts a token must end on a space
+ * or at the end of the line, so a cut can only drop tags whole. `tag` is the
+ * COMPLETE spelling of one tag ("map!cg", not "map"). */
+static int tag_whole(const char *line, const char *tag) {
+    size_t n = strlen(tag);
+    for (const char *p = strstr(line, tag); p; p = strstr(p + 1, tag)) {
+        if (p != line && p[-1] != ' ') continue; /* inside another token */
+        if (p[n] != 0 && p[n] != ' ') return 0;  /* token continues: torn tag */
+    }
+    return 1;
+}
+
+/* Every tag spelling the renderer can emit — the alphabet for the torn-tag
+ * checks below. A suffix that is a PROPER prefix of any of these means the cut
+ * stopped inside a tag. */
+static const char *const r17_tags[] = {"prv", "shr", "shr!", "enc!", "pin!", "map:", "map!",
+                                       "map-", "in", "trk", "pe", "m", "dns", "dns..", "utp",
+                                       "punch", "Lpend", "v2", "hl"};
+#define R17_NTAGS ((int)(sizeof r17_tags / sizeof r17_tags[0]))
+
+/* The last token of a trimmed line must not be a PROPER prefix of one of the
+ * tags: "… pin!3" is a cut, "… pin!." (the trim's dots over a torn tag) is not a
+ * word of the line. The dots are stripped before the compare, so a cut inside a
+ * tag is caught even though cli_trim_to_width() overwrites its last bytes. */
+static int no_torn_tag(const char *line, const char *const *tags, int n) {
+    size_t len = strlen(line), s = len, tl;
+    char tok[32];
+    while (s > 0 && line[s - 1] != ' ') s--;
+    tl = len - s;
+    if (tl >= sizeof tok) tl = sizeof tok - 1;
+    memcpy(tok, line + s, tl);
+    tok[tl] = 0;
+    while (tl > 0 && tok[tl - 1] == '.') tok[--tl] = 0; /* the trim's ellipsis */
+    if (tl == 0) return 1;
+    for (int i = 0; i < n; i++)
+        if (tl < strlen(tags[i]) && strncmp(tok, tags[i], tl) == 0) return 0;
+    return 1;
+}
+
 /* Every field at its widest rendering (pattern from ntx_cli.c:14): 20-char name,
  * 99-capped counters, "1.00G" / "1024K" / "1024K/s" / "59:59". tags = 0 gives the
  * pre-§10 line, tags = 1 adds all six §10 tags at their caps. The widths are
@@ -88,6 +134,37 @@ static void seed(ntx_stats *st, const char *name) {
     t->pct = 9;
     t->spd_d = 8 * 1024 * 1024;
     t->spd_u = 128 * 1024;
+}
+
+/* A seeding share with the alarm tags on — R17's case. 20-char name, every
+ * informational tag active (trk/pe/dns/utp/punch), safety block in its alarm
+ * form. Measured full length 164 columns, so 80/100/120 all have to cut.
+ * cgnat = 1 swaps map:<port> for map!cg. */
+static void seedshare(ntx_stats *st, int cgnat) {
+    seed(st, "Q4.Report.2026.pdf");
+    ntx_tts_stat *t = &st->t[0];
+    t->state = NTX_TTS_DONE;
+    snprintf(t->phase, sizeof t->phase, "seed");
+    t->done = t->total = 934;
+    t->down = t->up = t->size = 1024ULL * 1024 * 1024;
+    t->pct = 100;
+    t->priv = 1;
+    t->share = 2; /* the shared file changed — shr! */
+    t->enc_strict = 1;
+    t->trk_pin_fail = 3;
+    t->in_ok = 2;
+    t->trk_udp_ok = 2;
+    t->trk_total = 5;
+    t->trk_pend = 1;
+    t->trk_dead = 2;
+    t->peers_all = t->peers_hs = t->peers_ok = t->peers_unchoked = t->peers_interested = 4;
+    st->utp = 1;
+    st->utp_conns = 7;
+    st->punch_ok = 3;
+    st->punch_fail = 1;
+    snprintf(st->doh, sizeof st->doh, "!UC");
+    st->port_map = cgnat ? NTX_PM_CGNAT : NTX_PM_ACTIVE;
+    st->ext_port = cgnat ? 0 : 40123;
 }
 
 int main(void) {
@@ -355,6 +432,141 @@ int main(void) {
             if (n > (size_t)CLI_MAX_LINE) return fail("writer_len");
         }
         if (ok("writer_len")) return 1;
+    }
+
+    /* ── R17: the safety tags of a share survive a cut to a terminal width ──
+     * A seeding share with every informational tag on is 164 columns wide, so
+     * 80/100/120 all have to cut. shr!/pin!N/enc!/map! are the tags that must
+     * still be readable after the cut — before R17 they were the tail of the
+     * list and were exactly what fell off, leaving a healthy-looking line. */
+    {
+        static const char *const safe_port[] = {"prv", "shr!", "enc!", "pin!3", "map:40123", "in2"};
+        static const char *const safe_cgnat[] = {"prv", "shr!", "enc!", "pin!3", "map!cg", "in2"};
+        static const int widths[] = {80, 100, 120};
+        for (int v = 0; v < 2; v++) {
+            for (int w = 0; w < 3; w++) {
+                int cols = widths[w];
+                const char *const *safe = v ? safe_cgnat : safe_port;
+                seedshare(&st, v);
+                size_t n = render_at(&st, line, sizeof line, cols);
+                printf("  R17 %s @%-3d cols -> %2zu: [%s]\n", v ? "cgnat" : "port", cols, n, line);
+                if ((int)n > cols) {
+                    fprintf(stderr, "line: %s\n", line);
+                    return fail("r17_within_width");
+                }
+                /* The cut is marked: docs/cli.md promises the removed part is
+                 * shown as " ..", so a line that was actually cut ends in dots. */
+                if (n < 2 || line[n - 1] != '.' || line[n - 2] != '.') {
+                    fprintf(stderr, "%s @%d cols: cut without ellipsis [%s]\n", v ? "cgnat" : "port",
+                            cols, line);
+                    return fail("r17_ellipsis");
+                }
+                for (int i = 0; i < 6; i++) {
+                    if (!strstr(line, safe[i])) {
+                        fprintf(stderr, "%s @%d cols: no \"%s\" in [%s]\n", v ? "cgnat" : "port",
+                                cols, safe[i], line);
+                        return fail("r17_safety_tag_cut");
+                    }
+                    if (!tag_whole(line, safe[i])) {
+                        fprintf(stderr, "%s @%d cols: torn \"%s\" in [%s]\n", v ? "cgnat" : "port",
+                                cols, safe[i], line);
+                        return fail("r17_safety_tag_torn");
+                    }
+                }
+                /* the safety block must still be in the documented order, and it
+                 * must sit ahead of the informational tags it used to trail */
+                if (!ordered(line, safe, 6)) {
+                    fprintf(stderr, "line: %s\n", line);
+                    return fail("r17_safety_order");
+                }
+                const char *inf = strstr(line, "trk");
+                if (inf && strstr(line, "shr!") > inf) {
+                    fprintf(stderr, "line: %s\n", line);
+                    return fail("r17_safety_after_info");
+                }
+                if (!no_torn_tag(line, safe, 6)) {
+                    fprintf(stderr, "%s @%d cols: torn suffix [%s]\n", v ? "cgnat" : "port", cols,
+                            line);
+                    return fail("r17_torn_suffix");
+                }
+            }
+        }
+        if (ok("r17_safety_visible")) return 1;
+    }
+
+    /* ── R17: the §10 block at its documented widest form still fits behind the
+     * name column at 80 columns — 20 (name) + 36 (the block) = 56. ── */
+    {
+        static const char *const caps[] = {"prv", "shr!", "enc!", "pin!99", "map:65535", "in99"};
+        const maxload wide = {1, 1, 1, 1, 1};
+        maxseed(&st, 1, &wide);
+        st.t[0].share = 2; /* the alarm form: shr! */
+        size_t n = render_at(&st, line, sizeof line, 80);
+        printf("  R17 widest block @80 -> %zu: [%s]\n", n, line);
+        if ((int)n > 80) return fail("r17_widest_width");
+        for (int i = 0; i < 6; i++)
+            if (!strstr(line, caps[i])) {
+                fprintf(stderr, "no \"%s\" in [%s]\n", caps[i], line);
+                return fail("r17_widest_tag_cut");
+            }
+        if (!ordered(line, caps, 6)) return fail("r17_widest_order");
+        const char *inf = strstr(line, "trk");
+        if (inf && strstr(line, "shr!") > inf) return fail("r17_widest_after_info");
+        if (!no_torn_tag(line, r17_tags, R17_NTAGS)) return fail("r17_widest_torn");
+        if (ok("r17_widest_block")) return 1;
+    }
+
+    /* ── R17 guard: every terminal width keeps the line inside the width and
+     * off a tag boundary — swept, not sampled. ── */
+    {
+        for (int cols = 24; cols <= CLI_MAX_LINE + 30; cols++) {
+            for (int v = 0; v < 2; v++) {
+                seedshare(&st, v);
+                size_t n = render_at(&st, line, sizeof line, cols);
+                if ((int)n > cols) {
+                    fprintf(stderr, "cols %d %s: %zu [%s]\n", cols, v ? "cgnat" : "port", n, line);
+                    return fail("r17_sweep_width");
+                }
+                if (n && line[n - 1] == ' ') return fail("r17_sweep_trailing_space");
+                if (!no_torn_tag(line, r17_tags, R17_NTAGS)) {
+                    fprintf(stderr, "cols %d: torn suffix [%s]\n", cols, line);
+                    return fail("r17_sweep_torn");
+                }
+                /* shr! is never half-present ("shr" without the '!') */
+                if (strstr(line, "shr ") || strstr(line, "shr.") || strstr(line, "shr\n"))
+                    return fail("r17_shr_plain");
+            }
+        }
+        if (ok("r17_width_sweep")) return 1;
+    }
+
+    /* ── R17 guard: a plain torrent (no share) is unaffected by the reorder ──
+     * The measured 119-char line fits 120 columns, so it must come out
+     * byte-identical to the pre-R17 layout and carry no tag of its own. */
+    {
+        static const char *const plain_line_119 =
+            "Plain.Torrent          9% [>         ]  100.0M/1.00G  v8.0M/s^128K/s --:--"
+            "   12/934  @dl   trk00/00p00 pe00/00/00u00i00";
+        seed(&st, "Plain.Torrent");
+        size_t n = render_at(&st, line, sizeof line, 120);
+        printf("  R17 plain @120 -> %zu: [%s]\n", n, line);
+        if (strcmp(line, plain_line_119) != 0) {
+            fprintf(stderr, "got : [%s]\nwant: [%s]\n", line, plain_line_119);
+            return fail("r17_plain_layout");
+        }
+        if (strstr(line, "prv") || strstr(line, "shr") || strstr(line, "enc!") ||
+            strstr(line, "pin!") || strstr(line, "map") || strstr(line, " in"))
+            return fail("r17_plain_tags");
+        for (int cols = 30; cols <= 120; cols += 7) {
+            seed(&st, "Plain.Torrent");
+            size_t m = render_at(&st, line, sizeof line, cols);
+            if ((int)m > cols) return fail("r17_plain_width");
+            if (!no_torn_tag(line, r17_tags, R17_NTAGS)) {
+                fprintf(stderr, "cols %d: torn suffix [%s]\n", cols, line);
+                return fail("r17_plain_torn");
+            }
+        }
+        if (ok("r17_plain_unaffected")) return 1;
     }
 
     /* ── R8: the 20-byte name column must never be cut inside a UTF-8 character,

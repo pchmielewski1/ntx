@@ -93,7 +93,23 @@ static void cli_name_short(const char *src, char *out, size_t cap) {
     ntx_utf8_copy(out, fit + 1, src);
 }
 
-static void cli_flags_compact(const ntx_stats *st, const ntx_tts_stat *t, char *out, size_t cap) {
+/* Builds the tag list. `out` gets the tags the line ends with. When `hoist` is
+ * set and the slot is a share, the design §10 block (prv/shr/enc!/pin!/map/
+ * inN) is built into `sec` instead of onto the tail, so the caller can print it
+ * directly behind the fixed 20-column name: those four tags are what tells the
+ * operator the share is NOT healthy ("shr!" = stopped serving, "pin!N" = pin
+ * check failed, "enc!" = strict encryption, "map!cg" = inbound will not work),
+ * and on a terminal the line is cut to the column count — the counters
+ * (trk/pe/m/dns/utp/punch) are what a narrow terminal gives up first, never a
+ * warning (R17). `sec` stays empty for a slot that is not a share and for
+ * hoist = 0, which is the layout docs/cli.md documents. Either way the relative
+ * order of the six §10 tags is the same; their widest form is
+ * " prv shr! enc! pin!99 map:65535 in99" (36 chars, pin!/in capped at 99 like
+ * the peer counters), so name column + block is 56 columns — inside every width
+ * the CLI is used at. */
+static void cli_flags_compact(const ntx_stats *st, const ntx_tts_stat *t, char *out, size_t cap,
+                              int hoist, char *sec, size_t seccap) {
+    if (seccap) sec[0] = 0;
     if (cap == 0) return;
     unsigned a = t->peers_all > 99 ? 99 : t->peers_all;
     unsigned h = t->peers_hs > 99 ? 99 : t->peers_hs;
@@ -131,11 +147,8 @@ static void cli_flags_compact(const ntx_stats *st, const ntx_tts_stat *t, char *
     if (st && (st->punch_ok || st->punch_fail))
         snprintf(punch, sizeof punch, " punch%u/%u", st->punch_ok > 99 ? 99u : (unsigned)st->punch_ok,
                  st->punch_fail > 99 ? 99u : (unsigned)st->punch_fail);
-    /* Design §10 tags: appended after every existing tag so the §10 tail
-     * truncation drops them first. pin!/in cap at 99 like the peer counters,
-     * so the widest §10 tail is 36 chars with its leading spaces
-     * (" prv shr! enc! pin!99 map:65535 in99") — cli_cap_line trims it from
-     * the end when the rest leaves no room. */
+    /* Design §10 tags — the safety block, see the note on hoist above. pin!/in
+     * cap at 99 like the peer counters. */
     char prv[8] = "", shr[8] = "", enc[8] = "", pin[16] = "", map[16] = "", inn[8] = "";
     if (t->priv) snprintf(prv, sizeof prv, " prv");
     if (t->share) snprintf(shr, sizeof shr, " shr%s", t->share == 2 ? "!" : "");
@@ -153,17 +166,23 @@ static void cli_flags_compact(const ntx_stats *st, const ntx_tts_stat *t, char *
         snprintf(map, sizeof map, " map-"); /* PENDING, NONE, or ACTIVE w/o ext port */
     if (t->share)
         snprintf(inn, sizeof inn, " in%u", t->in_ok > 99 ? 99u : (unsigned)t->in_ok);
+    char info[128];
     if (t->meta_need > 0) {
         unsigned mg = t->meta_got > 99 ? 99 : t->meta_got;
         unsigned mn = t->meta_need > 99 ? 99 : t->meta_need;
-        snprintf(out, cap,
-                 " trk%02u/%02up%02u%s pe%02u/%02u/%02uu%02ui%02u m%02u/%02u%s%s%s%s%s%s%s%s%s%s",
-                 tu, tt, tp, dead, a, h, o, u, ii, mg, mn, v2, dns, utp, punch, prv, shr, enc, pin,
-                 map, inn);
+        snprintf(info, sizeof info,
+                 " trk%02u/%02up%02u%s pe%02u/%02u/%02uu%02ui%02u m%02u/%02u%s%s%s%s", tu, tt, tp,
+                 dead, a, h, o, u, ii, mg, mn, v2, dns, utp, punch);
     } else {
-        snprintf(out, cap,
-                 " trk%02u/%02up%02u%s pe%02u/%02u/%02uu%02ui%02u%s%s%s%s%s%s%s%s%s%s", tu, tt, tp,
-                 dead, a, h, o, u, ii, v2, dns, utp, punch, prv, shr, enc, pin, map, inn);
+        snprintf(info, sizeof info,
+                 " trk%02u/%02up%02u%s pe%02u/%02u/%02uu%02ui%02u%s%s%s%s", tu, tt, tp, dead, a, h,
+                 o, u, ii, v2, dns, utp, punch);
+    }
+    if (hoist && t->share && seccap) {
+        snprintf(sec, seccap, "%s%s%s%s%s%s", prv, shr, enc, pin, map, inn);
+        snprintf(out, cap, "%s", info);
+    } else {
+        snprintf(out, cap, "%s%s%s%s%s%s%s", info, prv, shr, enc, pin, map, inn);
     }
 }
 
@@ -179,18 +198,46 @@ static void cli_cap_line(char *line, size_t want, size_t cap) {
     while (lim > 0 && line[lim - 1] == ' ') line[--lim] = 0;
 }
 
+/* Cut the line to the terminal width. R17: the " .." ellipsis must not land
+ * inside a tag, so the cut backs off to the last token boundary that still
+ * leaves room for the dots — the same rule cli_cap_line applies to the
+ * CLI_MAX_LINE budget. A width so narrow that no boundary is left keeps the old
+ * hard cut; no tag could be saved at that width anyway. */
 static void cli_trim_to_width(char *line, int cols) {
     if (cols <= 0) cols = CLI_MAX_LINE;
     if (cols > CLI_MAX_LINE) cols = CLI_MAX_LINE;
     size_t n = strlen(line);
-    if ((int)n >= cols) {
+    if ((int)n < cols) return;
+    if (cols <= 4) { /* nothing is left to save — the old hard cut */
         line[(size_t)cols - 1] = 0;
         if (cols > 2) line[(size_t)cols - 2] = '.';
         if (cols > 3) line[(size_t)cols - 3] = '.';
+        return;
     }
+    /* " .." rides on after the cut, so the last token has to end by cols-5 to
+     * keep the whole line at cols-1 chars, the length the hard cut produced. */
+    size_t lim = (size_t)cols - 5;
+    while (lim > 0 && line[lim] != ' ') lim--;
+    if (lim == 0) { /* no token boundary to land on: the old hard cut */
+        line[(size_t)cols - 1] = 0;
+        line[(size_t)cols - 2] = '.';
+        line[(size_t)cols - 3] = '.';
+        return;
+    }
+    while (lim > 1 && line[lim - 1] == ' ') lim--; /* no run of spaces before .. */
+    /* line[lim] is the first space of the run that ends the last token: it stays
+     * as the single separator and the two dots ride on behind it. Writing a NUL
+     * at lim here would terminate the line and put the dots past the terminator,
+     * i.e. invisible. */
+    line[lim] = ' ';
+    line[lim + 1] = '.';
+    line[lim + 2] = '.';
+    line[lim + 3] = 0;
 }
 
-static size_t cli_status_raw(const ntx_stats *st, char *out, size_t cap) {
+/* `hoist` moves the §10 safety block of a share slot behind the name column
+ * (R17); see cli_flags_compact(). */
+static size_t cli_status_raw(const ntx_stats *st, char *out, size_t cap, int hoist) {
     if (!st || !out || cap == 0) return 0;
 
     if (st->n <= 0) {
@@ -199,28 +246,28 @@ static size_t cli_status_raw(const ntx_stats *st, char *out, size_t cap) {
     }
 
     const ntx_tts_stat *t = &st->t[0];
-    char name[CLI_NAME_W + 4];
+    char name[CLI_NAME_W + 4], sec[64] = "";
     /* Staging room for trk/pe/m/v2/dns/utp/punch + the §10 tags (worst case
      * measured 110 B); the line is capped to CLI_MAX_LINE by cli_cap_line. */
     char flags[128];
     cli_name_short(t->name, name, sizeof name);
-    cli_flags_compact(st, t, flags, sizeof flags);
+    cli_flags_compact(st, t, flags, sizeof flags, hoist, sec, sizeof sec);
     const char *phase = t->phase[0] ? t->phase : "?";
 
     /* --share hashing rides the normal line so bar/pct show progress (§10);
      * everything else without metadata keeps the META: rendering. */
     if (strcmp(phase, "hash") != 0 &&
         (t->state == NTX_TTS_META || (t->size == 0 && t->total == 0))) {
-        return (size_t)snprintf(out, cap, "%-*s META:%-9s%s %3llus", CLI_NAME_W, name, phase, flags,
-                                (unsigned long long)st->uptime_s);
+        return (size_t)snprintf(out, cap, "%-*s%s META:%-9s%s %3llus", CLI_NAME_W, name, sec, phase,
+                                flags, (unsigned long long)st->uptime_s);
     }
 
     if (t->state == NTX_TTS_PAUSED) {
         char dn[16], tot[16];
         cli_size_short(t->down, dn, sizeof dn);
         cli_size_short(t->size ? t->size : t->down, tot, sizeof tot);
-        return (size_t)snprintf(out, cap, "%-*s PAUSED  %6s/%-5s  %4u/%-4u%s", CLI_NAME_W, name, dn, tot,
-                                (unsigned)t->done, (unsigned)t->total, flags);
+        return (size_t)snprintf(out, cap, "%-*s%s PAUSED  %6s/%-5s  %4u/%-4u%s", CLI_NAME_W, name,
+                                sec, dn, tot, (unsigned)t->done, (unsigned)t->total, flags);
     }
 
     char bar[CLI_BAR_W + 4], dn[16], tot[16], spd_d[16], spd_u[16], eta[16];
@@ -242,13 +289,13 @@ static size_t cli_status_raw(const ntx_stats *st, char *out, size_t cap) {
         else if (strcmp(phase, "seed") != 0 && strcmp(phase, "ratio-done") != 0)
             tag = "seed";
         /* Live line must show uploaded total (not only rate) — finish line alone was too late. */
-        return (size_t)snprintf(out, cap, "%-*s 100%% %s  %6s/%-5s  up%-5s ^%-5s r%.1f @%-4s%s",
-                                CLI_NAME_W, name, bar, dn, tot, up, spd_u, ratio, tag, flags);
+        return (size_t)snprintf(out, cap, "%-*s%s 100%% %s  %6s/%-5s  up%-5s ^%-5s r%.1f @%-4s%s",
+                                CLI_NAME_W, name, sec, bar, dn, tot, up, spd_u, ratio, tag, flags);
     }
 
     return (size_t)snprintf(out, cap,
-                            "%-*s %3u%% %s  %6s/%-5s  v%-5s^%-5s %5s %4u/%-4u @%-4s%s", CLI_NAME_W,
-                            name, (unsigned)t->pct, bar, dn, tot, spd_d, spd_u, eta,
+                            "%-*s%s %3u%% %s  %6s/%-5s  v%-5s^%-5s %5s %4u/%-4u @%-4s%s",
+                            CLI_NAME_W, name, sec, (unsigned)t->pct, bar, dn, tot, spd_d, spd_u, eta,
                             (unsigned)t->done, (unsigned)t->total, phase, flags);
 }
 
@@ -256,20 +303,31 @@ size_t ntx_cli_status_format(const ntx_stats *st, char *out, size_t cap) {
     if (!st || !out || cap == 0) return 0;
     /* raw returns the *would-be* length; the cap needs it, not the truncated
      * strlen, to know how many tags did not fit. */
-    size_t want = cli_status_raw(st, out, cap);
+    size_t want = cli_status_raw(st, out, cap, 0);
     if (cap > 1) cli_cap_line(out, want, cap);
+    return strlen(out);
+}
+
+/* The tty line (R17). Same budget rules as ntx_cli_status_format(), plus two
+ * things the plain formatter must not do because its output is pinned by the
+ * docs and the tests: the safety block of a share slot rides behind the name so
+ * it sits ahead of the cut, and the final cut is to the terminal width instead
+ * of to CLI_MAX_LINE. */
+static size_t cli_status_tty(const ntx_stats *st, char *out, size_t cap, int cols) {
+    if (!st || !out || cap == 0) return 0;
+    size_t want = cli_status_raw(st, out, cap, 1);
+    if (cap > 1) cli_cap_line(out, want, cap);
+    cli_trim_to_width(out, cols);
     return strlen(out);
 }
 
 void ntx_cli_status_update(const ntx_stats *st, FILE *fp, int *needs_nl) {
     if (!st || !fp) return;
     char line[CLI_MAX_LINE + 1];
-    ntx_cli_status_format(st, line, sizeof line);
 
     if (isatty(fileno(fp))) {
         static size_t prev_len = 0;
-        int cols = cli_term_cols();
-        cli_trim_to_width(line, cols);
+        cli_status_tty(st, line, sizeof line, cli_term_cols());
         size_t len = strlen(line);
         fputs("\r\033[2K", fp);
         fputs(line, fp);
@@ -279,6 +337,7 @@ void ntx_cli_status_update(const ntx_stats *st, FILE *fp, int *needs_nl) {
         fflush(fp);
         if (needs_nl) *needs_nl = 1;
     } else {
+        ntx_cli_status_format(st, line, sizeof line);
         fputs(line, fp);
         fputc('\n', fp);
         fflush(fp);
