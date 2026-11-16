@@ -210,6 +210,21 @@ static int ipc_t_rec(void *ud, const char *line) { (void)ud; snprintf(ipc_t_got[
 static void ipc_t_bad(void *ud) { (void)ud; ipc_t_nbad++; }
 static int ipc_t_recstop(void *ud, const char *line) { (void)ud; (void)line; ipc_t_stop_seen++; return 1; }
 
+/* R30: byte-transparent capture sink. A raw NUL inside the frame survives the
+   framer (it copies every byte of the read), so the parser is the place that
+   must reject it; strlen of the captured line proves the truncation. */
+static size_t r30_cap_slen;
+static const char *r30_cap_raw; /* into the reader's own line buffer (stable until the next feed) */
+static int r30_cap_n;
+static int r30_cap_cb(void *ud, const char *line) {
+    (void)ud;
+    const char *z = memchr(line, 0, NTX_IPC_LINE_MAX);
+    r30_cap_slen = (size_t)(z - line);
+    r30_cap_raw = line;
+    r30_cap_n++;
+    return 0;
+}
+
 int main(void) {
     char out[512];
 
@@ -1112,6 +1127,149 @@ int main(void) {
         if (!strstr(js, "\"name\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""))
             return fail("r8_stats_ascii47_guard");
         if (ok("r8_utf8_stats_event")) return 1;
+    }
+
+    { /* ── R30 · S18: a decoded \u0000 must not silently cut path/torrent ──
+         The bug: "a\u0000b" decoded to the bytes a 00 b, so every strlen-based
+         consumer downstream (ntx_session_share_add opens r->path / r->torrent)
+         saw "a" — the wrong file got seeded and the reply said ok. A NUL cannot
+         name a POSIX path, so the decoder rejects the code point as bad_json,
+         exactly like the other malformed-JSON cases (same seq/cmd/ok/code shape). */
+        ntx_ipc_req r;
+        static const char *NUL_LINES[] = {
+            "{\"cmd\":\"share\",\"path\":\"a\\u0000b\"}",
+            "{\"cmd\":\"share\",\"path\":\"/x\",\"torrent\":\"x\\u0000y.torrent\"}",
+            "{\"cmd\":\"add\",\"path\":\"a\\u0000b.torrent\"}",
+            "{\"cmd\":\"add\",\"magnet\":\"magnet:?xt=urn:btih:0123456789abcdef0123456789ab"
+            "cdef01234567\\u0000&dn=x\"}",
+            "{\"cmd\":\"share\",\"\\u0000key\":1}",                 /* key position */
+            "{\"cmd\":\"ping\",\"k\":\"a\\u0000b\"}"                /* unknown-key value */
+        };
+        for (size_t k = 0; k < sizeof NUL_LINES / sizeof NUL_LINES[0]; k++) {
+            ntx_ipc_parse(NUL_LINES[k], &r);
+            if (r.pre != NTX_IPC_E_BAD_JSON) {
+                printf("R30 line %zu: want=bad_json got=%s line=%s\n", k,
+                       code_name(r.pre), NUL_LINES[k]);
+                return fail("r30_nul_bad_json");
+            }
+        }
+        /* the measure-only mirror (ipc_json_str_len, §6.1 skip paths) must reach
+           the same verdict: the same grammar, so no pair can be skipped past a NUL */
+        ntx_ipc_parse("{\"cmd\":\"ping\",\"kkkkkkkkkkkkkkkkkk\":\"a\\u0000b\",\"seq\":3}", &r);
+        if (r.pre != NTX_IPC_E_BAD_JSON) return fail("r30_nul_longkey_value");
+
+        /* guards: only U+0000 is newly refused. The escapes that worked before
+           still decode byte-for-byte, and >U+007F is still refused (§3.4). */
+        ntx_ipc_parse("{\"cmd\":\"share\",\"path\":\"a\\u005cb\"}", &r);
+        if (r.pre != NTX_IPC_OK || strcmp(r.path, "a\\b") != 0) return fail("r30_esc_backslash");
+        ntx_ipc_parse("{\"cmd\":\"share\",\"path\":\"a\\u0041\\u007fb\"}", &r);
+        if (r.pre != NTX_IPC_OK || strcmp(r.path, "aA\x7f" "b") != 0) return fail("r30_esc_ascii_kept");
+        ntx_ipc_parse("{\"cmd\":\"share\",\"path\":\"a\\u0001\\u001fb\"}", &r);
+        if (r.pre != NTX_IPC_OK || strcmp(r.path, "a\x01\x1f" "b") != 0) return fail("r30_esc_ctl_kept");
+        ntx_ipc_parse("{\"cmd\":\"share\",\"path\":\"a\\u00e9b\"}", &r);
+        if (r.pre != NTX_IPC_E_BAD_JSON) return fail("r30_esc_above_7f_still_rejected");
+        /* a raw é travels raw (§3.4) and must stay accepted */
+        ntx_ipc_parse("{\"cmd\":\"share\",\"path\":\"a\xc3\xa9" "b\"}", &r);
+        if (r.pre != NTX_IPC_OK || strcmp(r.path, "a\xc3\xa9" "b") != 0) return fail("r30_raw_utf8_kept");
+        if (ok("r30_nul_parse")) return 1;
+
+        /* dispatcher over a live session: the truncation target really exists, so
+           pre-fix this shared the file "a" (ack ok:1, slot HASHING) instead of
+           answering bad_json. Post-fix: no slot, no .torrent, no share event. */
+        {
+            ntx_config cfg;
+            ntx_netx *nx;
+            char dir[96], real[192], line[768], out[2048];
+            struct stat sb;
+
+            memset(&cfg, 0, sizeof cfg);
+            snprintf(dir, sizeof dir, "test/.scratch/ntx-ipc-r30");
+            cfg.store_dir = dir;
+            if (mkdir("test/.scratch", 0755) != 0 && errno != EEXIST) return fail("r30_scratch");
+            if (mkdir(dir, 0755) != 0 && errno != EEXIST) return fail("r30_dir");
+            snprintf(real, sizeof real, "%s/a", dir);       /* what pre-fix would seed */
+            FILE *wf = fopen(real, "wb");
+            if (!wf) return fail("r30_file");
+            fputs("0123456789", wf);
+            fclose(wf);
+
+            ntx_session *s = mk(&nx, &cfg);
+            snprintf(line, sizeof line,
+                     "{\"cmd\":\"share\",\"seq\":41,\"path\":\"%s/a\\u0000b\"}", dir);
+            ntx_ipc_dispatch(s, line, out, sizeof out);
+            if (strcmp(out, "{\"type\":\"err\",\"seq\":41,\"cmd\":\"share\","
+                            "\"ok\":0,\"code\":\"bad_json\"}") != 0) {
+                printf("R30 share reply: %s\n", out);
+                drop(s, nx); return fail("r30_d_share_reply");
+            }
+            snprintf(line, sizeof line,
+                     "{\"cmd\":\"share\",\"seq\":42,\"path\":\"%s/a\",\"torrent\":"
+                     "\"%s/x\\u0000y.torrent\"}", dir, dir);
+            ntx_ipc_dispatch(s, line, out, sizeof out);
+            if (strcmp(out, "{\"type\":\"err\",\"seq\":42,\"cmd\":\"share\","
+                            "\"ok\":0,\"code\":\"bad_json\"}") != 0) {
+                printf("R30 torrent reply: %s\n", out);
+                drop(s, nx); return fail("r30_d_torrent_reply");
+            }
+            /* nothing was created for the truncated name: no share slot anywhere,
+               no event queued, and no `.torrent` written for the seed of "a"
+               (share_add names the output <store-dir>/<basename>.torrent). */
+            for (int ti = 0; ti < NTX_SESSION_MAX_TTS; ti++)
+                if (ntx_session_share_state(s, ti) != NTX_SHARE_NONE) {
+                    printf("R30 slot %d state=%d\n", ti, (int)ntx_session_share_state(s, ti));
+                    drop(s, nx); return fail("r30_no_slot");
+                }
+            {
+                ntx_share_event ev;
+                if (ntx_session_share_poll_event(s, &ev) != 0) { drop(s, nx); return fail("r30_no_event"); }
+            }
+            snprintf(real, sizeof real, "%s/a.torrent", dir);
+            if (stat(real, &sb) == 0) { printf("R30 wrote %s\n", real); drop(s, nx); return fail("r30_no_write"); }
+            drop(s, nx);
+            if (ok("r30_nul_dispatch")) return 1;
+        }
+
+        /* a RAW NUL byte in the frame is already refused, and this pins WHO
+           refuses it: the framer is \n-delimited and stores the NUL verbatim
+           (the bytes past it are still in the line buffer), so the parser's
+           `c == 0` guard in ipc_json_str is what rejects the document. No
+           second guard is needed downstream — no dead code. */
+        {
+            static const char frame[] = { '{', '"', 'c', 'm', 'd', '"', ':', '"', 's',
+                                          'h', 'a', 'r', 'e', '"', ',', '"', 'p', 'a',
+                                          't', 'h', '"', ':', '"', 'a', '\0', 'b', '"',
+                                          '}', '\n' };
+            ntx_ipc_reader rd;
+            ntx_ipc_sink snk = { 0, r30_cap_cb, 0 };
+            char out[2048];
+            ntx_config cfg;
+            ntx_netx *nx;
+            r30_cap_n = 0; r30_cap_slen = 0; r30_cap_raw = 0;
+            ntx_ipc_reader_init(&rd);
+            ntx_ipc_feed(&rd, frame, sizeof frame, &snk);
+            if (r30_cap_n != 1) return fail("r30_raw_framed");
+            /* the framer kept the byte after the NUL (10 bytes of the frame past it) */
+            if (r30_cap_slen != 24 || r30_cap_raw[24] != 0 ||
+                memcmp(r30_cap_raw + 25, "b\"}", 3) != 0) {
+                printf("R30 framer: slen=%zu b24=%02x b25=%02x\n", r30_cap_slen,
+                       (unsigned)(unsigned char)r30_cap_raw[24],
+                       (unsigned)(unsigned char)r30_cap_raw[25]);
+                return fail("r30_raw_framer_keeps_nul");
+            }
+            memset(&cfg, 0, sizeof cfg);
+            cfg.store_dir = "test/.scratch/ntx-ipc-r30";
+            ntx_session *s = mk(&nx, &cfg);
+            ntx_ipc_dispatch(s, r30_cap_raw, out, sizeof out);
+            drop(s, nx);
+            /* the cmd was read before the NUL, so it is echoed — the same shape
+               the existing malformed cases take (§ json-api: seq/cmd echoed when
+               they were read before the error) */
+            if (strcmp(out, "{\"type\":\"err\",\"cmd\":\"share\",\"ok\":0,\"code\":\"bad_json\"}") != 0) {
+                printf("R30 raw NUL reply: %s\n", out);
+                return fail("r30_raw_nul_reply");
+            }
+            if (ok("r30_raw_nul_framer")) return 1;
+        }
     }
 
     return 0; /* tasks append here; keep the final line intact */

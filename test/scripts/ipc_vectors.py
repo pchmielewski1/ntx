@@ -64,6 +64,22 @@ OKV = [
     (b'{"cmd":"seqq","seq":7}', b'unknown_cmd', b''),
     (b'{"cmd":"ping","i":7}', b'ok', b'cmd=ping'),                # i ignored for ping
     (b'{"seq":5,"cmd":"hello"}', b'ok', b'cmd=hello seq=5'),      # any key order
+    # R30: a decoded NUL ends the string for every strlen-based consumer
+    # downstream (share_add opens path / torrent with it), so "a\u0000b" used to
+    # seed the file "a" and answer ok. \u0000 is rejected as bad_json in both
+    # decoders (ipc_json_str and the measure-only ipc_json_str_len, §6.1 mirror).
+    (b'{"cmd":"share","path":"a\\u0000b"}', b'bad_json', b''),
+    (b'{"cmd":"share","path":"/x","torrent":"x\\u0000y.torrent"}', b'bad_json', b''),
+    (b'{"cmd":"add","path":"a\\u0000b.torrent"}', b'bad_json', b''),
+    (b'{"cmd":"add","magnet":"magnet:?xt=urn:btih:0123456789abcdef0123456789ab'
+     b'cdef01234567\\u0000&dn=x"}', b'bad_json', b''),
+    (b'{"cmd":"share","\\u0000key":1}', b'bad_json', b''),
+    (b'{"cmd":"ping","k":"a\\u0000b"}', b'bad_json', b''),        # unknown-key value
+    # guards: the escapes that must keep working — \u005c is a real backslash,
+    # \u0000 is the ONLY rejected code point below U+0080 (§3.4 rejects the rest).
+    (b'{"cmd":"share","path":"a\\u005cb"}', b'ok', b'cmd=share'),
+    (b'{"cmd":"share","path":"a\\u0041\\u007fb"}', b'ok', b'cmd=share'),
+    (b'{"cmd":"share","path":"a\\u0001\\u001fb"}', b'ok', b'cmd=share'),
 ]
 def w(name, rows):
     with open(os.path.join(HERE, name), "wb") as f:

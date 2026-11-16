@@ -170,6 +170,9 @@ static int ipc_json_str(const char **pp, char *dst, size_t dst_sz) {
                     if (dig < 0) return -1;
                     v = v * 16u + (unsigned)dig;
                 }
+                if (v == 0u) return -1;   /* R30: a decoded NUL would cut the value
+                                             for every strlen consumer (share_add
+                                             opens path/torrent) -> bad_json */
                 if (v > 0x7Fu) return -1; /* §3.4: non-ASCII travels raw */
                 d = (char)v;
                 p += 4;
@@ -218,6 +221,7 @@ static int ipc_json_str_len(const char **pp, size_t *len) {
                     if (dig < 0) return -1;
                     v = v * 16u + (unsigned)dig;
                 }
+                if (v == 0u) return -1;   /* R30: same grammar as ipc_json_str */
                 if (v > 0x7Fu) return -1;
                 o++;
                 p += 4;

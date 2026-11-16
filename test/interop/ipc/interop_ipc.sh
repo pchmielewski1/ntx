@@ -159,6 +159,12 @@ grep -q '"seq":10,"cmd":"share","ok":0,"code":"io"' "$MAIN_OUT" ||
     grep -q '"seq":10,"cmd":"share","ok":0,"code":"no_trackers"' "$MAIN_OUT" ||
     die "share of a directory is neither io nor no_trackers"
 
+# R30: a decoded \u0000 must not silently cut the path — pre-fix this shared the
+# file "a" below with ack ok:1. The whole document is bad_json instead.
+printf 'R30FILE\n' > "$WORK/a"
+say "{\"cmd\":\"share\",\"seq\":12,\"path\":\"$WORK/a\\u0000b\"}"
+wait_for '"seq":12,"cmd":"share","ok":0,"code":"bad_json"' 3 "$MAIN_OUT" main
+
 # Variant A: quit is the LAST command; fd stays open until the ack lands.
 say '{"cmd":"quit","seq":8}'
 wait_for '"seq":8,"cmd":"quit","ok":1' 3 "$MAIN_OUT" main

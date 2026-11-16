@@ -94,7 +94,7 @@ for ln in lines:
 # DEAD slot with err/no_slot — the reply still echoes seq+cmd, so it is recorded
 # from the err branch above (the brief's own wait_for pins '"code":"no_slot"').
 want = {1: "ping", 2: "add", 3: "pause", 4: "pause", 5: "resume", 6: "remove",
-        7: "remove", 8: "quit", 9: "share", 10: "share", 11: "add"}
+        7: "remove", 8: "quit", 9: "share", 10: "share", 11: "add", 12: "share"}
 for seq, cmd in want.items():
     if replies.get(seq) != cmd:
         die(f"FAIL ack seq={seq} want={cmd} got={replies.get(seq)}")
@@ -102,6 +102,9 @@ for seq, cmd in want.items():
 for seq in (9, 10):
     if share_errs.get(seq) not in SHARE_ERR:
         die(f"FAIL share seq={seq} want code in {SHARE_ERR} got={share_errs.get(seq)}")
+# R30: "a\u0000b" is refused by the parser, never by the filesystem.
+if share_errs.get(12) != "bad_json":
+    die(f"FAIL share seq=12 want code=bad_json got={share_errs.get(12)}")
 if lines[-1].get("cmd") != "quit" or lines[-1].get("type") != "ack" \
         or lines[-1].get("ok") != 1:
     die(f"FAIL last line must be the quit ack: {lines[-1]}")
