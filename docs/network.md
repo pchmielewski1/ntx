@@ -768,7 +768,8 @@ blocking calls.
 - **When it is off.** Never started under `--proxy` or `--tunnel` (the mapping would leak the
   address the user is hiding, and inbound would bypass the proxy) — the command line refuses
   that combination. `--no-port-map` disables it outright; `--port-map` enables it even without
-  a share. Otherwise it runs while at least one share is live and is released when the last
+  a share — the ask then goes out when the session starts and removing the last share does
+  not release it. Otherwise it runs while at least one share is live and is released when the last
   one goes. The public swarm is never mapped.
 - **State reporting.** `ntx_session_portmap_state()` is the JSON `port_map` field verbatim:
   `0` off, `1` pending, `2` active, `3` none, `4` cgnat; `ext_port` is non-zero only in state

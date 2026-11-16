@@ -152,6 +152,32 @@ static void wr(const char *path, const char *text) {
     fclose(f);
 }
 
+/* A deterministic regular file for the Q2 share (ntx_session_share_add refuses
+ * anything but a regular file of size > 0; the content is irrelevant here). */
+static void mk_file(const char *path, uint64_t size, uint8_t seed) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        printf("FAIL mk_open %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
+    uint32_t x = 0x12345678u ^ seed;
+    uint64_t done = 0;
+    while (done < size) {
+        uint8_t buf[4096];
+        size_t want = size - done < sizeof buf ? (size_t)(size - done) : sizeof buf;
+        for (size_t i = 0; i < want; i++) {
+            x = x * 1103515245u + 12345u;
+            buf[i] = (uint8_t)(x >> 16);
+        }
+        if (write(fd, buf, want) != (ssize_t)want) {
+            printf("FAIL mk_write\n");
+            exit(1);
+        }
+        done += want;
+    }
+    close(fd);
+}
+
 /* Default route through the fake gateway. /proc/net/route prints the gateway as
  * a host-byte-order hex u32 (127.0.0.1 → 0100007F, 203.0.113.1 → 017100CB);
  * /proc/net/ipv6_route prints 16 raw bytes in network order. */
@@ -319,7 +345,12 @@ typedef struct {
     ntx_session *s;
 } sess;
 
-static void sess_open(sess *x, const char *tag) {
+/* `port_map` is handed to ntx_config BEFORE the session is built, which is the
+ * production order (parse_args → ntx_netx_init → ntx_session_init) and the whole
+ * point of the R16 cases: what a session does at bring-up with --port-map set.
+ * A case that only cares about the driver's own state machine keeps using
+ * sess_open(), which leaves the field 0 exactly as it did before. */
+static void sess_open_pm(sess *x, const char *tag, int port_map, int proxy) {
     char dir[256];
     snprintf(dir, sizeof dir, "%s/%s", SCRATCH, tag);
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
@@ -327,6 +358,15 @@ static void sess_open(sess *x, const char *tag) {
         exit(1);
     }
     memset(x, 0, sizeof *x);
+    x->cfg.port_map = port_map;
+    /* --port-map together with --proxy is refused by parse_args; a case that pins
+     * what the driver does anyway sets the fields before the session exists, which
+     * is the only way the §5 rule can be tested at bring-up. */
+    if (proxy) {
+        x->cfg.proxy = 1;
+        x->cfg.proxy_host = "127.0.0.1";
+        x->cfg.proxy_port = 1080;
+    }
     x->cfg.store_dir = dir;
     x->cfg.port_lo = 6881;
     x->cfg.port_hi = 6991;
@@ -346,6 +386,11 @@ static void sess_open(sess *x, const char *tag) {
      * gateway; a case must never read another case's datagram. */
     gw_drain();
 }
+
+/* port_map 0 ("automatic with a share", i.e. --no flag given): the state-machine
+ * cases drive the driver themselves through pm_start(), so they never need the
+ * flag set before bring-up. */
+static void sess_open(sess *x, const char *tag) { sess_open_pm(x, tag, 0, 0); }
 
 static void sess_close(sess *x) {
     ntx_session_free(x->s);
@@ -2199,6 +2244,124 @@ int main(void) {
         ck(!gw_pending(), "L_no_datagram_no_port_map");
         ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "L_adv_port_no_port_map");
         ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- Q. R16: --port-map maps the listen port with NO share at all.
+
+     * docs/cli.md promises it ("this flag turns it on for a session without one too")
+     * and docs/network.md says the same, but the driver was only ever started by
+     * ntx_session_portmap_want() from the share path (ntx_session_share_add /
+     * ntx_session_share_on_remove), so with --port-map and no --share nothing was
+     * ever mapped — the flag was a no-op and the status line showed no `map-`/
+     * `map:` tag because the state stayed OFF. Pre-fix failures of this group:
+     * Q1_pending_at_bringup got=0 want=1, Q1_no_share_datagram_on_wire got=-1
+     * want=60, Q1_want_set_by_bringup got=0 want=1, Q2_no_teardown_datagrams
+     * got=0 want=0-with-want-still-1 (the driver never wanted anything at all),
+     * Q2_mapping_still_wanted_after_last_share got=0 want=1. ---- */
+
+    /* Q1. the flag alone puts a PCP request on the wire — no share, no want() call
+     * by hand, only what ntx_session_init owes the config. */
+    {
+        sess x;
+        sess_open_pm(&x, "q1", 1, 0);
+        /* Bring-up owes the driver nothing but the ask: `want` is set by the session
+         * itself (no pm_start(), no share, no hand call), and the session's own tick
+         * is what opens the socket and puts the query on the wire. */
+        ck(x.s->pm && x.s->pm->want, "Q1_want_set_by_bringup");
+        uint8_t req[2048];
+        pump_ms(x.n, 300);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "Q1_pending_after_tick");
+        int n = gw_wait(req, sizeof req, 300); /* pumped by the session's own tick */
+        ck_eq(n, 60, "Q1_no_share_datagram_on_wire");
+        ck(req_is(req, n, NTX_PCP_PROTO_TCP, 7200), "Q1_first_request_is_pcp_tcp");
+        ck_eq(req_int_port(req), ntx_netx_port(x.n), "Q1_internal_port_is_listen_port");
+
+        /* And it is not just the flag in the config: the grant reaches the port we
+         * advertise, which is the whole point of mapping without a share. */
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "Q1_active_without_share");
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "Q1_adv_port_without_share");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* Q2. a share comes and goes and the mapping the user asked for stays: the
+     * session maps on its own from bring-up, the share's own ntx_session_portmap_want
+     * (s, 1) must not restart that sequence, and the release at the end of
+     * ntx_session_share_on_remove() — ntx_session_portmap_want(s, 0) — may drop the
+     * SHARE's claim on the mapping, never the user's. */
+    {
+        sess x;
+        sess_open_pm(&x, "q2", 1, 0);
+        uint8_t req[2048];
+        pump_ms(x.n, 200); /* the session tick is what opens the socket and sends */
+        ck_eq(gw_wait(req, sizeof req, 300), 60, "Q2_request_at_bringup");
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "Q2_active_before_share");
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "Q2_adv_port_before_share");
+        gw_drain();
+
+        char p[256];
+        snprintf(p, sizeof p, "%s/q2/share.bin", SCRATCH);
+        mk_file(p, 4096, 201);
+        ntx_share_err se = NTX_SHARE_OK;
+        int ti = ntx_session_share_add(x.s, p, NULL, &se);
+        if (ti < 0) {
+            printf("FAIL Q2_share_add e=%d\n", (int)se);
+            fails++;
+        }
+        /* The share's want(1) is a no-op for a driver that already wants the
+         * mapping: no fresh sequence, so no new datagram and no lost grant. */
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "Q2_active_with_share");
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "Q2_adv_port_with_share");
+        ck(!gw_pending(), "Q2_share_add_sends_nothing");
+
+        ntx_session_remove(x.s, ti); /* the last share is gone: §8 release runs */
+        pump_ms(x.n, 100);
+        ck(x.s->pm && x.s->pm->want, "Q2_mapping_still_wanted_after_last_share");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "Q2_still_active_after_last_share");
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "Q2_adv_port_after_last_share");
+        int dels = 0;
+        while (gw_get(req, sizeof req) >= 0)
+            if (rd32(req + 4) == 0) dels++;
+        ck_eq(dels, 0, "Q2_no_delete_on_last_share_removal");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* Q3. the guard: without the flag the session must still map NOTHING. Q1 must
+     * not be satisfied by simply always starting the driver. */
+    {
+        sess x;
+        sess_open_pm(&x, "q3", 0, 0);
+        pump_ms(x.n, 20);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_OFF, "Q3_off_auto_no_share");
+        ck(!x.s->pm || !x.s->pm->want, "Q3_not_wanted_auto_no_share");
+        ck(!gw_pending(), "Q3_no_datagram_auto_no_share");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "Q3_adv_port_auto_no_share");
+        /* A whole day of ticks: a driver that woke up late would still show here. */
+        ck_eq(pm_sends_in(&x, 60000, 12), 0, "Q3_stays_quiet");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* Q4. the guard on the other axis: --port-map under a proxy stays OFF, and the
+     * bring-up call must not smuggle the mapping past §5's rule. */
+    {
+        sess x;
+        sess_open_pm(&x, "q4", 1, 1);
+        pump_ms(x.n, 20);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_OFF, "Q4_off_proxy_at_bringup");
+        ck(!gw_pending(), "Q4_no_datagram_proxy_at_bringup");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "Q4_adv_port_proxy_at_bringup");
+        ck_eq(pm_sends_in(&x, 60000, 6), 0, "Q4_stays_quiet_proxy");
         sess_close(&x);
     }
 

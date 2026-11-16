@@ -75,6 +75,16 @@ ntx_session *ntx_session_init(ntx_netx *netx, const ntx_config *cfg) {
         if (n > 0 && n < (int)sizeof dht_state_path) ntx_dht_set_state_path(dht_state_path);
         ntx_dht_start(netx);
     }
+    /* R16 (§8, docs/cli.md, docs/network.md): --port-map maps the listen port for a
+     * session that never shares, so the ask belongs to bring-up, not to the share
+     * path — the flag used to be a no-op without --share, because want() was only
+     * ever called from ntx_session_share_add/on_remove. The `0` is the share claim,
+     * not an "off": want() keeps the mapping for port_map == 1 whatever it is, and
+     * for the auto default (0) and --no-port-map (-1) this call is a no-op, so a
+     * session that is not sharing and did not ask still maps nothing. want() only
+     * allocates here; the route read, the socket and the first query stay on the
+     * tick, and want() itself refuses proxy/tunnel (§5). */
+    if (cfg && cfg->port_map == 1) ntx_session_portmap_want(s, 0);
     return s;
 }
 
