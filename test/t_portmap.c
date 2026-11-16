@@ -595,7 +595,10 @@ static void sess_open_pm(sess *x, const char *tag, int port_map, int proxy) {
         x->cfg.proxy_host = "127.0.0.1";
         x->cfg.proxy_port = 1080;
     }
-    x->cfg.store_dir = dir;
+    /* The session keeps the ntx_config pointer (s->cfg = cfg), so store_dir must
+     * outlive this frame: Q2's share path reads it from ntx_session_share_add
+     * long after sess_open_pm returned. Same rule t_share_session.c pins. */
+    x->cfg.store_dir = strdup(dir);
     x->cfg.port_lo = 6881;
     x->cfg.port_hi = 6991;
     x->cfg.max_peers = 8;
@@ -625,6 +628,8 @@ static void sess_open(sess *x, const char *tag) { sess_open_pm(x, tag, 0, 0); }
 static void sess_close(sess *x) {
     ntx_session_free(x->s);
     ntx_netx_free(x->n);
+    free((void *)x->cfg.store_dir);
+    x->cfg.store_dir = NULL;
 }
 
 /* Real I/O pump (epoll + the self-rearming 100 ms session tick). */
