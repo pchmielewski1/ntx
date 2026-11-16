@@ -733,6 +733,17 @@ blocking calls.
   (like a result code, R14), in both families — never as a reason to re-request. On exit
   `ntx_session_portmap_stop()`
   sends lifetime-0 delete requests, bounded in time like the `stopped` announces.
+- **A renewal that dies takes the grant with it (R12).** A grant is only held while it is
+  kept: when the renewal of a mapping runs its nine sends against a gateway that says
+  nothing, the gateway has by then let the mapping expire at the end of its Lifetime, so
+  the driver drops it — `active` for that protocol is cleared and the state goes back to
+  `pending` (`none` when nothing is mapped and nothing is owed). A mapping whose renewal
+  is merely **in flight** keeps its grant, and so keeps advertising its port: the gateway
+  still forwards it until the retries are truly spent. Only the silence re-asks — the
+  tick sends one fresh acquisition per `PM_REACQ_MS` (5 min), the wait doubling per ask
+  that goes unanswered up to `PM_REACQ_MAX_MS` (1 h), so a gateway that is gone is met by
+  one datagram an hour and a gateway that comes back gets its mapping back. A refusal the
+  gateway stated is still final for the sequence (R14), and the port goes with it.
 - **A share does not wait for the gateway.** A `pending` mapping holds the `started`
   announce (design §5.5) for at most `NTX_PM_SHARE_SETTLE_MS` (4 s): after that the announce
   goes out with the **listen** port and the magnet is delivered, while the mapping keeps
@@ -741,7 +752,11 @@ blocking calls.
   nothing delayed every magnet by the whole retransmission schedule, ~64 s over NAT-PMP and
   ~128 s over PCP).
 - **Where the external port goes.** `ntx_session_adv_port()` returns the mapped external port
-  while the TCP mapping is `active`, and the listen port otherwise. It is the port in every
+  while the TCP mapping is `active` and its granted lifetime has not run out, and the listen
+  port otherwise — which after R12 is the same thing as "while the driver really holds it",
+  since a renewal that is given up on clears `active`. The UDP mapping is not consulted: its
+  external port is never advertised anywhere, so a lost UDP grant never costs the swarm the
+  TCP one. It is the port in every
   tracker announce — the `port=` parameter of an HTTP announce, the `port` field of a UDP
   announce — and in the BEP 10 extension handshake `p` field, so peers learn the reachable
   address.

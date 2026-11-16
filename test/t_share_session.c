@@ -167,7 +167,7 @@ static void scratch(void) {
                                        "from","fromchg","fromerr","fromdup","fromio","fromserve",
                                        "frompread","store","during","durtrunc",
                                        "r7dead","r7hash","r7pend",
-                                       "r5chg","r5io","r4evt","r4qa","r11","r11b"};
+                                       "r5chg","r5io","r4evt","r4qa","r11","r11b","r12"};
     for (size_t k = 0; k < sizeof tags / sizeof tags[0]; k++) {
         char d[640];
         snprintf(d, sizeof d, "%s/%s", scratch_root, tags[k]);
@@ -878,6 +878,175 @@ static void test_silent_gateway_gives_up(void) {
     ntx_portmap_test_set_route_files(NULL, NULL);
     ntx_portmap_test_set_gateway_port(0);
     ok("silent_gateway_gives_up");
+}
+
+/* ---- R12: a renewal that dies takes the advertised port with it, and a re-grant
+ * brings the external port back -------------------------------------------------
+ * The share announced on the external port; the gateway then stops answering the
+ * renewal, spends the driver's budget and lets the mapping expire. Pre-fix the driver
+ * kept the grant: the state stayed ACTIVE, `ntx_session_adv_port` went on returning
+ * the port nobody forwards any more, every announce and ext-handshake told the swarm
+ * to dial it, and the renewal loop — which only walks `active && !failed` — never
+ * asked for a mapping again. Pre-fix failures: r12_adv_port_back_to_listen
+ * got=40123 want=<listen>, r12_no_announce_on_listen (no such line in the tracker),
+ * r12_reacquired / r12_adv_port_new_ext / r12_no_reannounce_with_new_ext (nothing was
+ * ever re-asked, so the second half never happened at all). */
+#define R12_EXT 40123u
+#define R12_EXT2 40155u
+#define R12_REACQ_MS 300000u
+
+/* One PCP answer with `ext`, for the MAP request the driver has outstanding. The
+ * Epoch advances with the client's clock, so a healthy gateway is never mistaken for a
+ * §8.5 restart. `skip_nonce`, when non-NULL, marks the DEAD grant's nonce: the last
+ * retransmissions of a renewal that is already lost carry it, and answering them would
+ * pass the case on a datagram nobody is waiting for. */
+static uint64_t r12_epoch_at;
+static uint32_t r12_epoch;
+
+static int r12_answer_map(int gwd, sess *x, uint16_t ext, const uint8_t skip_nonce[12]) {
+    ntx_session *s = x->s;
+    uint8_t req[2048], rsp[60];
+    for (int spins = 0; spins < 900; spins++) {
+        struct sockaddr_in from;
+        socklen_t fl = sizeof from;
+        ssize_t n = recvfrom(gwd, req, sizeof req, MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
+        if (n == 60 && req[1] == 1 && req[36] == 6 && req[0] == 2 &&
+            !(skip_nonce && memcmp(req + 24, skip_nonce, 12) == 0)) {
+            memset(rsp, 0, sizeof rsp);
+            rsp[0] = 2;
+            rsp[1] = 0x81;
+            rsp[4] = 0; rsp[5] = 0x1c; rsp[6] = 0x20; rsp[7] = 0; /* lifetime 7200 */
+            uint32_t ep = r12_epoch + (uint32_t)((pm_now() - r12_epoch_at) / 1000u);
+            rsp[8] = (uint8_t)(ep >> 24);
+            rsp[9] = (uint8_t)(ep >> 16);
+            rsp[10] = (uint8_t)(ep >> 8);
+            rsp[11] = (uint8_t)ep;
+            memcpy(rsp + 24, req + 24, 12);
+            rsp[36] = req[36];
+            rsp[40] = req[40];
+            rsp[41] = req[41];
+            rsp[42] = (uint8_t)(ext >> 8);
+            rsp[43] = (uint8_t)ext;
+            rsp[44] = 0xff; rsp[45] = 0xff;
+            rsp[56] = 203; rsp[57] = 0; rsp[58] = 113; rsp[59] = 9;
+            r12_epoch = ep;
+            r12_epoch_at = pm_now();
+            if (sendto(gwd, rsp, sizeof rsp, 0, (struct sockaddr *)&from, fl) < 0) return -1;
+            for (int i = 0; i < 20; i++) ntx_netx_run_once(x->n, 2);
+            return 1;
+        }
+        ntx_portmap_test_advance_ms(1000);
+        ntx_session_portmap_tick(s);
+        ntx_netx_run_once(x->n, 2);
+    }
+    return 0;
+}
+
+static void test_lost_renewal_reannounces(void) {
+    scratch();
+    tracker tr;
+    memset(&tr, 0, sizeof tr);
+    tracker_start(&tr);
+    set_test_trackers(&tr, 2);
+    uint16_t gport = 0;
+    int gwd = r11_gw_start(&gport);
+    r11_routes(gport);
+
+    sess x;
+    sess_open(&x, "r12");
+    x.cfg.port_map = 1;
+    char p[256];
+    snprintf(p, sizeof p, "%s/r12/t.bin", scratch_root);
+    mk_file(p, 120000, 151);
+    ntx_share_err e = NTX_SHARE_OK;
+    int ti = ntx_session_share_add(x.s, p, NULL, &e);
+    if (ti < 0) fail("r12_add");
+    (void)pump_until_hashed(&x, ti, 2000, NULL);
+    x.s->share[ti]->fstat_at = UINT64_MAX; /* the fstat is not what this case tests */
+
+    /* The first grant, and `started` with the external port on the wire. */
+    r12_epoch = 7;
+    r12_epoch_at = pm_now();
+    if (r12_answer_map(gwd, &x, R12_EXT, NULL) != 1) fail("r12_no_first_grant");
+    if (ntx_session_portmap_state(x.s) != NTX_PM_ACTIVE) fail("r12_active");
+    if (ntx_session_adv_port(x.s) != (uint16_t)R12_EXT) fail("r12_adv_port_ext");
+    char want[64];
+    snprintf(want, sizeof want, "port=%u&", (unsigned)R12_EXT);
+    int got = 0;
+    for (int i = 0; i < 12 && !got; i++) {
+        ntx_session_tick(x.s);
+        pump_announces(&x, ti);
+        tracker_drain(&tr);
+        got = strstr(tr.lines, want) != NULL;
+    }
+    if (!got) {
+        printf("TRK1[%s]\n", tr.lines);
+        fail("r12_no_announce_with_ext_port");
+    }
+    /* The nonce of this grant is the one the renewal reuses (R13), so it is also the
+     * nonce of the retransmissions that go out while the renewal dies. */
+    uint8_t dead_nonce[12];
+    memcpy(dead_nonce, x.s->pm->grant_nonce[PM_PH_TCP], 12);
+
+    /* The gateway goes quiet for the renewal: the renew window, then the budget. The
+     * tick below is what puts the renewal on the wire. */
+    ntx_portmap_test_advance_ms(3601000);
+    ntx_session_portmap_tick(x.s);
+    if (x.s->pm->phase != PM_PH_TCP) fail("r12_renewal_not_sent");
+    int steps = 0;
+    while (x.s->pm->phase >= 0 && steps++ < 40) {
+        long w = (long)(x.s->pm->next_try - pm_now());
+        ntx_portmap_test_advance_ms((uint64_t)(w > 0 ? w + 5 : 5));
+        ntx_session_portmap_tick(x.s);
+    }
+    if (x.s->pm->phase != -1) fail("r12_renewal_still_outstanding");
+    if (x.s->pm->active[PM_PH_TCP] != 0) fail("r12_grant_kept_after_failed_renewal");
+    if (ntx_session_portmap_state(x.s) != NTX_PM_PENDING) fail("r12_pending_after_renewal_failed");
+    if (ntx_session_adv_port(x.s) != (uint16_t)ntx_netx_port(x.n)) fail("r12_adv_port_back_to_listen");
+
+    /* The swarm is told: a LATER announce carries the listen port again, and the share
+     * stays up (it has been reachable on the listen port since the settle cap). */
+    snprintf(want, sizeof want, "port=%u&", (unsigned)ntx_netx_port(x.n));
+    got = 0;
+    for (int i = 0; i < 12 && !got; i++) {
+        ntx_session_tick(x.s);
+        pump_announces(&x, ti);
+        tracker_drain(&tr);
+        got = strstr(tr.lines, want) != NULL;
+    }
+    if (!got) {
+        printf("TRK2[%s]\n", tr.lines);
+        fail("r12_no_announce_on_listen");
+    }
+    if (ntx_session_share_state(x.s, ti) != NTX_SHARE_READY &&
+        ntx_session_share_state(x.s, ti) != NTX_SHARE_ANNOUNCING)
+        fail("r12_share_died_with_the_grant");
+
+    /* The gateway is back, with a DIFFERENT external port. The re-acquisition is owed
+     * but paced (PM_REACQ_MS), so the clock walks in bounded steps. */
+    if (r12_answer_map(gwd, &x, R12_EXT2, dead_nonce) != 1) fail("r12_no_reacquisition_query");
+    if (ntx_session_portmap_state(x.s) != NTX_PM_ACTIVE) fail("r12_reacquired");
+    if (ntx_session_adv_port(x.s) != (uint16_t)R12_EXT2) fail("r12_adv_port_new_ext");
+    snprintf(want, sizeof want, "port=%u&", (unsigned)R12_EXT2);
+    got = 0;
+    for (int i = 0; i < 12 && !got; i++) {
+        ntx_session_tick(x.s);
+        pump_announces(&x, ti);
+        tracker_drain(&tr);
+        got = strstr(tr.lines, want) != NULL;
+    }
+    if (!got) {
+        printf("TRK3[%s]\n", tr.lines);
+        fail("r12_no_reannounce_with_new_ext");
+    }
+
+    ntx_session_remove(x.s, ti);
+    sess_close(&x);
+    tracker_stop(&tr);
+    close(gwd);
+    ntx_portmap_test_set_route_files(NULL, NULL);
+    ntx_portmap_test_set_gateway_port(0);
+    ok("lost_renewal_reannounces");
 }
 
 /* --- R5 helpers -------------------------------------------------------------
@@ -2892,6 +3061,7 @@ int main(void) {
     test_started_and_magnet();
     test_silent_gateway_settles();
     test_silent_gateway_gives_up();
+    test_lost_renewal_reannounces();
     test_remove_during_hash();
     test_store_dir_on_demand();
     test_pin_fail();

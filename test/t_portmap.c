@@ -583,6 +583,102 @@ static void both_active(sess *x, uint16_t ext, const uint8_t ip[16]) {
     pcp_grant(x, NTX_PCP_PROTO_UDP, ext, ip, 7200);
 }
 
+/* How many FRESH MAP queries — distinct nonces — go out over steps × step_ms of
+ * clock while nobody answers. The re-acquisition probe of R12: a driver that re-asks
+ * on every tick is counted here, and so is one that never asks again. Retransmissions
+ * of the outstanding query repeat its nonce and are not counted (the rule
+ * pcp_answer_all uses). The pump is bounded, so a looping driver fails instead of
+ * hanging. */
+static int pm_fresh_queries_in(sess *x, uint8_t proto, const uint8_t known[12], uint64_t step_ms, int steps) {
+    const int cap = 64;
+    uint8_t buf[2048], seen[cap][12];
+    int q = 0;
+    if (known) memcpy(seen[q++], known, 12); /* the grant's own nonce is not a new ask */
+    for (int i = 0; i < steps; i++) {
+        ntx_portmap_test_advance_ms(step_ms);
+        pm_tick(x);
+        pump_ms(x->n, 10);
+        ssize_t r;
+        while ((r = gw_get(buf, sizeof buf)) > 0) {
+            if (!req_is(buf, r, proto, 7200)) continue;
+            int fresh = 1;
+            for (int k = 0; k < q; k++)
+                if (memcmp(seen[k], buf + 24, 12) == 0) fresh = 0;
+            if (fresh) {
+                if (q < cap) memcpy(seen[q], buf + 24, 12);
+                q++;
+            }
+        }
+    }
+    gw_drain();
+    return q;
+}
+
+/* pcp_grant for a request that may still be sitting on its retransmission schedule:
+ * the clock walks in 5 s steps (up to a bounded 4000 s of it, so a driver that never
+ * asks again is a FAIL and not a hang) until the datagram appears, then the canned
+ * SUCCESS goes back. The gateway came back to life; the driver owes it a query. */
+static void pcp_grant_whenever(sess *x, uint8_t proto, uint16_t ext_port, const uint8_t ext_ip[16],
+                               uint32_t lifetime) {
+    uint8_t req[2048], rsp[64];
+    for (int spins = 0; spins < 800; spins++) {
+        ssize_t n = gw_get(req, sizeof req);
+        if (n < 0) {
+            ntx_portmap_test_advance_ms(5000);
+            pm_tick(x);
+            ntx_netx_run_once(x->n, 2);
+            continue;
+        }
+        if (!req_is(req, n, proto, 7200)) continue;
+        /* The last retransmission of the renewal that just died, and any copy of it,
+         * carries the DEAD grant's nonce and answers nothing any more. Answering it
+         * here would hand the case its pass to a datagram nobody is waiting for. The
+         * re-acquisition has to be a fresh query, which is also what O4 pins. */
+        if (memcmp(req + 24, granted_nonce[proto], 12) == 0) continue;
+        memcpy(granted_nonce[proto], req + 24, 12);
+        pcp_resp(rsp, req, ext_port, ext_ip, lifetime, gw_epoch_live(x->s->pm));
+        gw_send(rsp, 60);
+        pump_ms(x->n, 20);
+        return;
+    }
+    printf("FAIL no pcp request within the window proto=%u\n", proto);
+    fails++;
+}
+
+/* Walk the outstanding query's retransmission budget against a gateway that says
+ * nothing: one tick per scheduled instant, exactly as case D drives it. Bounded, so a
+ * driver that keeps a query open forever is a FAIL and not a hang. 1 = the budget ran
+ * out (the phase is no longer outstanding). */
+static int pm_burn_budget(sess *x, int ph) {
+    for (int i = 0; i < 16; i++) {
+        if (x->s->pm->phase != ph) return 1;
+        long w = pm_wait_ms(x->s->pm);
+        ntx_portmap_test_advance_ms((uint64_t)(w > 0 ? w + 5 : 5));
+        pm_tick(x);
+    }
+    return x->s->pm->phase != ph;
+}
+
+/* Wait (clock-walking, bounded) for the next MAP request of `proto` and copy it out;
+ * 1 on success, 0 if none appeared within the window. The caller answers it, which is
+ * what makes a case that must NOT answer one (a query left to die) expressible. */
+static int pm_next_req(sess *x, uint8_t proto, uint8_t out[60]) {
+    uint8_t req[2048];
+    for (int spins = 0; spins < 800; spins++) {
+        ssize_t n = gw_get(req, sizeof req);
+        if (n >= 0 && req_is(req, n, proto, 7200)) {
+            memcpy(out, req, 60);
+            return 1;
+        }
+        ntx_portmap_test_advance_ms(250);
+        pm_tick(x);
+        ntx_netx_run_once(x->n, 2);
+    }
+    return 0;
+}
+
+
+
 /* ---- the announce port, straight off the wire (as t_session_trk_udp.c does) ---- */
 
 static int udp_loopback(uint16_t *port) {
@@ -1488,9 +1584,261 @@ int main(void) {
         sess_close(&x);
     }
 
+    /* ---- P. the gateway goes quiet AFTER a grant: the grant is lost, not kept (R12).
+
+     * The renewal of a mapping is answered by nothing. The retransmission budget runs
+     * out, the gateway lets the mapping expire at the end of its lifetime — and the
+     * driver used to keep the grant: `pm_give_up_phase` set `failed[ph]` and left
+     * `active[ph] = 1`, so the state stayed ACTIVE forever, `ntx_session_adv_port`
+     * went on handing out the port the gateway had stopped forwarding (announce and
+     * the ext-handshake `p` told the swarm to dial a dead port), and the renewal loop,
+     * which only walks `active && !failed`, never asked for a mapping again. Pre-fix
+     * failures of this group: P1_adv_port_back_to_listen got=40123 want=6881,
+     * P1_pending_after_renewal_failed (state stayed 2), P1_grant_dropped got=1,
+     * P1_announce_back_to_listen got=40123, P2_no_reacquisition_window /
+     * P2_adv_port_new_ext / P2_reannounce_carries_new_ext, and P4_tcp_renewal_lost_* —
+     * i.e. nothing ever came back. ---- */
+
+    /* P1. the whole renewal budget dies: adv_port returns the LISTEN port, the state
+     * says a re-acquisition is owed, and the re-acquisition is bounded. */
+    {
+        sess x;
+        sess_open(&x, "p1");
+        x.cfg.port_map = 1;
+        one_torrent(&x);
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "P1_active");
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "P1_adv_port");
+        uint8_t gn[12];
+        memcpy(gn, granted_nonce[NTX_PCP_PROTO_TCP], 12);
+        gw_drain();
+        ntx_portmap_test_advance_ms(3601000); /* past half of the 7200 s grant */
+        pm_tick(&x);
+        uint8_t req[2048];
+        ck_eq(gw_get(req, sizeof req), 60, "P1_renew_sent");
+        ck(memcmp(req + 24, gn, 12) == 0, "P1_renewal_is_the_grant_query");
+        /* The budget, spent in silence. */
+        ck(pm_burn_budget(&x, PM_PH_TCP), "P1_budget_exhausted");
+        ck_eq(x.s->pm->phase, -1, "P1_nothing_outstanding");
+        ck_eq(x.s->pm->active[PM_PH_TCP], 0, "P1_grant_dropped");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "P1_adv_port_back_to_listen");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "P1_pending_after_renewal_failed");
+        /* The swarm is told, not left dialling the dead port. */
+        ck_eq(announce_port_on_wire(&x), ntx_netx_port(x.n), "P1_announce_back_to_listen");
+        /* Re-acquisition is owed and paced: over two hours a handful of FRESH queries
+         * (the grant's own nonce excluded), not zero and not hundreds. */
+        int q = pm_fresh_queries_in(&x, NTX_PCP_PROTO_TCP, gn, 60000, 120);
+        if (q < 1 || q > 24) {
+            printf("FAIL P1_bounded_reacquisition got=%d want=1..24\n", q);
+            fails++;
+        }
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* P2. the gateway answers again, with a DIFFERENT external port: the re-acquisition
+     * must take it and the share must re-announce with it (the S09 path, on a RE-grant). */
+    {
+        sess x;
+        sess_open(&x, "p2");
+        x.cfg.port_map = 1;
+        one_torrent(&x);
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        gw_drain();
+        ntx_portmap_test_advance_ms(3601000);
+        pm_tick(&x);
+        gw_drain(); /* the gateway was quiet for the whole budget */
+        ck(pm_burn_budget(&x, PM_PH_TCP), "P2_budget_exhausted");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "P2_adv_port_back_to_listen");
+        uint8_t dead[12];
+        memcpy(dead, granted_nonce[NTX_PCP_PROTO_TCP], 12); /* the nonce of the grant that died */
+        pcp_grant_whenever(&x, NTX_PCP_PROTO_TCP, 40131, pub, 7200);
+        /* §11.1/§11.2 (R13): with no live grant the ask is a NEW acquisition, so it must
+         * not go out under the dead mapping's nonce — the gateway keys on it, and a repeat
+         * would renew (and later delete) a mapping that is already gone. */
+        ck(memcmp(granted_nonce[NTX_PCP_PROTO_TCP], dead, 12) != 0, "P2_reacquisition_draws_fresh_nonce");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "P2_reacquired");
+        ck_eq(ntx_session_adv_port(x.s), 40131, "P2_adv_port_new_ext");
+        ck_eq(announce_port_on_wire(&x), 40131, "P2_reannounce_carries_new_ext");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* P3. the other edge: a renewal that is merely IN FLIGHT keeps the grant advertised.
+     * The gateway still holds the mapping until its lifetime runs out, so dropping the
+     * port here would take a working share off the reachable address for nothing. */
+    {
+        sess x;
+        sess_open(&x, "p3");
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        gw_drain();
+        ntx_portmap_test_advance_ms(3601000);
+        pm_tick(&x);
+        uint8_t req[2048];
+        ck_eq(gw_get(req, sizeof req), 60, "P3_renew_sent");
+        for (int i = 0; i < 4 && x.s->pm->tries < 5; i++) {
+            long w = pm_wait_ms(x.s->pm);
+            ntx_portmap_test_advance_ms((uint64_t)(w > 0 ? w + 5 : 5));
+            pm_tick(&x);
+        }
+        ck(x.s->pm->tries >= 3, "P3_retransmissions_made");
+        ck(x.s->pm->tries < (int)PM_MAX_TRIES, "P3_budget_not_spent");
+        ck_eq(x.s->pm->active[PM_PH_TCP], 1, "P3_in_flight_still_holds");
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "P3_in_flight_advertises_grant");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "P3_in_flight_stays_active");
+        ck_eq(ext_handshake_port(&x), EXT_PORT, "P3_ext_handshake_in_flight");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* P4. both mappings. `ntx_session_adv_port` depends on the TCP mapping alone, so a
+     * UDP mapping that dies must not cost the advertised TCP port, and a TCP mapping
+     * that dies must cost it — with the live UDP mapping left alone. Pinned as it is,
+     * not as one might wish it were: the UDP external port is never advertised
+     * anywhere, so nothing about a dead UDP grant can reach the swarm. */
+    {
+        sess x;
+        sess_open(&x, "p4u");
+        x.cfg.utp = 1;
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        both_active(&x, EXT_PORT, pub);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "P4u_both_active");
+        gw_drain();
+        ntx_portmap_test_advance_ms(3601000); /* both renew windows open */
+        pm_tick(&x);
+        uint8_t req[2048];
+        /* The TCP renewal is the first query out; answer it, so only UDP dies. */
+        ck_eq(gw_get(req, sizeof req), 60, "P4u_tcp_renew_sent");
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        uint8_t ureq[60];
+        ck(pm_next_req(&x, NTX_PCP_PROTO_UDP, ureq), "P4u_udp_renew_sent");
+        ck_eq(x.s->pm->phase, PM_PH_UDP, "P4u_udp_renewal_outstanding");
+        ck(pm_burn_budget(&x, PM_PH_UDP), "P4u_udp_budget_exhausted");
+        ck_eq(x.s->pm->active[PM_PH_UDP], 0, "P4u_udp_grant_dropped");
+        ck_eq(x.s->pm->active[PM_PH_TCP], 1, "P4u_tcp_grant_kept");
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "P4u_dead_udp_keeps_tcp_port");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "P4u_stays_active");
+        int q = pm_fresh_queries_in(&x, NTX_PCP_PROTO_UDP, NULL, 60000, 30);
+        if (q < 1 || q > 12) {
+            printf("FAIL P4u_udp_reacquisition_bounded got=%d want=1..12\n", q);
+            fails++;
+        }
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+    {
+        sess x;
+        sess_open(&x, "p4t");
+        x.cfg.utp = 1;
+        x.cfg.port_map = 1;
+        one_torrent(&x);
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        both_active(&x, EXT_PORT, pub);
+        gw_drain();
+        ntx_portmap_test_advance_ms(3601000);
+        pm_tick(&x);
+        uint8_t req[2048];
+        ck_eq(gw_get(req, sizeof req), 60, "P4t_tcp_renew_sent");
+        ck(pm_burn_budget(&x, PM_PH_TCP), "P4t_tcp_budget_exhausted");
+        ck_eq(x.s->pm->active[PM_PH_TCP], 0, "P4t_tcp_grant_dropped");
+        ck_eq(x.s->pm->active[PM_PH_UDP], 1, "P4t_udp_grant_untouched");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "P4t_dead_tcp_drops_adv_port");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "P4t_pending_while_tcp_owed");
+        ck_eq(announce_port_on_wire(&x), ntx_netx_port(x.n), "P4t_announce_drops_dead_port");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* P5. the lifetime half of the adv_port rule: a gateway whose grant is shorter than
+     * one send cycle. The renewal is legitimately still in flight (its budget is not
+     * spent), yet the gateway has stopped forwarding the port at the end of its
+     * Lifetime, so the port must not be advertised any more. With the normal 7200 s
+     * grant this can never happen — the nine PCP sends end ~783 s in, far inside the
+     * 3600 s renew window — which is why the case hands out 40 s. */
+    {
+        sess x;
+        sess_open(&x, "p5");
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 40);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "P5_active");
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "P5_adv_port_while_held");
+        gw_drain();
+        ntx_portmap_test_advance_ms(21000); /* past renew_at = life/2, renewal goes out */
+        pm_tick(&x);
+        uint8_t req[2048];
+        ck_eq(gw_get(req, sizeof req), 60, "P5_renew_sent");
+        ck_eq(x.s->pm->tries, 1, "P5_one_send_only");
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "P5_in_flight_inside_lifetime");
+        ntx_portmap_test_advance_ms(20000); /* the lifetime has now run out here too */
+        ck_eq(x.s->pm->tries, 1, "P5_still_in_flight");
+        ck_eq(x.s->pm->active[PM_PH_TCP], 1, "P5_grant_still_recorded");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "P5_no_port_past_lifetime");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* P6. the backoff is BOUNDED and does not stop. The re-acquisition must go on for
+     * the life of the share (a router reboot outlives an hour) but never turn into a
+     * storm, so a whole day against a dead gateway is counted here: the asks keep
+     * coming, and their number has an upper bound a runaway would blow. The schedule
+     * is one nine-send query cycle per wait, and the wait doubles per ask from 5 min to
+     * the 1 h ceiling, so a day costs a few dozen asks, not thousands. Pre-fix: nothing
+     * came at all after the renewal died (the probe counted 0). */
+    {
+        sess x;
+        sess_open(&x, "p6");
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        gw_drain();
+        ntx_portmap_test_advance_ms(3601000);
+        pm_tick(&x);
+        gw_drain();
+        ck(pm_burn_budget(&x, PM_PH_TCP), "P6_budget_exhausted");
+        /* 24 h of silence, one tick a minute. */
+        int q = pm_fresh_queries_in(&x, NTX_PCP_PROTO_TCP, granted_nonce[NTX_PCP_PROTO_TCP], 60000, 1440);
+        if (q < 8) {
+            printf("FAIL P6_kept_asking got=%d want>=8\n", q);
+            fails++;
+        }
+        if (q > 60) {
+            printf("FAIL P6_backoff_bound got=%d want<=60\n", q);
+            fails++;
+        }
+        /* And the ceiling really is a ceiling: the last ask of the day waits an hour, so
+         * the tail of the window holds at most two of them per hour. */
+        int tail = pm_fresh_queries_in(&x, NTX_PCP_PROTO_TCP, granted_nonce[NTX_PCP_PROTO_TCP], 60000, 120);
+        if (tail > 6) {
+            printf("FAIL P6_ceiling_holds tail=%d want<=6\n", tail);
+            fails++;
+        }
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "P6_no_stale_port_after_a_day");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
     /* ---- M. a datagram that carries no verdict at all: no grant, no immediate
-     * resend, and the retransmission schedule continues (§8.3).
-     *
+     * resend, and the retransmission schedule continues (§8.3).     *
      * This case used to answer with result 7 (NETWORK_FAILURE) and then pin the
      * driver retransmitting the query eight more times, i.e. it pinned the very
      * behaviour review §6 / R14 calls the defect: a refusal the gateway stated

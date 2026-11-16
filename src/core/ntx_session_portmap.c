@@ -50,6 +50,18 @@
  * minutes is met by one query per restart, forever — which is right. The upgrade path
  * if a flapping gateway ever proves noisy is a backoff on `restarts`, not more sends. */
 #define PM_MAX_RESTARTS 3u
+/* R12: the ask for a mapping the driver has just lost (its renewal met silence). One
+ * cycle already costs the whole nine-send schedule of PM_MAX_TRIES (~13 min over PCP,
+ * ~64 s over NAT-PMP), so one ask per this wait cannot hammer a gateway. The wait
+ * doubles per ask that goes unanswered, 5 → 10 → 20 … minutes, capped at
+ * PM_REACQ_MAX_MS: a share outlives an hour-long router reboot, so asking goes on for
+ * the whole run and a gateway that comes back gets its mapping back, while a gateway
+ * that is gone is met by one datagram an hour.
+ * ponytail: the ceiling is 1 h, the doubling is per phase and not jittered. Upgrade
+ * path if a fleet behind one gateway proves noisy: jitter it the way pm_jitter does
+ * for PCP rather than shrinking the ceiling. */
+#define PM_REACQ_MS 300000u       /* the first wait: 5 min */
+#define PM_REACQ_MAX_MS 3600000u  /* doubling stops at 1 h => ~24 asks a day, worst case */
 
 /* One outstanding query at a time, in this order. The NAT-PMP external-address
  * query exists only in the fallback: it is how CGNAT is found without PCP. */
@@ -83,6 +95,15 @@ struct ntx_portmap {
     int failed[PM_NPH];       /* this query exhausted its retries */
     uint16_t ext[PM_NPH];
     uint64_t renew_at[PM_NPH]; /* virtual ms */
+    uint64_t expire_at[PM_NPH]; /* virtual ms the gateway stops forwarding this grant (R12) */
+    /* R12: a mapping this sequence held and lost is owed asks until it is held again.
+     * `reacq_at` is the instant the next ask may go out (0 = none pending) and
+     * `reacq_gap` the wait to use for the next loss (PM_REACQ_MS, doubled per ask,
+     * capped); `reacq_gap == 0` also means "nothing was ever granted for this phase",
+     * which is what separates a lost mapping from a first acquisition that the ordinary
+     * arms of the tick already own. */
+    uint64_t reacq_at[PM_NPH];
+    uint32_t reacq_gap[PM_NPH];
     uint32_t epoch;
     int epoch_seen;            /* 0 until the first PCP answer: no baseline */
     uint64_t epoch_at;         /* virtual ms the baseline Epoch was received (§8.5) */
@@ -258,11 +279,19 @@ static void pm_close_sock(struct ntx_portmap *pm) {
     pm->fd = -1;
 }
 
+/* Every trace of a mapping is gone, including the debt R12 records: a caller that
+ * drops grants wholesale (reset, §8.5 rollback, CGNAT) is starting a different
+ * sequence, and the re-acquisition budget of a mapping this sequence never held would
+ * only make it ask for one again. `grant_nonce`/`grant_ip` stay as they are: nothing
+ * reads them while `active` is 0 (R13), and the fresh ask draws a new nonce. */
 static void pm_clear_grants(struct ntx_portmap *pm) {
     for (int i = 0; i < PM_NPH; i++) {
         pm->active[i] = 0;
         pm->ext[i] = 0;
         pm->renew_at[i] = 0;
+        pm->expire_at[i] = 0;
+        pm->reacq_at[i] = 0;
+        pm->reacq_gap[i] = 0;
     }
 }
 
@@ -337,7 +366,7 @@ static int pm_drain_err(struct ntx_portmap *pm) {
 }
 
 static void pm_start_query(struct ntx_portmap *pm, int phase, uint16_t sugg_port);
-static void pm_give_up_phase(struct ntx_portmap *pm, int ph);
+static void pm_give_up_phase(struct ntx_portmap *pm, int ph, int reask);
 
 /* The gateway's verdicts, named for --verbose only (R14): the number is what the
  * gateway sent and is always printed, the name is convenience. One line per refusal,
@@ -387,7 +416,7 @@ static void pm_refused_result(struct ntx_portmap *pm, int ph, uint32_t res, uint
     pm->phase = -1;
     pm->tries = 0;
     pm_diag_result(pm->fam, res);
-    pm_give_up_phase(pm, ph);
+    pm_give_up_phase(pm, ph, 0);
     if (!pm_result_retryable(pm->fam, res) || life_s == 0 || pm->retried) return;
     uint64_t wait_s = life_s < PM_RETRY_MIN_S ? PM_RETRY_MIN_S : life_s;
     pm->retry_ph = ph;
@@ -410,7 +439,7 @@ static void pm_refused(struct ntx_portmap *pm, int ph) {
         pm_start_query(pm, PM_PH_ADDR, 0);
         return;
     }
-    pm_give_up_phase(pm, ph);
+    pm_give_up_phase(pm, ph, 1);
 }
 
 /* The one verdict for both ways the socket reports trouble (SO_ERROR via the close
@@ -432,7 +461,7 @@ static void pm_sock_err(struct ntx_portmap *pm, int err) {
         pm_refused(pm, ph);
         return;
     }
-    pm_give_up_phase(pm, ph);
+    pm_give_up_phase(pm, ph, 1);
 }
 
 /* The result of send() is never discarded (R9): trouble is judged here and the
@@ -513,11 +542,23 @@ static void pm_grant(struct ntx_portmap *pm, int phase, uint16_t ext_port, uint3
                      const uint8_t ext_ip16[16]) {
     pm->active[phase] = 1;
     pm->failed[phase] = 0;
+    /* R12: holding a mapping again means losing it is worth asking about again — the
+     * backoff belongs to the mapping, so a fresh grant resets it and clears any ask
+     * still queued for the one it replaces. */
+    pm->reacq_gap[phase] = PM_REACQ_MS;
+    pm->reacq_at[phase] = 0;
     memcpy(pm->grant_nonce[phase], pm->nonce, sizeof pm->nonce);
     if (ext_ip16) memcpy(pm->grant_ip[phase], ext_ip16, 16);
     else memset(pm->grant_ip[phase], 0, 16);
     pm->ext[phase] = ext_port;
     pm->renew_at[phase] = pm_now() + (uint64_t)(life / 2) * 1000u;
+    /* R12: the instant the gateway itself stops forwarding this grant. A renewal that
+     * is still in flight past it cannot be assumed held any more, and
+     * `ntx_session_adv_port` must not tell the swarm to dial a port the gateway has
+     * dropped. With the normal schedule a renewal is always over long before this
+     * (PCP: the nine sends end ~783 s in, half of 7200 s is 3600 s), so it only bites
+     * for a gateway that hands out a lifetime shorter than one send cycle. */
+    pm->expire_at[phase] = pm_now() + (uint64_t)life * 1000u;
     pm->phase = -1;
     pm->tries = 0;
     if (pm->active[PM_PH_TCP]) pm->st = NTX_PM_ACTIVE; /* §8: announces carry the ext port */
@@ -583,7 +624,7 @@ static void pm_no_mapping(struct ntx_portmap *pm, int ph, const char *why) {
     pm->phase = -1;
     pm->tries = 0;
     ntx_diag("ntx: port map: %s %s\n", pm->fam == PM_PCP ? "PCP" : "NAT-PMP", why);
-    pm_give_up_phase(pm, ph);
+    pm_give_up_phase(pm, ph, 0);
 }
 
 /* A SUCCESS MAP reply whose Lifetime is 0 grants nothing — §11.1 makes lifetime 0 the
@@ -762,16 +803,73 @@ static void pm_stop_now(struct ntx_portmap *pm) {
     pm_reset(pm, NTX_PM_OFF);
 }
 
-/* A query that ran out of retries: §8 "brak odpowiedzi bramy … oznacza status
- * „brak" i dalsze działanie bez mapowania". A failed TCP mapping takes UDP with it
- * (a gateway that will not map TCP will not map UDP either); a failed UDP mapping
- * must not disturb the live TCP one. */
-static void pm_give_up_phase(struct ntx_portmap *pm, int ph) {
+/* Marking a phase failed also cancels the R12 debt for it: the sequence has a verdict
+ * for that phase, so nothing is owed on it any more. */
+static void pm_fail_phase(struct ntx_portmap *pm, int ph) {
     pm->failed[ph] = 1;
-    if (ph != PM_PH_UDP) pm->failed[PM_PH_UDP] = 1;
+    pm->reacq_at[ph] = 0;
+    pm->reacq_gap[ph] = 0;
+}
+
+/* A query that ran out of retries — or stated a refusal — for a phase.
+ * §8 "brak odpowiedzi bramy … oznacza status „brak" i dalsze działanie bez
+ * mapowania". A failed TCP mapping takes UDP with it (a gateway that will not map TCP
+ * will not map UDP either); a failed UDP mapping must not disturb the live TCP one.
+ *
+ * `reask` says which kind of failure this is: 1 when the gateway simply stopped
+ * answering (the retransmission budget died, or the socket reports the responder is
+ * gone), 0 when it stated a verdict. R14 keeps a stated verdict final for the
+ * sequence, and only the silence owes a further ask.
+ *
+ * R12: when the phase HELD a mapping, that mapping is over either way — the gateway
+ * let it expire at the end of its lifetime — so `active` is cleared here. Keeping it
+ * set was the defect: `ntx_session_adv_port` went on handing the swarm a port nobody
+ * forwards any more (announce, and the BEP 10 `p` of an ext handshake, told peers to
+ * dial a dead port), and the renewal loop, which only walks `active && !failed`, never
+ * asked for a mapping again, so the driver sat on a stale grant permanently. With the
+ * grant gone `adv_port` falls back to the listen port at once, and on a silence the
+ * ask goes out again from the re-acquisition arm of the tick, on a backoff of its own.
+ * The verdict is not crossed over to the other protocol the way a first acquisition
+ * poisons it: this gateway DID map this client once, the other mapping may well be
+ * alive, and `failed` on it would cost it its renewals. */
+static void pm_give_up_phase(struct ntx_portmap *pm, int ph, int reask) {
+    if (ph != PM_PH_ADDR && (pm->active[ph] || pm->reacq_gap[ph] > 0)) {
+        pm->active[ph] = 0;
+        pm->ext[ph] = 0;
+        pm->renew_at[ph] = 0;
+        pm->expire_at[ph] = 0;
+        pm->failed[ph] = 1;
+        if (reask && pm->reacq_gap[ph] > 0) {
+            pm->reacq_at[ph] = pm_now() + pm->reacq_gap[ph];
+            pm->reacq_gap[ph] = pm->reacq_gap[ph] * 2u > PM_REACQ_MAX_MS ? PM_REACQ_MAX_MS
+                                                                         : pm->reacq_gap[ph] * 2u;
+            pm->gave_up = 0; /* the tick is what sends the ask */
+            /* ACTIVE means "the TCP grant is in place" (`adv_port` reads exactly
+             * that), so it is only right while that grant is; PENDING is the honest
+             * state for a TCP mapping this driver still owes itself. */
+            pm->st = pm->active[PM_PH_TCP] ? NTX_PM_ACTIVE : NTX_PM_PENDING;
+        } else {
+            /* No re-ask owed (a verdict was stated, or the budget is spent): the phase
+             * is failed outright, which is also what drops the debt. */
+            pm_fail_phase(pm, ph);
+            if (!pm->active[PM_PH_TCP] && !pm->active[PM_PH_UDP]) {
+                pm->st = NTX_PM_NONE;
+                pm->gave_up = 1; /* nothing owed any more: §8 says "brak" */
+            } else if (!pm->active[PM_PH_TCP]) {
+                /* UDP is still mapped and TCP is settled for this sequence: ACTIVE
+                 * would claim a TCP grant that is gone, and `gave_up` here would stop
+                 * the renewals of the live UDP grant. `failed[TCP]` is what keeps the
+                 * schedule quiet about TCP from here on. */
+                pm->st = NTX_PM_PENDING;
+            }
+        }
+        return;
+    }
+    pm_fail_phase(pm, ph);
+    if (ph != PM_PH_UDP) pm_fail_phase(pm, PM_PH_UDP);
     if (ph == PM_PH_ADDR) {
-        pm->failed[PM_PH_TCP] = 1;
-        pm->failed[PM_PH_UDP] = 1;
+        pm_fail_phase(pm, PM_PH_TCP);
+        pm_fail_phase(pm, PM_PH_UDP);
     }
     if (!pm->active[PM_PH_TCP] && !pm->active[PM_PH_UDP]) {
         pm->st = NTX_PM_NONE;
@@ -831,7 +929,7 @@ void ntx_session_portmap_tick(struct ntx_session *s) {
         int ph = pm->phase;
         if ((uint32_t)pm->tries >= PM_MAX_TRIES) {
             pm->phase = -1;
-            pm_give_up_phase(pm, ph);
+            pm_give_up_phase(pm, ph, 1);
             return;
         }
         pm_send(pm);
@@ -863,6 +961,19 @@ void ntx_session_portmap_tick(struct ntx_session *s) {
             pm_start_query(pm, i, pm->ext[i]); /* keep the granted port across renewals */
             return;
         }
+
+    /* R12: a mapping this driver held and lost (its renewal died) is asked for again,
+     * on the doubling backoff of PM_REACQ_MS / PM_REACQ_MAX_MS. It sits behind the
+     * renewals — a grant we do hold always comes first — and ahead of the fresh
+     * acquisitions, which `failed` already excludes for this phase. The ask is a fresh
+     * one: no live grant, so `pm_start_query` draws a new nonce and states no
+     * preference (§11.1/§11.2, R13). */
+    for (int i = PM_PH_TCP; i < PM_NPH; i++)
+        if (pm->reacq_at[i] && now >= pm->reacq_at[i]) {
+            pm->reacq_at[i] = 0;
+            pm_start_query(pm, i, ntx_netx_port(pm->netx));
+            return;
+        }
     if (pm->fam == PM_NATPMP && !pm->addr_done && !pm->failed[PM_PH_ADDR]) {
         pm_start_query(pm, PM_PH_ADDR, 0);
         return;
@@ -889,7 +1000,16 @@ ntx_pm_state ntx_session_portmap_state(const struct ntx_session *s) {
 
 uint16_t ntx_session_adv_port(const struct ntx_session *s) {
     const struct ntx_portmap *pm = s->pm;
-    if (pm && pm->st == NTX_PM_ACTIVE && pm->active[PM_PH_TCP] && pm->ext[PM_PH_TCP])
+    /* The mapped port is advertised only while the driver actually holds the TCP
+     * mapping: `active` is set by a grant and cleared the moment its renewal is given
+     * up on (R12), and `expire_at` is the instant the gateway itself stops forwarding
+     * it — a renewal that is merely in flight past `renew_at` keeps advertising (the
+     * gateway still holds the mapping; dropping the port there would take a working
+     * share off the air for nothing), one whose lifetime has run out does not. The UDP
+     * mapping is deliberately not consulted: its external port is never advertised
+     * anywhere, so a lost UDP grant must not cost the swarm the TCP one. */
+    if (pm && pm->st == NTX_PM_ACTIVE && pm->active[PM_PH_TCP] && pm->ext[PM_PH_TCP] &&
+        pm_now() < pm->expire_at[PM_PH_TCP])
         return pm->ext[PM_PH_TCP];
     return ntx_netx_port(s->netx);
 }
