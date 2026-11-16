@@ -149,7 +149,7 @@ static void cli_flags_compact(const ntx_stats *st, const ntx_tts_stat *t, char *
                  st->punch_fail > 99 ? 99u : (unsigned)st->punch_fail);
     /* Design §10 tags — the safety block, see the note on hoist above. pin!/in
      * cap at 99 like the peer counters. */
-    char prv[8] = "", shr[8] = "", enc[8] = "", pin[16] = "", map[16] = "", inn[8] = "";
+    char prv[8] = "", shr[8] = "", enc[8] = "", pin[16] = "", map[16] = "", map6[16] = "", inn[8] = "";
     if (t->priv) snprintf(prv, sizeof prv, " prv");
     if (t->share) snprintf(shr, sizeof shr, " shr%s", t->share == 2 ? "!" : "");
     if (t->enc_strict) snprintf(enc, sizeof enc, " enc!");
@@ -164,6 +164,13 @@ static void cli_flags_compact(const ntx_stats *st, const ntx_tts_stat *t, char *
         snprintf(map, sizeof map, " map!cg");
     else if (st && st->port_map != NTX_PM_OFF)
         snprintf(map, sizeof map, " map-"); /* PENDING, NONE, or ACTIVE w/o ext port */
+    /* map6:<port> rides the IPv6 family ALONE and only while it is ACTIVE with a port
+     * (the same "no map:0" rule as above). The aggregate tag above is about reachability
+     * from either family, so this one is what names the v6 grant the operator cannot
+     * read out of `map:` — a v6-only host shows `map- map6:6881`, a dual host shows
+     * both. Nothing is printed for a family that was never brought up. */
+    if (st && st->port_map6 == NTX_PM_ACTIVE && st->ext_port6)
+        snprintf(map6, sizeof map6, " map6:%u", st->ext_port6);
     if (t->share)
         snprintf(inn, sizeof inn, " in%u", t->in_ok > 99 ? 99u : (unsigned)t->in_ok);
     char info[128];
@@ -179,10 +186,10 @@ static void cli_flags_compact(const ntx_stats *st, const ntx_tts_stat *t, char *
                  o, u, ii, v2, dns, utp, punch);
     }
     if (hoist && t->share && seccap) {
-        snprintf(sec, seccap, "%s%s%s%s%s%s", prv, shr, enc, pin, map, inn);
+        snprintf(sec, seccap, "%s%s%s%s%s%s%s", prv, shr, enc, pin, map, map6, inn);
         snprintf(out, cap, "%s", info);
     } else {
-        snprintf(out, cap, "%s%s%s%s%s%s%s", info, prv, shr, enc, pin, map, inn);
+        snprintf(out, cap, "%s%s%s%s%s%s%s%s", info, prv, shr, enc, pin, map, map6, inn);
     }
 }
 

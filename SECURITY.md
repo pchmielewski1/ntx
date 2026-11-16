@@ -166,6 +166,21 @@ What this audit did **not** cover:
   the user is hiding and let inbound bypass the proxy), can be turned off with `--no-port-map`,
   and is never started for the public swarm. The codec is a pure byte transformer with golden
   vectors and no allocation, and it never reads past the declared packet length.
+- **PCP over IPv6 in the LAN (R15).** What `ntx` sends there is one 60-byte `MAP` per phase to
+  port 5351 of the `::/0` nexthop parsed out of `/proc/net/ipv6_route` (`RTF_UP` and `RTF_GATEWAY`
+  set, `RTF_REJECT` clear, metric < `ffffffff`, lowest metric wins), plus its renewals and
+  lifetime-0 deletes. What it **accepts unsolicited** is still nothing but that one peer's answer:
+  `pm_src6_ok` admits a datagram only when its source address equals the parsed nexthop **and** its
+  scope id equals the scope the socket was `connect()`ed through, on port 5351 — so neither another
+  host using the gateway's address on a different link nor an unscoped `fe80::` reply is believed.
+  A link-local nexthop is reached only with `sin6_scope_id = if_nametoindex(iface)`; if the route's
+  interface name does not resolve, v6 is skipped rather than dialled at an address no device owns.
+  The answer must then match the request on length, version, opcode, R bit, nonce, protocol and
+  internal port before anything is granted, and a grant whose external port differs from the listen
+  port is not used at all — it is deleted with its own nonce, because the announce carries one port
+  and a firewall opening the swarm can never be told about is exposure for nothing. As on the v4
+  side: no NAT-PMP fallback exists for IPv6, so an `UNSUPP_VERSION` or an ICMP error is a refusal,
+  and the whole family stays silent for the run.
 - **Test fixtures.** `test/vectors/tls13/key_p256.pem` and `key_rsa.pem` are throw-away private keys
   of the test servers used for the TLS golden streams. They protect nothing; secret scanners
   will flag them.

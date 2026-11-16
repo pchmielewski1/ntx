@@ -50,9 +50,16 @@ typedef struct {
     uint16_t utp_conns; /* active uTP connections */
     uint64_t demux_dht, demux_utp, demux_drop; /* shared-sock classifier (ntx_netx) */
     uint32_t punch_ok, punch_fail;             /* BEP55 dial initiated / dial refused */
-    /* Port mapping for shares (design §8, §11): ntx_pm_state and the mapped TCP port. */
+    /* Port mapping for shares (design §8, §11): ntx_pm_state and the mapped TCP port.
+     * S17d: `port_map` is the AGGREGATE of the two families (ACTIVE when either one is
+     * active, see stats_pm_merge in ntx_session_stats.c), `ext_port` is the v4 grant and
+     * `port_map6` / `ext_port6` the IPv6 family's own verdict and grant. A family that
+     * is OFF (never brought up) is the identity of the aggregate, so a v4-only host sees
+     * exactly the value it saw before. */
     uint8_t port_map;
     uint16_t ext_port;
+    uint8_t port_map6;
+    uint16_t ext_port6;
 } ntx_stats;
 
 /* Implemented in ui/ntx_stats.c: ntx_stats_to_json */

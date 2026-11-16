@@ -71,7 +71,7 @@ int ntx_stats_to_json(const ntx_stats *st, char *out, size_t cap) {
                       "\"utp\":%u,\"utp_conns\":%u,\"utp_v6\":%u,"
                       "\"demux_dht\":%llu,\"demux_utp\":%llu,\"demux_drop\":%llu,"
                       "\"punch_ok\":%u,\"punch_fail\":%u,"
-                      "\"port_map\":%u,\"ext_port\":%u,"
+                      "\"port_map\":%u,\"ext_port\":%u,\"port_map6\":%u,\"ext_port6\":%u,"
                       "\"n\":%d,\"torrents\":[",
                       st->down_Bps, st->up_Bps, st->total_peers, st->conn_peers,
                       (unsigned long long)st->down_total, (unsigned long long)st->up_total,
@@ -83,7 +83,8 @@ int ntx_stats_to_json(const ntx_stats *st, char *out, size_t cap) {
                       (unsigned long long)st->demux_dht, (unsigned long long)st->demux_utp,
                       (unsigned long long)st->demux_drop,
                       st->punch_ok, st->punch_fail,
-                      (unsigned)st->port_map, (unsigned)st->ext_port, emitted);
+                      (unsigned)st->port_map, (unsigned)st->ext_port,
+                      (unsigned)st->port_map6, (unsigned)st->ext_port6, emitted);
     const char *tail = truncated ? "],\"truncated\":1}" : "]}";
     size_t tl = strlen(tail);
     if (hn < 0 || (size_t)hn > IPC_HDR_RES || (size_t)hn + pos + tl + 1 > cap) {

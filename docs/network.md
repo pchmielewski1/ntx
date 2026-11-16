@@ -771,9 +771,59 @@ blocking calls.
   a share — the ask then goes out when the session starts and removing the last share does
   not release it. Otherwise it runs while at least one share is live and is released when the last
   one goes. The public swarm is never mapped.
+### IPv6 (R15)
+
+Over IPv6 there is usually no NAT to traverse, so PCP there opens the router's firewall rather
+than translating an address. The v6 half is a separate sequence with its own socket, its own
+nonce, grants, renewal clock, deferred retry and Epoch (§8.5) — `pm->s6` — driven by `pm_tick6()`
+from the same tick as v4. The two families share helpers and rules but not one byte of state, so
+a verdict in one never moves the other.
+
+- **The gateway comes from `/proc/net/ipv6_route`.** `pm_route6_line` parses the kernel's own
+  layout: `dst(32hex) dpl(2hex) src(32hex) spl(2hex) nexthop(32hex) metric(8hex) refcnt(8hex)
+  use(8hex) flags(8hex) iface`. The default is the line with an all-zero `dst`, `dpl 00`,
+  `RTF_UP` (0x1) **and** `RTF_GATEWAY` (0x2) set, `RTF_REJECT` (0x200) clear and a metric below
+  `ffffffff`; among the survivors the lowest metric wins, and the nexthop is kept as a native
+  v6 address — never widened from a v4-mapped one — together with its `iface`. networkd's
+  `::/0`-on-`lo` blackhole line (metric `ffffffff`, `RTF_REJECT`) is exactly what the flag check
+  exists to refuse.
+- **The socket and its scope.** One `AF_INET6` non-blocking UDP socket, `IPV6_V6ONLY`, `connect()`ed
+  to the nexthop on port 5351. A link-local (`fe80::/10`) nexthop is meaningless without the
+  interface it lives on, so `sin6_scope_id` is set from `if_nametoindex(iface)`; when that name
+  resolves to nothing the family is skipped rather than dialled at an address no device owns.
+- **The source rule.** A datagram is fed to the parsers only when its source is the gateway: the
+  same 16 bytes, the same scope the socket was connected through, and port 5351 (`pm_src6_ok`).
+  Nothing else on the LAN is believed. That is the one place `ntx` accepts unsolicited UDP — see
+  [SECURITY.md](../SECURITY.md#network-exposure).
+- **No NAT-PMP after IPv6.** RFC 6886 defines no IPv6 form, so the v6 half speaks PCP only: an
+  `UNSUPP_VERSION` there is a refusal, and a socket error ends the sequence with `none` — no
+  fallback is attempted, and none of it reaches the v4 sequence.
+- **The client address, and when the family is skipped.** The address in the request is the local
+  address of the connected socket, read with `getsockname` — the address the route actually uses.
+  Only a routable one is usable: loopback, `::`, a v4-mapped `::ffff:a.b.c.d`, link-local
+  (`fe80::/10`), unique-local (`fc00::/7`), multicast or reserved all say no, and the family is
+  skipped with `none` and nothing ever sent, because opening a port toward an address nothing
+  outside can reach is a firewall hole for nothing.
+- **The grant-port rule.** A tracker announce carries one port — the one `ntx_session_adv_port()`
+  puts in the announce and the BEP 10 `p` field, and that decision stays v4's. A v6 grant is
+  therefore only usable when the router forwards the listen port **unchanged**. A grant offering
+  anything else is deleted with the nonce it was made with (§11.1), reported under `--verbose`,
+  and the family is settled for the run: `ext_port6` is by construction either 0 or the listen
+  port. UDP is mapped too, for `--utp`, on the listen port.
 - **State reporting.** `ntx_session_portmap_state()` is the JSON `port_map` field verbatim:
-  `0` off, `1` pending, `2` active, `3` none, `4` cgnat; `ext_port` is non-zero only in state
-  `2`. The status line shows `map:<port>`, `map-` or `map!cg` ([cli.md](cli.md#diagnostic-tags)).
+  `0` off, `1` pending, `2` active, `3` none, `4` cgnat; `ext_port` is the v4 grant and is non-zero
+  only in state `2`. `ntx_session_portmap_state6()` and `ntx_session_ext_port6()` are the v6
+  family's own verdict and grant, reported as `port_map6` and `ext_port6` ([json-api.md](json-api.md)).
+- **Aggregation.** The single reported `port_map` answers "is inbound reachable through *any*
+  family", the two per-family fields say which. `active` wins if either family holds a mapping —
+  a v6-only host whose v4 says `none` *is* reachable from the v6 internet, and reporting `none`
+  there would be a lie. With neither family active the most informative refusal wins, in the order
+  `cgnat` > `pending` > `none`. `cgnat` can only come from the v4 half — it is a property of the
+  external address a v4 NAT handed back, and a v6 router that forwards the listen port hands back
+  no address worth classifying. `off` is the identity: a family the driver never brought up (no
+  route for it, mapping off, `--proxy`) contributes nothing, so a v4-only host reads exactly the
+  value it read before. The status line shows `map:<port>`, `map-` or `map!cg` for that aggregate
+  and `map6:<port>` for the v6 grant ([cli.md](cli.md#diagnostic-tags)).
 
 ## Limitations
 

@@ -735,6 +735,14 @@ static int pcp6_next_req(sess *x, uint8_t proto, uint8_t out[60]) {
 /* v6 state reads: the accessors are NULL-safe, so no probe helper is needed. */
 static long pm6_state6(const sess *x) { return (long)ntx_session_portmap_state6(x->s); }
 static long pm6_ext6(const sess *x) { return (long)ntx_session_ext_port6(x->s); }
+
+/* S17d: the stats the operator reads. Refreshed through the real path
+ * (ntx_session_stats_refresh → the double buffer → ntx_session_snapshot), so what the
+ * U cases pin is the published line, not a call into the driver. */
+static void sess_stats(sess *x, ntx_stats *st) {
+    ntx_session_stats_refresh(x->s, 0);
+    ntx_session_snapshot(x->s, st);
+}
 /* ---- retransmission pacing probes (R11) -------------------------------------
  * The schedule is read from the driver at the instant a datagram was observed,
  * which is also the instant the driver computed the next one: `next_try - now` is
@@ -4127,6 +4135,253 @@ int main(void) {
         ck(!gw6_pending(), "T10_nothing_on_wire_with_the_real_address");
         ntx_session_portmap_stop(x.s);
         sess_close(&x);
+        gw_drain();
+        gw6_drain();
+    }
+
+    /* ---- U. S17d / R15: the stats the operator reads.
+
+     * The three fields the sub-step adds are the aggregate `port_map` (ACTIVE when
+     * EITHER family is active), `port_map6` (the v6 family's own verdict) and
+     * `ext_port6` (its grant). What the cases pin, beyond the values themselves, is
+     * that the aggregate can go ACTIVE from one family alone in BOTH directions, that
+     * a family which was never brought up is the identity of the aggregate (so the
+     * v4-only numbers every existing test pins do not move), and that `ext_port` stays
+     * the v4 grant while `ext_port6` stays the v6 one — an aggregate that is ACTIVE
+     * because of v6 must not put a v4 port in the JSON, and the other way round.
+     *
+     * Read through the real publishing path (stats_refresh → the double buffer →
+     * snapshot), the same one ntx_main's --stats-json and the status line consume. */
+    {
+        /* U1. v6 ACTIVE while v4 has no route at all: the aggregate is ACTIVE on the
+         * strength of v6 alone, and `ext_port` (a v4 field) stays 0 — there is no v4
+         * grant to report, and adv_port is still the listen port. */
+        char nov4[256];
+        snprintf(nov4, sizeof nov4, "%s/u1_no_v4", SCRATCH);
+        wr(nov4, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+                 "wlP9s9\t0101A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n");
+        sess x;
+        sess_open(&x, "u1");
+        x.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, nov4);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&x);
+        uint16_t lp = ntx_netx_port(x.n);
+        pcp_grant6(&x, NTX_PCP_PROTO_TCP, lp, V6_EXT_GLOBAL, 7200);
+        ntx_stats st;
+        sess_stats(&x, &st);
+        ck_eq((long)st.port_map, NTX_PM_ACTIVE, "U1_aggregate_active_from_v6_alone");
+        ck_eq(st.ext_port, 0, "U1_ext_port_stays_v4s_own");
+        ck_eq((long)st.port_map6, NTX_PM_ACTIVE, "U1_port_map6_active");
+        ck_eq(st.ext_port6, lp, "U1_ext_port6_is_the_grant");
+        ck_eq(ntx_session_adv_port(x.s), lp, "U1_adv_port_still_listen");
+        ck_eq((long)ntx_session_portmap_state(x.s), NTX_PM_NONE, "U1_v4_itself_is_none");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        gw_drain();
+        gw6_drain();
+
+        /* U2. the reverse: v4 ACTIVE (a foreign external port, which is legal for v4)
+         * while the v6 gateway refused. ACTIVE from v4 alone, and the v6 fields say
+         * `none` / 0 rather than borrowing anything. */
+        sess y;
+        sess_open(&y, "u2");
+        y.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&y);
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pcp_grant(&y, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        uint8_t req[2048], err[24];
+        ck(pcp6_next_req(&y, NTX_PCP_PROTO_TCP, req), "U2_v6_query_out");
+        pcp_err24(err, PCP_RES_NOT_AUTHORIZED, 0);
+        gw6_answer(err, sizeof err);
+        pump_ms(y.n, 40);
+        pm_tick(&y);
+        sess_stats(&y, &st);
+        ck_eq((long)st.port_map, NTX_PM_ACTIVE, "U2_aggregate_active_from_v4_alone");
+        ck_eq(st.ext_port, EXT_PORT, "U2_ext_port_is_the_v4_grant");
+        ck_eq((long)st.port_map6, NTX_PM_NONE, "U2_port_map6_none");
+        ck_eq(st.ext_port6, 0, "U2_no_ext_port6_without_a_grant");
+        ck_eq(ntx_session_adv_port(y.s), EXT_PORT, "U2_adv_port_is_the_v4_grant");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(y.s);
+        sess_close(&y);
+        gw_drain();
+        gw6_drain();
+
+        /* U3. both ACTIVE at once: the aggregate is ACTIVE, and each family keeps its
+         * OWN port — v4's grant is a foreign port, v6's is by rule the listen port. */
+        sess z;
+        sess_open(&z, "u3");
+        z.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&z);
+        lp = ntx_netx_port(z.n);
+        pcp_grant6(&z, NTX_PCP_PROTO_TCP, lp, V6_EXT_GLOBAL, 7200);
+        pcp_grant(&z, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        sess_stats(&z, &st);
+        ck_eq((long)st.port_map, NTX_PM_ACTIVE, "U3_aggregate_active");
+        ck_eq(st.ext_port, EXT_PORT, "U3_ext_port_v4");
+        ck_eq((long)st.port_map6, NTX_PM_ACTIVE, "U3_port_map6_active");
+        ck_eq(st.ext_port6, lp, "U3_ext_port6_v6");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(z.s);
+        sess_close(&z);
+        gw_drain();
+        gw6_drain();
+
+        /* U4. the v4-only case every pre-S17d test pins: no v6 default route, so the v6
+         * half was never brought up (OFF) and the aggregate is the v4 state verbatim —
+         * OFF is the identity of the merge, not a state that dilutes it. */
+        sess v;
+        sess_open(&v, "u4");
+        v.cfg.port_map = 1;
+        write_route6(V6_LO_BLACKHOLE, v4path);
+        pm_start(&v);
+        sess_stats(&v, &st);
+        ck_eq((long)st.port_map, NTX_PM_PENDING, "U4_v4_only_aggregate_is_v4");
+        ck_eq((long)st.port_map6, NTX_PM_OFF, "U4_port_map6_off_without_a_v6_route");
+        ck_eq(st.ext_port6, 0, "U4_ext_port6_zero");
+        ntx_session_portmap_stop(v.s);
+        sess_close(&v);
+        gw_drain();
+        gw6_drain();
+
+        /* U5. v4 CGNAT while v6 refused: nothing is reachable, so the aggregate keeps
+         * the most informative refusal — `cgnat` beats `none`. The v6 half can never
+         * reach 4 by itself (RFC 6886 has no IPv6, so there is no external-address
+         * query to reveal a CGNAT), which is what U9 pins. */
+        sess w;
+        sess_open(&w, "u5");
+        w.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&w);
+        uint8_t rsp[64], cgn[16];
+        pcp_v4(cgn, 100, 64, 1, 1);
+        ck_eq(gw_wait(req, sizeof req, 400), 60, "U5_v4_request");
+        pcp_resp(rsp, req, EXT_PORT, cgn, 7200, 7);
+        gw_send(rsp, 60);
+        pump_ms(w.n, 40);
+        pm_tick(&w);
+        ck(pcp6_next_req(&w, NTX_PCP_PROTO_TCP, req), "U5_v6_query_out");
+        pcp_err24(err, PCP_RES_NOT_AUTHORIZED, 0);
+        gw6_answer(err, sizeof err);
+        pump_ms(w.n, 40);
+        pm_tick(&w);
+        sess_stats(&w, &st);
+        ck_eq((long)st.port_map, NTX_PM_CGNAT, "U5_cgnat_beats_none");
+        ck_eq(st.ext_port, 0, "U5_no_ext_port_on_cgnat");
+        ck_eq((long)st.port_map6, NTX_PM_NONE, "U5_port_map6_none");
+        ck_eq(st.ext_port6, 0, "U5_no_ext_port6_on_refusal");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(w.s);
+        sess_close(&w);
+        gw_drain();
+        gw6_drain();
+
+        /* U6. v4 CGNAT but v6 ACTIVE: the operator IS reachable over v6, so ACTIVE
+         * outranks the CGNAT diagnosis — and `port_map6` still says which family it
+         * came from, which is the whole reason the per-family field exists. */
+        sess u;
+        sess_open(&u, "u6");
+        u.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&u);
+        lp = ntx_netx_port(u.n);
+        ck_eq(gw_wait(req, sizeof req, 400), 60, "U6_v4_request");
+        pcp_resp(rsp, req, EXT_PORT, cgn, 7200, 7);
+        gw_send(rsp, 60);
+        pump_ms(u.n, 40);
+        pm_tick(&u);
+        pcp_grant6(&u, NTX_PCP_PROTO_TCP, lp, V6_EXT_GLOBAL, 7200);
+        sess_stats(&u, &st);
+        ck_eq((long)st.port_map, NTX_PM_ACTIVE, "U6_active_beats_cgnat");
+        ck_eq((long)st.port_map6, NTX_PM_ACTIVE, "U6_port_map6_names_the_family");
+        ck_eq(st.ext_port6, lp, "U6_ext_port6_is_the_grant");
+        ck_eq(st.ext_port, 0, "U6_ext_port_not_borrowed_from_v6");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(u.s);
+        sess_close(&u);
+        gw_drain();
+        gw6_drain();
+
+        /* U7. neither family brought up: a public next hop for v4 (§8: no NAT to
+         * traverse) and no v6 default at all — every field 0, and no datagram either. */
+        sess q;
+        sess_open(&q, "u7");
+        q.cfg.port_map = 1;
+        write_routes(GW_PUB);                      /* v4: public next hop, no NAT to traverse */
+        write_route6(V6_LO_BLACKHOLE, v4path);     /* v6: nothing but networkd's blackhole */
+        pm_start(&q);
+        pump_ms(q.n, 20);
+        sess_stats(&q, &st);
+        ck_eq((long)st.port_map, NTX_PM_OFF, "U7_public_address_no_mapping");
+        ck_eq((long)st.port_map6, NTX_PM_OFF, "U7_port_map6_off");
+        ck_eq(st.ext_port, 0, "U7_ext_port_zero");
+        ck_eq(st.ext_port6, 0, "U7_ext_port6_zero");
+        ck(!gw_pending() && !gw6_pending(), "U7_nothing_on_either_wire");
+        sess_close(&q);
+        gw_drain();
+        gw6_drain();
+
+        /* U8. --proxy / --tunnel: neither family is asked, so the stats say OFF and not
+         * a verdict of `none` the driver never reached (§5). */
+        sess p;
+        sess_open_pm(&p, "u8", 1, 1);
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&p);
+        pump_ms(p.n, 20);
+        sess_stats(&p, &st);
+        ck_eq((long)st.port_map, NTX_PM_OFF, "U8_off_under_proxy");
+        ck_eq((long)st.port_map6, NTX_PM_OFF, "U8_port_map6_off_under_proxy");
+        ck_eq(st.ext_port, 0, "U8_ext_port_zero_under_proxy");
+        ck_eq(st.ext_port6, 0, "U8_ext_port6_zero_under_proxy");
+        ntx_portmap_test_set_client6(NULL);
+        sess_close(&p);
+
+        sess_open(&p, "u8b");
+        p.cfg.port_map = 1;
+        p.cfg.tunnel = 1;
+        p.cfg.tunnel_host = "127.0.0.1";
+        p.cfg.tunnel_port = 4444;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&p);
+        pump_ms(p.n, 20);
+        sess_stats(&p, &st);
+        ck_eq((long)st.port_map, NTX_PM_OFF, "U8_off_under_tunnel");
+        ck_eq((long)st.port_map6, NTX_PM_OFF, "U8_port_map6_off_under_tunnel");
+        ntx_portmap_test_set_client6(NULL);
+        sess_close(&p);
+        gw_drain();
+        gw6_drain();
+
+        /* U9. a family still asking is PENDING on its own and in the aggregate, and
+         * `ext_port6` is 0 until a grant exists. Also the ceiling of the enum: the v6
+         * half has no CGNAT to reach, so 4 never appears in port_map6. */
+        sess o;
+        sess_open(&o, "u9");
+        o.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, nov4); /* v6 route, no v4 route at all */
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&o);
+        pump_ms(o.n, 20);
+        sess_stats(&o, &st);
+        ck_eq((long)st.port_map, NTX_PM_PENDING, "U9_pending_aggregates");
+        ck_eq((long)st.port_map6, NTX_PM_PENDING, "U9_port_map6_pending");
+        ck_eq(st.ext_port6, 0, "U9_no_ext_port6_before_the_grant");
+        ck_eq(st.ext_port, 0, "U9_no_ext_port_without_a_v4");
+        ck_eq(pm6_state6(&o) == NTX_PM_CGNAT ? 1 : 0, 0, "U9_v6_has_no_cgnat_state");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(o.s);
+        sess_close(&o);
         gw_drain();
         gw6_drain();
     }

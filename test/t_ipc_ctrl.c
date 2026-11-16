@@ -761,6 +761,73 @@ int main(void) {
         }
         if (ok("c3_stats_fields")) return 1;
 
+        /* S17d / R15: the IPv6 mapping keys. The aggregate and the two per-family
+           fields must come out exactly as the session published them — the JSON is the
+           operator's only view of WHICH family is mapped once the aggregate says only
+           "reachable" — and every line stays strictly parseable (§10 no-space rule
+           included, which ipc_ok_local plus the substring pins). */
+        {
+            ntx_stats st;
+            char js[4096];
+
+            /* both families ACTIVE, each with its own port */
+            memset(&st, 0, sizeof st);
+            st.n = 1;
+            st.port_map = NTX_PM_ACTIVE; st.ext_port = 40123;
+            st.port_map6 = NTX_PM_ACTIVE; st.ext_port6 = 6881;
+            st.t[0].slot = 0;
+            if (ntx_stats_to_json(&st, js, sizeof js) <= 0) return fail("s17d_stats_fit");
+            if (!strstr(js, "\"port_map\":2,\"ext_port\":40123,\"port_map6\":2,\"ext_port6\":6881"))
+                return fail("s17d_stats_both");
+            if (!ipc_ok_local(js)) return fail("s17d_stats_both_parseable");
+
+            /* ACTIVE from v6 alone: the aggregate is 2 while the v4-only field is 0 —
+             * the pair is what keeps the line honest about which family granted. */
+            memset(&st, 0, sizeof st);
+            st.n = 1;
+            st.port_map = NTX_PM_ACTIVE; st.ext_port = 0;
+            st.port_map6 = NTX_PM_ACTIVE; st.ext_port6 = 6881;
+            st.t[0].slot = 0;
+            if (ntx_stats_to_json(&st, js, sizeof js) <= 0) return fail("s17d_stats_fit2");
+            if (!strstr(js, "\"port_map\":2,\"ext_port\":0,\"port_map6\":2,\"ext_port6\":6881"))
+                return fail("s17d_stats_v6_only");
+            if (!ipc_ok_local(js)) return fail("s17d_stats_v6_only_parseable");
+
+            /* v4 ACTIVE, v6 settled at none, and nothing brought up at all: the two
+             * new keys are present in every state (never omitted), 0 when unused. */
+            memset(&st, 0, sizeof st);
+            st.n = 1;
+            st.port_map = NTX_PM_ACTIVE; st.ext_port = 40123;
+            st.port_map6 = NTX_PM_NONE; st.ext_port6 = 0;
+            st.t[0].slot = 0;
+            if (ntx_stats_to_json(&st, js, sizeof js) <= 0) return fail("s17d_stats_fit3");
+            if (!strstr(js, "\"port_map\":2,\"ext_port\":40123,\"port_map6\":3,\"ext_port6\":0"))
+                return fail("s17d_stats_v4_only");
+            memset(&st, 0, sizeof st);
+            st.n = 1;
+            st.t[0].slot = 0;
+            if (ntx_stats_to_json(&st, js, sizeof js) <= 0) return fail("s17d_stats_fit4");
+            if (!strstr(js, "\"port_map\":0,\"ext_port\":0,\"port_map6\":0,\"ext_port6\":0"))
+                return fail("s17d_stats_off");
+            if (!ipc_ok_local(js)) return fail("s17d_stats_off_parseable");
+
+            /* the worst-case header still fits the reserve with the two extra keys:
+             * every field at its widest, no truncation and honest n. The v6 `4` here is a
+             * width probe only — ntx_session_stats_refresh can never publish it (NAT-PMP
+             * has no IPv6, so no CGNAT verdict exists for that family). */
+            memset(&st, 0, sizeof st);
+            st.n = 1;
+            st.port_map = NTX_PM_CGNAT; st.ext_port = 65535;
+            st.port_map6 = NTX_PM_CGNAT; st.ext_port6 = 65535;
+            st.t[0].slot = 0;
+            if (ntx_stats_to_json(&st, js, sizeof js) <= 0) return fail("s17d_stats_fit5");
+            if (!strstr(js, "\"port_map\":4,\"ext_port\":65535,\"port_map6\":4,\"ext_port6\":65535"))
+                return fail("s17d_stats_widest");
+            if (strstr(js, "\"truncated\":1")) return fail("s17d_stats_header_reserve");
+            if (!ipc_ok_local(js)) return fail("s17d_stats_widest_parseable");
+        }
+        if (ok("s17d_stats_v6_fields")) return 1;
+
         /* §11 share event lines: the ready shape with the §11.1 escaping, and the
            failure shape whose code comes from ntx_share_err_code */
         {

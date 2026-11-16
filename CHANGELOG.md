@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+### Features
+- **PCP port mapping works over IPv6.** The v6 default is now read from `/proc/net/ipv6_route`
+  in the kernel's own layout (`dst dpl src spl nexthop metric refcnt use flags iface`, with
+  `RTF_UP` and `RTF_GATEWAY` required, `RTF_REJECT` refused and a metric below `ffffffff`), and a
+  `MAP` sequence of its own runs against that nexthop on port 5351: its own `AF_INET6`
+  `IPV6_V6ONLY` socket, `connect()`ed — with `sin6_scope_id` from the route's interface for a
+  link-local nexthop — its own nonce, grants, renewal clock, deferred retry and RFC 6887 §8.5
+  Epoch check. The client address in the request is the socket's own address from `getsockname`;
+  a host with nothing but a loopback, link-local or unique-local address skips the family instead
+  of asking the router to open a port toward an address nothing outside can reach. TCP is mapped,
+  and UDP with `--utp`, on the listen port. Because an announce carries one port and that decision
+  stays IPv4's, a v6 grant is only kept while it forwards the listen port **unchanged** — anything
+  else is a firewall opening the swarm can never be told about, so it is deleted with its own
+  nonce and reported under `--verbose`. There is no NAT-PMP fallback after IPv6 (RFC 6886 is
+  IPv4-only), so an `UNSUPP_VERSION` or an ICMP error there is simply a refusal, and none of it
+  reaches the v4 sequence: the two families share rules and helpers, not state.
+  `docs/network.md` [IPv6 (R15)](docs/network.md#ipv6-r15), `SECURITY.md`.
+- **The IPv6 mapping is visible.** Stats gained `port_map6` (the same `0`–`4` scale) and
+  `ext_port6`, and the status line a `map6:<port>` tag shown only while the v6 mapping is active.
+  `port_map` is now the **aggregate** of the two families: `active` when either holds a mapping —
+  a share reachable over v6 alone *is* reachable — otherwise the most informative refusal, in the
+  order `cgnat` > `pending` > `none`, with `off` as the identity so a v4-only host reads exactly
+  the value it read before. `ext_port` and `ext_port6` never borrow from each other, so
+  `"ext_port":0,"ext_port6":6881` is a v6-only host and `map- map6:6881` its status line.
+  `docs/json-api.md`, `docs/cli.md`.
+
+### Fixed
+- **`/proc/net/ipv6_route` was parsed against a line no kernel writes.** The reader expected
+  another field order and only accepted a `::ffff:a.b.c.d` nexthop, which Linux never prints, so
+  the v6 default of a dual-stack host was never found and PCP silently stayed IPv4-only — against
+  design §8, which asks for both families. The parser follows the kernel format now and the test
+  fixture is a real `cat /proc/net/ipv6_route`, including the `lo` blackhole line (`metric
+  ffffffff`, `RTF_REJECT`) that a `dst`-and-`dpl`-only check would have accepted.
+
 ## 0.1.5 - 2026-11-13
 
 ### Features

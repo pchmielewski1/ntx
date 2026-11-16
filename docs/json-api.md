@@ -88,7 +88,7 @@ then the `torrents` array. Example (one line, wrapped here for readability):
  "doh":"Q9","doh_busy":0,"doh_ok":3,"doh_fail":0,"doh_mitm":0,
  "hash_req_tx":0,"hash_req_rx_ok":0,"hash_rej":0,
  "utp":1,"utp_conns":7,"utp_v6":0,"demux_dht":1200,"demux_utp":5400,"demux_drop":0,
- "punch_ok":1,"punch_fail":0,"port_map":2,"ext_port":49321,"n":1,"torrents":[{"i":0,"ih":"0112233445566778899aabbccddeef0011223344",
+ "punch_ok":1,"punch_fail":0,"port_map":2,"ext_port":49321,"port_map6":2,"ext_port6":6881,"n":1,"torrents":[{"i":0,"ih":"0112233445566778899aabbccddeef0011223344",
  "name":"ubuntu-24.04.iso","state":1,"phase":"dl","pct":21,"spd_d":8500000,"spd_u":131072,
  "eta_s":192,"done":215,"total":934,"partial":12,"peers":55,"trk_total":18,"trk_pend":0,
  "trk_udp_ok":9,"trk_dead":0,"peers_all":60,"peers_hs":5,"peers_ok":55,"peers_unchoked":12,
@@ -124,8 +124,10 @@ All values are non-negative integers unless a type is given. Byte totals, `uptim
 | `utp_v6` | int | `1` if the IPv6 uTP socket is bound or a uTP connection over IPv6 exists. |
 | `demux_dht`, `demux_utp`, `demux_drop` | int | Datagrams on the shared UDP socket routed to the DHT, to uTP, or matching neither. See [network.md](network.md). |
 | `punch_ok`, `punch_fail` | int | BEP 55 holepunch dials started / refused before starting (duplicate, limits, no route). |
-| `port_map` | int | NAT-PMP/PCP port-mapping state of the session: `0` `off`, `1` `pending` (a request is out, no answer yet), `2` `active` (the gateway mapped the port), `3` `none` (no gateway answered, or mapping is unsupported), `4` `cgnat` (the external address is in `100.64.0.0/10`, so inbound will not work). See [network.md](network.md#nat-pmp-and-pcp-port-mapping). |
-| `ext_port` | int | The external port the gateway mapped. Non-zero only when `port_map` is `2`; `0` in every other state. |
+| `port_map` | int | **Aggregate** NAT-PMP/PCP port-mapping state of the session over both address families: `0` `off`, `1` `pending` (a request is out, no answer yet), `2` `active` (a gateway mapped the port — over either family), `3` `none` (no gateway answered, or mapping is unsupported), `4` `cgnat` (the external address is in `100.64.0.0/10`, so inbound will not work). Aggregation rule: `2` if **either** family is `2` (a share reachable over v6 alone *is* reachable, so `none` from the other family must not hide it); otherwise the most informative refusal wins in the order `4` > `1` > `3`; `0` is the identity, so a family the driver never brought up (no route, `--no-port-map`, `--proxy`) contributes nothing and a v4-only host reads exactly the value it read before the v6 mapping existed. See [network.md](network.md#nat-pmp-and-pcp-port-mapping). |
+| `ext_port` | int | The external port the **IPv4** gateway mapped. Non-zero only when the v4 family is `2` (whatever the aggregate says); `0` in every other state. |
+| `port_map6` | int | State of the **IPv6** family alone, on the same `0`–`4` scale as `port_map`. Only `0`, `1`, `2` and `3` occur: NAT-PMP has no IPv6 (RFC 6886 is IPv4-only), so there is no external-address query to reveal a CGNAT and `4` is unreachable for this family. |
+| `ext_port6` | int | The external port the **IPv6** gateway granted. Non-zero only when `port_map6` is `2`; `0` in every other state. By the grant-port rule it always equals the listen port — a v6 gateway granting any other port is refused — and it is never borrowed from `ext_port`, so a v6-only host shows `"ext_port":0,"ext_port6":6881`. |
 | `n` | int | Number of objects actually present in `torrents`. |
 | `torrents` | array | One object per live torrent (below). |
 | `truncated` | int | Present, with value `1`, only when some torrents did not fit into the output buffer; absent otherwise. |

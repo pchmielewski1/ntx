@@ -18,6 +18,25 @@ static int stats_trk_pending(const ntx_session *s, int tts_idx) {
     return n;
 }
 
+/* S17d · the aggregation rule for the reported `port_map` (design §8, docs/network.md).
+ * The two families are driven separately and each holds its own verdict, so the single
+ * number the operator sees says "is inbound reachable through ANY family", and the two
+ * per-family fields say which. ACTIVE wins because it is the only state that means a
+ * mapping exists: v6 ACTIVE with v4 NONE is a share that IS reachable from the v6
+ * internet, and reporting `none` there would be a lie in the other direction. With no
+ * family active, the most informative refusal wins — a CGNAT diagnosis (inbound will
+ * not work, once per process) outranks a schedule still running, which outranks a
+ * settled refusal. OFF is the identity: a family the driver never brought up (no route
+ * for it, mapping off, --proxy) contributes nothing, so a v4-only host reads exactly
+ * the value it read before S17d. */
+static ntx_pm_state stats_pm_merge(ntx_pm_state a, ntx_pm_state b) {
+    if (a == NTX_PM_ACTIVE || b == NTX_PM_ACTIVE) return NTX_PM_ACTIVE;
+    if (a == NTX_PM_CGNAT || b == NTX_PM_CGNAT) return NTX_PM_CGNAT;
+    if (a == NTX_PM_PENDING || b == NTX_PM_PENDING) return NTX_PM_PENDING;
+    if (a == NTX_PM_NONE || b == NTX_PM_NONE) return NTX_PM_NONE;
+    return NTX_PM_OFF;
+}
+
 static uint32_t stats_smooth5(uint32_t cur, const uint32_t ring[5]) {
     uint64_t sum = cur;
     for (int k = 0; k < 5; k++) sum += ring[k];
@@ -186,8 +205,14 @@ void ntx_session_stats_refresh(struct ntx_session *s, int rotate_ring) {
     ntx_netx_demux_stats(s->netx, &st->demux_dht, &st->demux_utp, &st->demux_drop);
     st->punch_ok = s->hp_dial_ok;
     st->punch_fail = s->hp_dial_fail;
-    st->port_map = (uint8_t)ntx_session_portmap_state(s);
-    st->ext_port = (st->port_map == NTX_PM_ACTIVE) ? ntx_session_adv_port(s) : 0;
+    st->port_map = (uint8_t)stats_pm_merge(ntx_session_portmap_state(s),
+                                           ntx_session_portmap_state6(s));
+    st->ext_port = (ntx_session_portmap_state(s) == NTX_PM_ACTIVE) ? ntx_session_adv_port(s) : 0;
+    /* S17d: the v6 family's own verdict and grant, next to the aggregate. ext_port6 is
+     * the listen port only while the v6 TCP grant is held (ntx_session_ext_port6), so it
+     * can never name a port the gateway refuses to forward. */
+    st->port_map6 = (uint8_t)ntx_session_portmap_state6(s);
+    st->ext_port6 = (st->port_map6 == NTX_PM_ACTIVE) ? ntx_session_ext_port6(s) : 0;
     int total_peers = 0, conn_peers = 0;
     for (int pi = 0; pi < NTX_SESSION_MAX_PEERS; pi++) {
         if (s->peers[pi].fd != -1) {

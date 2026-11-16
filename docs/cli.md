@@ -177,7 +177,7 @@ Without `--stats-json`, the status of the torrent is written to **stderr** about
   lands on a **tag boundary** — a tag is either printed whole or not at all, never torn in half — and the
   removed part is marked with ` ..`.
 - On a terminal, the tags that tell you a **share is not healthy** (`prv`, `shr`/`shr!`, `enc!`, `pin!N`,
-  `map…`, `inN`) are printed directly after the name column, *before* the counters, so a narrow terminal
+  `map…`/`map6…`, `inN`) are printed directly after the name column, *before* the counters, so a narrow terminal
   gives up `trk…`, `pe…`, `m…`, `dns…`, `utp…` and `punch…` first and never a warning (R17). Without a
   share, and in every non-terminal line, the tags keep the plain order of the table below.
 - When stderr is not a terminal, every refresh is a separate line ending in `\n` (about ten lines per second).
@@ -213,7 +213,8 @@ ntx: stopped — <name> (metadata not fetched, phase <phase>)
 ### Diagnostic tags
 
 Tags are appended in this order. Counters are capped at 99. The rows from `prv` to `inN` are the **safety
-block** of a share slot: on a terminal that block is printed directly after the name column, ahead of the
+block** of a share slot (which includes `map6:<port>`, printed directly after the aggregate `map:` tag):
+on a terminal that block is printed directly after the name column, ahead of the
 counter tags above, so a cut to the terminal width drops counters before it drops a warning (R17). The order
 inside the block is the order of the table and is the same in both positions; outside a share the block stays
 at the end of the list, exactly where the table puts it.
@@ -232,9 +233,10 @@ at the end of the list, exactly where the table puts it.
 | `shr` / `shr!` | This torrent is a `--share`. `shr!` replaces it once the shared file changed on disk and the share was stopped (design §10). |
 | `enc!` | Strict message-stream encryption is in force for this torrent: every peer connection must complete MSE/PE, plaintext peers are dropped without fallback. Set for shares. |
 | `pin!N` | `N` share tracker hosts whose SPKI pin check failed (possible man-in-the-middle, or the built-in keys are out of date — see [network.md](network.md#share-trackers-and-pinned-keys)). Capped at 99; absent when `N` is 0. |
-| `map:<port>` | Port mapping is `active` and the gateway handed back external port `<port>` (design §8). |
-| `map!cg` | The gateway mapped a CGNAT-range external address (`100.64.0.0/10`), so inbound connections are unlikely to work. |
-| `map-` | Port mapping is on but there is no usable external port yet: pending, unsupported by the gateway, or active with no port reported. |
+| `map:<port>` | The **aggregate** mapping of both families is `active` and the gateway handed back external port `<port>` (design §8). The port shown is always the **IPv4** grant — it is non-zero only while the v4 family holds one, so a host reachable over v6 alone reads `map-` here and names its port in `map6:` below. |
+| `map!cg` | The gateway mapped a CGNAT-range external address (`100.64.0.0/10`), so inbound connections are unlikely to work. Only the v4 half can produce it. |
+| `map-` | Port mapping is on but the aggregate has no usable external port yet: pending, unsupported by the gateway, or active with no port reported. |
+| `map6:<port>` | The **IPv6** family alone is `active` and the router forwards `<port>` — always the listen port, since a v6 gateway granting any other port is refused, which is what makes it announceable (design §8, [network.md](network.md#ipv6-r15)). Shown only in that state. `map:`, `map!cg` and `map-` describe the **aggregate** of both families, so `map- map6:6881` is a host reachable over v6 only and `map:40123 map6:6881` one reachable over both; there is no `map6-` or `map6!cg` — a v6 family that is off, pending or refused adds nothing, and NAT-PMP has no IPv6, so `cgnat` can never come from v6. |
 | `inN` | Only with `shr`: `N` inbound peers reached the share and completed a strict-encryption handshake. Capped at 99. |
 | `@phase` | Current phase (next table). |
 

@@ -30,7 +30,7 @@ static int ordered(const char *line, const char *const *tags, int n) {
 
 /* Which legacy tags ride along in front of the §10 tail, i.e. how far the line
  * overshoots the 176-char budget. Measured would-be lengths are in the table below. */
-typedef struct { int dns, utp, punch, dead, lpend; } maxload;
+typedef struct { int dns, utp, punch, dead, lpend, v6; } maxload;
 
 /* R17: the tty path of ntx_cli_status_update() is cli_status_tty() — budget cap
  * plus the cut to the terminal width. The width itself comes from
@@ -55,8 +55,8 @@ static int tag_whole(const char *line, const char *tag) {
  * checks below. A suffix that is a PROPER prefix of any of these means the cut
  * stopped inside a tag. */
 static const char *const r17_tags[] = {"prv", "shr", "shr!", "enc!", "pin!", "map:", "map!",
-                                       "map-", "in", "trk", "pe", "m", "dns", "dns..", "utp",
-                                       "punch", "Lpend", "v2", "hl"};
+                                       "map-", "map6:", "in", "trk", "pe", "m", "dns", "dns..",
+                                       "utp", "punch", "Lpend", "v2", "hl"};
 #define R17_NTAGS ((int)(sizeof r17_tags / sizeof r17_tags[0]))
 
 /* The last token of a trimmed line must not be a PROPER prefix of one of the
@@ -109,6 +109,10 @@ static void maxseed(ntx_stats *st, int tags, const maxload *l) {
     t->trk_pin_fail = t->in_ok = tags ? 65535 : 0;
     st->port_map = tags ? 2 : 0; /* NTX_PM_ACTIVE */
     st->ext_port = tags ? 65535 : 0;
+    /* S17d: map6:<port> at its own widest form, riding the same `tags` switch so the
+     * pre-S17d loads (v6 = 0) render byte-for-byte what they rendered before. */
+    st->port_map6 = (tags && l->v6) ? NTX_PM_ACTIVE : 0;
+    st->ext_port6 = (tags && l->v6) ? 65535 : 0;
     t->size = 1024ULL * 1024 * 1024;       /* 1.00G */
     t->down = 1024ULL * 1024 - 1;          /* 1024K */
     t->total = 934;
@@ -139,8 +143,9 @@ static void seed(ntx_stats *st, const char *name) {
 /* A seeding share with the alarm tags on — R17's case. 20-char name, every
  * informational tag active (trk/pe/dns/utp/punch), safety block in its alarm
  * form. Measured full length 164 columns, so 80/100/120 all have to cut.
- * cgnat = 1 swaps map:<port> for map!cg. */
-static void seedshare(ntx_stats *st, int cgnat) {
+ * cgnat = 1 swaps map:<port> for map!cg. v6 = 1 adds the IPv6 mapping, which rides
+ * its own map6:<port> tag (S17d) right behind the aggregate one. */
+static void seedshare(ntx_stats *st, int cgnat, int v6) {
     seed(st, "Q4.Report.2026.pdf");
     ntx_tts_stat *t = &st->t[0];
     t->state = NTX_TTS_DONE;
@@ -165,6 +170,10 @@ static void seedshare(ntx_stats *st, int cgnat) {
     snprintf(st->doh, sizeof st->doh, "!UC");
     st->port_map = cgnat ? NTX_PM_CGNAT : NTX_PM_ACTIVE;
     st->ext_port = cgnat ? 0 : 40123;
+    /* S17d. With v6 the family is ACTIVE on the listen port; without it the family was
+     * never brought up (OFF), which is the identity of the aggregate. */
+    st->port_map6 = v6 ? NTX_PM_ACTIVE : NTX_PM_OFF;
+    st->ext_port6 = v6 ? 6881 : 0;
 }
 
 int main(void) {
@@ -245,6 +254,67 @@ int main(void) {
     st.ext_port = 40123;
     if (ok("map_states")) return 1;
 
+    /* ── S17d: map6:<port> rides the IPv6 family ALONE ──
+     * The aggregate tag above answers "is inbound reachable at all"; this one names the
+     * v6 grant, which the aggregate cannot express (a v6-only host is ACTIVE with no v4
+     * ext port, so `map:` has nothing to show). It is emitted only for an ACTIVE v6
+     * family that has a port, exactly the rule map:<port> obeys. */
+    st.port_map = 0;
+    st.ext_port = 0;
+    st.port_map6 = NTX_PM_ACTIVE;
+    st.ext_port6 = 6881;
+    ntx_cli_status_format(&st, line, sizeof line);
+    if (!strstr(line, " map6:6881")) return fail("map6_active_rendered");
+    if (strstr(line, " map:") || strstr(line, "map!cg") || strstr(line, " map-"))
+        return fail("map6_active_no_aggregate_tag"); /* v6 alone must not fake a v4 tag */
+    {
+        const char *want6[] = {"prv", "shr", "enc!", "pin!2", "map6:6881", "in3"};
+        if (!ordered(line, want6, 6)) {
+            fprintf(stderr, "line: %s\n", line);
+            return fail("map6_order_without_map");
+        }
+    }
+    /* The documented position: behind the aggregate tag, ahead of inN. */
+    st.port_map = NTX_PM_ACTIVE;
+    st.ext_port = 40123;
+    ntx_cli_status_format(&st, line, sizeof line);
+    {
+        const char *want6[] = {"prv", "shr", "enc!", "pin!2", "map:40123", "map6:6881", "in3"};
+        if (!ordered(line, want6, 7)) {
+            fprintf(stderr, "line: %s\n", line);
+            return fail("map6_order_after_map");
+        }
+    }
+    if (ok("map6_order")) return 1;
+
+    /* Every other v6 state, and ACTIVE without a port, render nothing. */
+    {
+        static const int off_states[] = {NTX_PM_OFF, NTX_PM_PENDING, NTX_PM_NONE, NTX_PM_CGNAT};
+        for (unsigned i = 0; i < sizeof off_states / sizeof off_states[0]; i++) {
+            st.port_map = NTX_PM_ACTIVE; /* the aggregate is not what gates this tag */
+            st.ext_port = 40123;
+            st.port_map6 = (uint8_t)off_states[i];
+            st.ext_port6 = 6881;
+            ntx_cli_status_format(&st, line, sizeof line);
+            if (strstr(line, "map6")) {
+                fprintf(stderr, "state %d: [%s]\n", off_states[i], line);
+                return fail("map6_present_on_inactive_family");
+            }
+        }
+        /* ACTIVE but no port yet ⇒ nothing to show, and never "map6:0" — the same rule
+         * the map: tag pins above. */
+        st.port_map6 = NTX_PM_ACTIVE;
+        st.ext_port6 = 0;
+        ntx_cli_status_format(&st, line, sizeof line);
+        if (strstr(line, "map6")) return fail("map6_active_no_port");
+        if (strstr(line, "map6:0")) return fail("map6_zero_port");
+        st.port_map = 0;
+        st.ext_port = 0;
+        ntx_cli_status_format(&st, line, sizeof line);
+        if (strstr(line, "map")) return fail("map6_both_off_absent");
+        if (ok("map6_states")) return 1;
+    }
+
     /* ── negatives: no flags set ⇒ no tags, and no stray substrings ── */
     /* Name deliberately spells out tag-ish words ("Pin"/"Ingress"): a tag
      * emitted unconditionally must not hide behind the truncated name. */
@@ -299,7 +369,7 @@ int main(void) {
     /* ── (a) worst case that still FITS: all six §10 tags at their caps ──
      * Widest load that keeps them all — measured 176 chars, the budget exactly. */
     {
-        const maxload fits = {1, 0, 0, 1, 0};
+        const maxload fits = {1, 0, 0, 1, 0, 0};
         maxseed(&st, 1, &fits);
     }
     ntx_cli_status_format(&st, line, sizeof line);
@@ -334,9 +404,9 @@ int main(void) {
         /* The loads below would be 177, 178, 179, 183 and 199 chars long without
          * the cap (measured): the 177 one overshoots by a single char, so even a
          * cap that is one byte too generous is caught. */
-        static const maxload load[] = {{0, 0, 1, 0, 0}, {0, 1, 0, 0, 1},
-                                       {1, 0, 0, 0, 1}, {0, 0, 1, 0, 1},
-                                       {1, 1, 1, 1, 1}};
+        static const maxload load[] = {{0, 0, 1, 0, 0, 0}, {0, 1, 0, 0, 1, 0},
+                                       {1, 0, 0, 0, 1, 0}, {0, 0, 1, 0, 1, 0},
+                                       {1, 1, 1, 1, 1, 0}};
         for (unsigned c = 0; c < sizeof load / sizeof load[0]; c++) {
             maxseed(&st, 0, &load[c]);
             ntx_cli_status_format(&st, base, sizeof base);
@@ -442,14 +512,25 @@ int main(void) {
     {
         static const char *const safe_port[] = {"prv", "shr!", "enc!", "pin!3", "map:40123", "in2"};
         static const char *const safe_cgnat[] = {"prv", "shr!", "enc!", "pin!3", "map!cg", "in2"};
+        static const char *const safe_port6[] = {"prv", "shr!", "enc!", "pin!3", "map:40123",
+                                                 "map6:6881", "in2"};
+        static const char *const safe_cgnat6[] = {"prv", "shr!", "enc!", "pin!3", "map!cg",
+                                                  "map6:6881", "in2"};
         static const int widths[] = {80, 100, 120};
-        for (int v = 0; v < 2; v++) {
+        /* S17d: the v6 half of the sweep — map6:<port> belongs to the hoisted block, so
+         * it is a safety tag too and must survive the same cut, in the documented
+         * position (after the aggregate map tag, before inN). */
+        for (int v = 0; v < 4; v++) {
+            int cgnat = v & 1, v6 = v >> 1;
             for (int w = 0; w < 3; w++) {
                 int cols = widths[w];
-                const char *const *safe = v ? safe_cgnat : safe_port;
-                seedshare(&st, v);
+                const char *const *safe = v6 ? (cgnat ? safe_cgnat6 : safe_port6)
+                                             : (cgnat ? safe_cgnat : safe_port);
+                int nsafe = v6 ? 7 : 6;
+                seedshare(&st, cgnat, v6);
                 size_t n = render_at(&st, line, sizeof line, cols);
-                printf("  R17 %s @%-3d cols -> %2zu: [%s]\n", v ? "cgnat" : "port", cols, n, line);
+                printf("  R17 %s%s @%-3d cols -> %2zu: [%s]\n", cgnat ? "cgnat" : "port",
+                       v6 ? "+v6" : "", cols, n, line);
                 if ((int)n > cols) {
                     fprintf(stderr, "line: %s\n", line);
                     return fail("r17_within_width");
@@ -457,25 +538,25 @@ int main(void) {
                 /* The cut is marked: docs/cli.md promises the removed part is
                  * shown as " ..", so a line that was actually cut ends in dots. */
                 if (n < 2 || line[n - 1] != '.' || line[n - 2] != '.') {
-                    fprintf(stderr, "%s @%d cols: cut without ellipsis [%s]\n", v ? "cgnat" : "port",
-                            cols, line);
+                    fprintf(stderr, "%s @%d cols: cut without ellipsis [%s]\n",
+                            cgnat ? "cgnat" : "port", cols, line);
                     return fail("r17_ellipsis");
                 }
-                for (int i = 0; i < 6; i++) {
+                for (int i = 0; i < nsafe; i++) {
                     if (!strstr(line, safe[i])) {
-                        fprintf(stderr, "%s @%d cols: no \"%s\" in [%s]\n", v ? "cgnat" : "port",
-                                cols, safe[i], line);
+                        fprintf(stderr, "%s%s @%d cols: no \"%s\" in [%s]\n", cgnat ? "cgnat" : "port",
+                                v6 ? "+v6" : "", cols, safe[i], line);
                         return fail("r17_safety_tag_cut");
                     }
                     if (!tag_whole(line, safe[i])) {
-                        fprintf(stderr, "%s @%d cols: torn \"%s\" in [%s]\n", v ? "cgnat" : "port",
+                        fprintf(stderr, "%s @%d cols: torn \"%s\" in [%s]\n", cgnat ? "cgnat" : "port",
                                 cols, safe[i], line);
                         return fail("r17_safety_tag_torn");
                     }
                 }
                 /* the safety block must still be in the documented order, and it
                  * must sit ahead of the informational tags it used to trail */
-                if (!ordered(line, safe, 6)) {
+                if (!ordered(line, safe, nsafe)) {
                     fprintf(stderr, "line: %s\n", line);
                     return fail("r17_safety_order");
                 }
@@ -484,8 +565,8 @@ int main(void) {
                     fprintf(stderr, "line: %s\n", line);
                     return fail("r17_safety_after_info");
                 }
-                if (!no_torn_tag(line, safe, 6)) {
-                    fprintf(stderr, "%s @%d cols: torn suffix [%s]\n", v ? "cgnat" : "port", cols,
+                if (!no_torn_tag(line, safe, nsafe)) {
+                    fprintf(stderr, "%s @%d cols: torn suffix [%s]\n", cgnat ? "cgnat" : "port", cols,
                             line);
                     return fail("r17_torn_suffix");
                 }
@@ -495,24 +576,32 @@ int main(void) {
     }
 
     /* ── R17: the §10 block at its documented widest form still fits behind the
-     * name column at 80 columns — 20 (name) + 36 (the block) = 56. ── */
+     * name column at 80 columns — 20 (name) + 36 (the block) = 56. With the v6 tag
+     * (S17d) the block grows by " map6:65535" — 11 more, 67 columns, still inside
+     * every width the CLI is used at, which is what the second half pins. ── */
     {
         static const char *const caps[] = {"prv", "shr!", "enc!", "pin!99", "map:65535", "in99"};
-        const maxload wide = {1, 1, 1, 1, 1};
-        maxseed(&st, 1, &wide);
-        st.t[0].share = 2; /* the alarm form: shr! */
-        size_t n = render_at(&st, line, sizeof line, 80);
-        printf("  R17 widest block @80 -> %zu: [%s]\n", n, line);
-        if ((int)n > 80) return fail("r17_widest_width");
-        for (int i = 0; i < 6; i++)
-            if (!strstr(line, caps[i])) {
-                fprintf(stderr, "no \"%s\" in [%s]\n", caps[i], line);
-                return fail("r17_widest_tag_cut");
-            }
-        if (!ordered(line, caps, 6)) return fail("r17_widest_order");
-        const char *inf = strstr(line, "trk");
-        if (inf && strstr(line, "shr!") > inf) return fail("r17_widest_after_info");
-        if (!no_torn_tag(line, r17_tags, R17_NTAGS)) return fail("r17_widest_torn");
+        static const char *const caps6[] = {"prv", "shr!", "enc!", "pin!99", "map:65535",
+                                            "map6:65535", "in99"};
+        for (int v6 = 0; v6 < 2; v6++) {
+            const maxload wide = {1, 1, 1, 1, 1, v6};
+            maxseed(&st, 1, &wide);
+            st.t[0].share = 2; /* the alarm form: shr! */
+            size_t n = render_at(&st, line, sizeof line, 80);
+            printf("  R17 widest block%s @80 -> %zu: [%s]\n", v6 ? "+v6" : "", n, line);
+            if ((int)n > 80) return fail("r17_widest_width");
+            const char *const *caps_want = v6 ? caps6 : caps;
+            int ncaps = v6 ? 7 : 6;
+            for (int i = 0; i < ncaps; i++)
+                if (!strstr(line, caps_want[i])) {
+                    fprintf(stderr, "no \"%s\" in [%s]\n", caps_want[i], line);
+                    return fail("r17_widest_tag_cut");
+                }
+            if (!ordered(line, caps_want, ncaps)) return fail("r17_widest_order");
+            const char *inf = strstr(line, "trk");
+            if (inf && strstr(line, "shr!") > inf) return fail("r17_widest_after_info");
+            if (!no_torn_tag(line, r17_tags, R17_NTAGS)) return fail("r17_widest_torn");
+        }
         if (ok("r17_widest_block")) return 1;
     }
 
@@ -520,16 +609,17 @@ int main(void) {
      * off a tag boundary — swept, not sampled. ── */
     {
         for (int cols = 24; cols <= CLI_MAX_LINE + 30; cols++) {
-            for (int v = 0; v < 2; v++) {
-                seedshare(&st, v);
+            for (int v = 0; v < 4; v++) {
+                seedshare(&st, v & 1, v >> 1);
                 size_t n = render_at(&st, line, sizeof line, cols);
                 if ((int)n > cols) {
-                    fprintf(stderr, "cols %d %s: %zu [%s]\n", cols, v ? "cgnat" : "port", n, line);
+                    fprintf(stderr, "cols %d %s: %zu [%s]\n", cols, (v & 1) ? "cgnat" : "port", n,
+                            line);
                     return fail("r17_sweep_width");
                 }
                 if (n && line[n - 1] == ' ') return fail("r17_sweep_trailing_space");
                 if (!no_torn_tag(line, r17_tags, R17_NTAGS)) {
-                    fprintf(stderr, "cols %d: torn suffix [%s]\n", cols, line);
+                    fprintf(stderr, "cols %d v%d: torn suffix [%s]\n", cols, v, line);
                     return fail("r17_sweep_torn");
                 }
                 /* shr! is never half-present ("shr" without the '!') */
