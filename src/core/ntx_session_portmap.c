@@ -78,14 +78,59 @@ struct pm_gw6 {
     char iface[IF_NAMESIZE];
 };
 
+/* S17c · the v6 sequence, in full. Everything the v4 machine keeps at the top of
+ * struct ntx_portmap — the outstanding query and its retransmission schedule, the
+ * nonces, the grants and their renew/re-acquire clocks, the §8.5 Epoch baseline, the
+ * one deferred retry — has its own copy here, and NOTHING is read across:
+ * ntx_session_portmap.c's v4 arms touch pm->phase/pm->active/pm->epoch/... and the
+ * v6 arms below touch only s6.*, so a v6 gateway that refuses, answers late or never
+ * shows up cannot move one v4 timer, and a v4 refusal cannot end a v6 schedule.
+ * The two halves are deliberately NOT one array-of-two machine: the v4 fields are
+ * read by name from t_portmap.c and t_share_session.c (the pacing, R12/R13/R14
+ * probes), and folding them into a per-family struct would have meant renaming every
+ * one of those probes for no change in behaviour.
+ * PM_PH_ADDR has a slot here and is never used: the external-address query belongs
+ * to NAT-PMP, which RFC 6886 defines for IPv4 only, so the v6 half speaks PCP alone. */
+struct pm_seq6 {
+    int st;                   /* ntx_pm_state of the v6 half alone (see state6) */
+    int gave_up;              /* no more asking for this sequence */
+    int phase;                /* outstanding query (PM_PH_TCP/PM_PH_UDP), -1 = none */
+    int tries;
+    uint32_t gap;             /* un-jittered base of the next interval, ms */
+    uint64_t next_try;
+    uint8_t nonce[12];        /* of the outstanding query */
+    uint8_t proto;            /* of the outstanding MAP query */
+    uint16_t iport;           /* internal port of the outstanding MAP query */
+    uint8_t client_ip[16];    /* our address on the v6 route: the PCP client address */
+    uint8_t req[60];
+    size_t reqlen;
+    int active[PM_NPH];
+    int failed[PM_NPH];
+    uint16_t ext[PM_NPH];     /* == the listen port whenever active[] is set (the rule) */
+    uint64_t renew_at[PM_NPH];
+    uint64_t expire_at[PM_NPH];
+    uint64_t reacq_at[PM_NPH];
+    uint32_t reacq_gap[PM_NPH];
+    uint8_t grant_nonce[PM_NPH][12];
+    uint8_t grant_ip[PM_NPH][16];
+    int retry_ph;             /* the one deferred retry of this half, -1 = none */
+    uint64_t retry_at;
+    int retried;
+    uint32_t epoch;           /* §8.5 baseline of THIS family */
+    int epoch_seen;
+    uint64_t epoch_at;
+    int restarts;
+    int lost;                 /* §8.5 rollback: the tick owes this half one fresh query */
+};
+
 struct ntx_portmap {
     ntx_netx *netx;
     const ntx_config *cfg;
     int fd;                   /* UDP socket connected to gateway:5351, -1 = closed */
-    /* ---- S17b · the IPv6 half, and deliberately SEPARATE state.
+    /* ---- S17b · the IPv6 half's socket, and deliberately SEPARATE state.
      * Nothing here is read by the v4 sequence and no v4 field is written from the v6
      * path, so a v6 gateway that refuses, answers or never shows up cannot disturb the
-     * v4 timers, phases, retries or grants (S17c puts MAP requests on this socket,
+     * v4 timers, phases, retries or grants (S17c put its MAP requests on this socket,
      * S17d aggregates the stats). Kept next to `fd` rather than in its own struct
      * because the two halves share the one netx loop and the one route read.
      *   fd6           AF_INET6 UDP socket connected to gw6.addr:5351, -1 when v6 is
@@ -100,9 +145,10 @@ struct ntx_portmap {
      *                 refusal apart from an attempt the kernel refused).
      *   gw6_connected connect() took it, so the socket is registered and live.
      *   rx6_seen / rx6_ok  datagrams the v6 callback read, and the ones the source
-     *                 rule let through. Until S17c nothing consumes a v6 datagram, so
-     *                 without them the two rules (gateway address, gateway port) have
-     *                 no observable effect at all to test against.
+     *                 rule let through. S17c parses the accepted ones, so the two
+     *                 counters still say who was dropped and why nothing was: without
+     *                 them the two rules (gateway address, gateway port) would have no
+     *                 observable effect at all to test against.
      *   gw6_err      errno of the last thing the v6 half judged wrong: the kernel's
      *                 answer to connect(), or the SO_ERROR it reported later. The
      *                 reason a refusal happened, which nothing else on this socket
@@ -114,6 +160,11 @@ struct ntx_portmap {
     int gw6_err;
     uint32_t rx6_seen;
     uint32_t rx6_ok;
+    /* S17c · the v6 sequence itself: the whole per-family machine, read by no v4 arm
+     * and writing no v4 field. A sequence that never reached a verdict leaves `st` at
+     * OFF (no v6 route, or mapping refused outright); pm_open6 is what gives it a
+     * verdict of its own. ntx_session_portmap_state6() reports it. */
+    struct pm_seq6 s6;
     ntx_pm_state st;
     int want;                 /* mapping requested; the tick is what starts anything */
     int started;              /* the route was read and the socket opened */
@@ -173,6 +224,14 @@ static uint16_t pm_gw_port_cfg;
  * make "v4 gateway alive, v6 gateway gone" — the case that proves the halves are
  * independent — impossible to build. */
 static uint16_t pm_gw6_port_cfg;
+/* S17c: the client address a v6 sequence names, for the one case the sandbox cannot
+ * produce on its own. getsockname() of a socket connected to [::1] answers ::1 and
+ * there is no routable v6 address to bind a test socket to here (`ip -6 addr add` is
+ * EPERM, every non-loopback bind is EADDRNOTAVAIL — both probed), so the family-skip
+ * rule of §8 would have no test at all. NULL (production, and every other case) means
+ * "ask the kernel", which is the path the wire-level cases pin byte for byte. */
+static uint8_t pm_client6_cfg[16];
+static int pm_client6_set;
 static int pm_cgnat_warned;
 
 void ntx_portmap_test_set_route_files(const char *v4, const char *v6) {
@@ -183,6 +242,23 @@ void ntx_portmap_test_set_route_files(const char *v4, const char *v6) {
 void ntx_portmap_test_set_gateway_port(uint16_t port) { pm_gw_port_cfg = port; }
 
 void ntx_portmap_test_set_gateway6_port(uint16_t port) { pm_gw6_port_cfg = port; }
+
+/* S17c: name the address the v6 sequence treats as our own on the route. NULL (the
+ * production value) means "whatever getsockname() says", which is the rule the wire
+ * cases depend on; a case that needs a routable client — or wants to show that a
+ * non-routable one is refused — passes the 16 bytes instead, and pm6_is_global still
+ * judges them. Without this the sandbox could not reach the v6 sequence at all: the
+ * only address bindable here is ::1 (probed: EADDRNOTAVAIL for any global, EPERM for
+ * `ip -6 addr add`), so getsockname always answers loopback and §8 always skips. */
+void ntx_portmap_test_set_client6(const uint8_t *addr16) {
+    if (addr16) {
+        memcpy(pm_client6_cfg, addr16, 16);
+        pm_client6_set = 1;
+    } else {
+        pm_client6_set = 0;
+        memset(pm_client6_cfg, 0, sizeof pm_client6_cfg);
+    }
+}
 
 void ntx_portmap_test_advance_ms(uint64_t ms) { pm_voff += ms; }
 
@@ -371,6 +447,8 @@ static struct ntx_portmap *pm_alloc(struct ntx_session *s) {
     pm->fd6 = -1;
     pm->phase = -1;
     pm->retry_ph = -1;
+    pm->s6.phase = -1; /* 0 would read as PM_PH_ADDR, the query this half never sends */
+    pm->s6.retry_ph = -1;
     pm->netx = s->netx;
     pm->cfg = s->cfg;
     s->pm = pm;
@@ -442,6 +520,12 @@ static void pm_reset(struct ntx_portmap *pm, ntx_pm_state st) {
      * first one's socket read. */
     pm->rx6_seen = 0;
     pm->rx6_ok = 0;
+    /* S17c: the v6 machine is the sequence's too — its outstanding query, nonces,
+     * grants, Epoch baseline and deferred retry all die with the sequence, and OFF is
+     * the honest starting point (pm_open6 is what gives the half a verdict). */
+    memset(&pm->s6, 0, sizeof pm->s6);
+    pm->s6.phase = -1;
+    pm->s6.retry_ph = -1;
     pm->st = st;
 }
 
@@ -759,13 +843,17 @@ static int pm_src6_ok(const struct ntx_portmap *pm, const struct sockaddr_in6 *s
  * The plain `epoch < baseline` this driver used instead sees only a rollback, so a
  * gateway that came back with a bigger, absurd Epoch was taken as a healthy grant and
  * the stale port stayed advertised (R10). Whole seconds, as the RFC counts them. */
+static int pcp_epoch_restarts(uint32_t base, uint64_t base_at, uint32_t epoch) {
+    if (epoch < base) return 1;
+    uint64_t cd = (pm_now() - base_at) / 1000u;
+    if (cd > 0xffffffffu) cd = 0xffffffffu; /* asleep for 49 days: no usable expectation */
+    uint64_t sd = (uint64_t)(epoch - base);
+    return sd + 1u < cd - cd / 16u || sd > cd + cd / 16u + 1u;
+}
+
 static int pcp_epoch_restarted(const struct ntx_portmap *pm, uint32_t epoch) {
     if (!pm->epoch_seen) return 0;
-    if (epoch < pm->epoch) return 1;
-    uint64_t cd = (pm_now() - pm->epoch_at) / 1000u;
-    if (cd > 0xffffffffu) cd = 0xffffffffu; /* asleep for 49 days: no usable expectation */
-    uint64_t sd = (uint64_t)(epoch - pm->epoch);
-    return sd + 1u < cd - cd / 16u || sd > cd + cd / 16u + 1u;
+    return pcp_epoch_restarts(pm->epoch, pm->epoch_at, epoch);
 }
 
 static void pm_no_mapping(struct ntx_portmap *pm, int ph, const char *why) {
@@ -871,6 +959,349 @@ static void pm_rx(struct ntx_portmap *pm, const uint8_t *b, size_t n) {
     pm_grant(pm, ph, ext, life, NULL);
 }
 
+/* ---- S17c · the PCP MAP sequence of the v6 half ---------------------------
+ * The v4 machine above, copied only in its RULES and sharing every helper it can
+ * (pm_jitter, pm_cap_life, pm_result_retryable, pm_diag_result, pcp_build_map,
+ * pcp_parse_map, pcp_epoch_restarts, the PM_*_MS pacing constants). What it
+ * deliberately does NOT share is one byte of state, and it has no NAT-PMP branch:
+ * RFC 6886 is IPv4-only, so a v6 gateway that answers UNSUPP_VERSION has said no.
+ *
+ * The rule this half exists for (R15, design §8): over IPv6 PCP opens the firewall,
+ * it does not translate. A tracker announce carries ONE port — the one
+ * ntx_session_adv_port puts in the `port` field and in the BEP 10 `p` — and that
+ * decision stays v4's. So a v6 grant is only usable when the gateway forwards the
+ * listen port UNCHANGED; anything else is a mapping the swarm can never be told
+ * about, which makes it a hole in the firewall for nothing. Such a grant is deleted
+ * with the nonce it was made with (§11.1) and the family is settled for the run. */
+
+/* 1 for the address a v6 PCP request may name as its client: routable from outside.
+ * The loopback, unspecified, link-local (fe80::/10), unique-local (fc00::/7),
+ * multicast and reserved ranges all say no — the same judgement pm_is_global makes
+ * for the v4 side, where 127/8, 169.254/16 and the private/CGNAT ranges are refused.
+ * A request with one of those in the client field asks a router to open a port to an
+ * address that is not reachable from anywhere, so the family is skipped instead.
+ * ::ffff:a.b.c.d is refused too: a v4-mapped client address in a v6 request is the
+ * exact confusion R15 was about, and the socket is AF_INET6 with V6ONLY. */
+static int pm6_is_global(const uint8_t a[16]) {
+    static const uint8_t zeros10[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    if (!memcmp(a, zeros10, 10)) return 0;           /* ::, ::1, ::ffff:a.b.c.d */
+    if (a[0] == 0xfe && (a[1] & 0xc0) == 0x80) return 0; /* fe80::/10 link-local */
+    if (pcp_ip_is_cgnat_or_private(a)) return 0;     /* fc00::/7 ULA (+ v4 mapped) */
+    if (a[0] >= 0xff) return 0;                      /* multicast and reserved */
+    return 1;
+}
+
+/* The v6 half's own pacing: PCP for both families, so the IRT/MRT path of the v4
+ * schedule always applies and no NAT-PMP branch is reachable here. The four
+ * declarations below are what the mutual recursion of the schedule needs
+ * (send ↔ sock_err, query ↔ build, give_up ↔ refused/no_mapping/grant) without
+ * reordering the functions away from their v4 twins. */
+static int pm_drain_err6(struct ntx_portmap *pm);
+static void pm_sock_err6(struct ntx_portmap *pm, int err);
+static void pm_start_query6(struct ntx_portmap *pm, int phase, uint16_t sugg_port);
+static void pm_give_up_phase6(struct ntx_portmap *pm, int ph, int reask);
+
+static void pm_build6(struct ntx_portmap *pm, int phase, uint32_t lifetime, uint16_t sugg_port,
+                      const uint8_t sugg_ip16[16]) {
+    struct pm_seq6 *s6 = &pm->s6;
+    uint16_t lp = ntx_netx_port(pm->netx);
+    s6->iport = lp;
+    s6->phase = phase;
+    s6->proto = (uint8_t)(phase == PM_PH_UDP ? NTX_PCP_PROTO_UDP : NTX_PCP_PROTO_TCP);
+    s6->reqlen = pcp_build_map(s6->req, s6->client_ip, s6->nonce, s6->proto, lp, sugg_port, lifetime, sugg_ip16);
+}
+
+static void pm_send6(struct ntx_portmap *pm) {
+    struct pm_seq6 *s6 = &pm->s6;
+    if (pm->fd6 < 0 || s6->phase < 0) return;
+    (void)pm_drain_err6(pm); /* the ICMP of the last datagram must not be blamed on this one (R9) */
+    if (send(pm->fd6, s6->req, s6->reqlen, 0) < 0) {
+        pm_sock_err6(pm, errno ? errno : EIO);
+        return;
+    }
+    s6->tries++;
+    s6->next_try = pm_now() + pm_jitter(s6->gap);
+    s6->gap = s6->gap >= PM_PCP_MRT_MS / 2u ? PM_PCP_MRT_MS : s6->gap * 2u;
+}
+
+/* §8: the v6 half keeps the state the v4 half has no claim on. `st` at the top of the
+ * struct stays the v4 sequence's — ntx_session_portmap_state() and therefore the
+ * stats' `port_map` keep their v4 meaning until S17d aggregates the two. */
+static void pm_set_st6(struct ntx_portmap *pm, ntx_pm_state st) { pm->s6.st = (int)st; }
+
+/* The v6 verdict on a refusal the gateway stated (R14, §7.4): the schedule stops, and
+ * the retryable pair gets exactly one further attempt after the wait the reply names,
+ * never sooner than PM_RETRY_MIN_S. No NAT-PMP step — there is none to take. */
+static void pm_refused_result6(struct ntx_portmap *pm, int ph, uint32_t res, uint32_t life_s) {
+    struct pm_seq6 *s6 = &pm->s6;
+    s6->phase = -1;
+    s6->tries = 0;
+    pm_diag_result(PM_PCP, res);
+    pm_give_up_phase6(pm, ph, 0);
+    if (!pm_result_retryable(PM_PCP, res) || life_s == 0 || s6->retried) return;
+    uint64_t wait_s = life_s < PM_RETRY_MIN_S ? PM_RETRY_MIN_S : life_s;
+    s6->retry_ph = ph;
+    s6->retry_at = pm_now() + wait_s * 1000u;
+    s6->gave_up = 0; /* the tick is what sends the one deferred attempt */
+}
+
+static void pm_no_mapping6(struct ntx_portmap *pm, int ph, const char *why) {
+    struct pm_seq6 *s6 = &pm->s6;
+    s6->phase = -1;
+    s6->tries = 0;
+    ntx_diag("ntx: port map6: PCP %s\n", why);
+    pm_give_up_phase6(pm, ph, 0);
+}
+
+/* A SUCCESS whose Lifetime is 0 grants nothing (§11.1, RFC 6886 §3.3 alike): the
+ * refusal, not a re-request — the request loop of R10 came from treating it as one. */
+static void pm_zero_lifetime6(struct ntx_portmap *pm, int ph) { pm_no_mapping6(pm, ph, "granted lifetime 0"); }
+
+/* The one place a v6 grant nonce is recorded (R13), and the gate the R15 rule sits
+ * behind: the external port the gateway assigned MUST be the listen port, because
+ * `ntx_session_adv_port` advertises one port for both families and it is a v4
+ * decision. A gateway that hands out another port gets its mapping deleted with the
+ * nonce it just granted and the family is settled — a v6 hole in a firewall for a
+ * port no peer will ever be told to dial is worse than no mapping. */
+static void pm_grant6(struct ntx_portmap *pm, int ph, uint16_t ext_port, uint32_t life,
+                      const uint8_t ext_ip16[16]) {
+    struct pm_seq6 *s6 = &pm->s6;
+    uint16_t lp = ntx_netx_port(pm->netx);
+    s6->phase = -1;
+    s6->tries = 0;
+    if (ext_port != lp) {
+        uint8_t buf[60];
+        size_t n = pcp_build_map(buf, s6->client_ip, s6->nonce, s6->proto, lp, ext_port, 0, ext_ip16);
+        (void)pm_drain_err6(pm);
+        if (pm->fd6 >= 0) (void)send(pm->fd6, buf, n, 0); /* §11.1, fire-and-forget */
+        ntx_diag("ntx: port map6: gateway forwarded port %u, not the listen port %u — mapping removed\n",
+                 (unsigned)ext_port, (unsigned)lp);
+        pm_give_up_phase6(pm, ph, 0);
+        return;
+    }
+    s6->active[ph] = 1;
+    s6->failed[ph] = 0;
+    s6->reacq_gap[ph] = PM_REACQ_MS; /* R12: losing this one is worth asking about again */
+    s6->reacq_at[ph] = 0;
+    memcpy(s6->grant_nonce[ph], s6->nonce, sizeof s6->nonce);
+    if (ext_ip16) memcpy(s6->grant_ip[ph], ext_ip16, 16);
+    else memset(s6->grant_ip[ph], 0, 16);
+    s6->ext[ph] = ext_port;
+    s6->renew_at[ph] = pm_now() + (uint64_t)(life / 2) * 1000u;
+    s6->expire_at[ph] = pm_now() + (uint64_t)life * 1000u;
+    if (s6->active[PM_PH_TCP]) pm_set_st6(pm, NTX_PM_ACTIVE);
+}
+
+/* The gateway restarted as far as THIS family is concerned (§8.5): its grants are
+ * gone and the tick owes the half one fresh query. Nothing is sent from the receive
+ * path (R10). The v4 baseline, its grants and its `lost` flag are untouched. */
+static void pm_lost6(struct ntx_portmap *pm) {
+    struct pm_seq6 *s6 = &pm->s6;
+    for (int i = 0; i < PM_NPH; i++) {
+        s6->active[i] = 0;
+        s6->ext[i] = 0;
+        s6->renew_at[i] = 0;
+        s6->expire_at[i] = 0;
+        s6->reacq_at[i] = 0;
+        s6->reacq_gap[i] = 0;
+        s6->failed[i] = 0;
+    }
+    s6->gave_up = 0;
+    s6->retry_ph = -1;
+    s6->retried = 0;
+    s6->phase = -1;
+    s6->tries = 0;
+    s6->lost = 1;
+    pm_set_st6(pm, NTX_PM_PENDING);
+}
+
+/* Marking a v6 phase failed also cancels its R12 debt, exactly as pm_fail_phase does. */
+static void pm_fail_phase6(struct ntx_portmap *pm, int ph) {
+    pm->s6.failed[ph] = 1;
+    pm->s6.reacq_at[ph] = 0;
+    pm->s6.reacq_gap[ph] = 0;
+}
+
+/* The v6 sibling of pm_give_up_phase, with the same two shapes (a phase that HELD a
+ * mapping versus one that never got one) and the same rule that a lost TCP grant
+ * takes the state off ACTIVE. The UDP grant is never advertised anywhere, so a
+ * TCP verdict does not poison it and vice versa — except on a phase that never got a
+ * grant at all, where a gateway that will not map TCP will not map UDP either. */
+static void pm_give_up_phase6(struct ntx_portmap *pm, int ph, int reask) {
+    struct pm_seq6 *s6 = &pm->s6;
+    if (s6->active[ph] || s6->reacq_gap[ph] > 0) {
+        s6->active[ph] = 0;
+        s6->ext[ph] = 0;
+        s6->renew_at[ph] = 0;
+        s6->expire_at[ph] = 0;
+        s6->failed[ph] = 1;
+        if (reask && s6->reacq_gap[ph] > 0) {
+            s6->reacq_at[ph] = pm_now() + s6->reacq_gap[ph];
+            s6->reacq_gap[ph] = s6->reacq_gap[ph] * 2u > PM_REACQ_MAX_MS ? PM_REACQ_MAX_MS
+                                                                         : s6->reacq_gap[ph] * 2u;
+            s6->gave_up = 0;
+            pm_set_st6(pm, s6->active[PM_PH_TCP] ? NTX_PM_ACTIVE : NTX_PM_PENDING);
+        } else {
+            pm_fail_phase6(pm, ph);
+            if (!s6->active[PM_PH_TCP] && !s6->active[PM_PH_UDP]) {
+                pm_set_st6(pm, NTX_PM_NONE);
+                s6->gave_up = 1;
+            } else if (!s6->active[PM_PH_TCP]) {
+                pm_set_st6(pm, NTX_PM_PENDING);
+            }
+        }
+        return;
+    }
+    pm_fail_phase6(pm, ph);
+    if (ph != PM_PH_UDP) pm_fail_phase6(pm, PM_PH_UDP); /* as v4: UDP's verdict is UDP's */
+    if (!s6->active[PM_PH_TCP] && !s6->active[PM_PH_UDP]) {
+        pm_set_st6(pm, NTX_PM_NONE);
+        s6->gave_up = 1;
+    }
+}
+
+/* §11.1/§11.2, the v6 copy of pm_start_query: a renewal of a grant we hold repeats the
+ * grant's nonce and suggests the address that came with it; a fresh acquisition draws
+ * a new nonce and states no preference. `grant_nonce`/`grant_ip` are written only by
+ * pm_grant6 (R13). */
+static void pm_start_query6(struct ntx_portmap *pm, int phase, uint16_t sugg_port) {
+    struct pm_seq6 *s6 = &pm->s6;
+    if (phase < 0 || pm->fd6 < 0) return;
+    const uint8_t *sugg_ip = NULL;
+    s6->lost = 0;
+    if (s6->active[phase]) {
+        memcpy(s6->nonce, s6->grant_nonce[phase], sizeof s6->nonce);
+        sugg_ip = s6->grant_ip[phase];
+    } else {
+        ntx_rand_bytes(s6->nonce, sizeof s6->nonce);
+    }
+    s6->tries = 0;
+    s6->gap = PM_PCP_IRT_MS;
+    pm_build6(pm, phase, PM_LIFE_S, sugg_port, sugg_ip);
+    pm_send6(pm);
+}
+
+/* §11.1 at exit: one lifetime-0 datagram per live v6 mapping, with the nonce that
+ * grant was made with. Fire-and-forget like the v4 deletes — stop() runs inside the
+ * close budget. */
+static void pm_send_deletes6(struct ntx_portmap *pm) {
+    struct pm_seq6 *s6 = &pm->s6;
+    if (pm->fd6 < 0) return;
+    uint16_t lp = ntx_netx_port(pm->netx);
+    uint8_t buf[60];
+    for (int ph = PM_PH_TCP; ph < PM_NPH; ph++) {
+        if (!s6->active[ph]) continue;
+        uint8_t proto = (uint8_t)(ph == PM_PH_TCP ? NTX_PCP_PROTO_TCP : NTX_PCP_PROTO_UDP);
+        size_t n = pcp_build_map(buf, s6->client_ip, s6->grant_nonce[ph], proto, lp, s6->ext[ph], 0,
+                                 s6->grant_ip[ph]);
+        (void)pm_drain_err6(pm);
+        if (send(pm->fd6, buf, n, 0) < 0) break;
+    }
+}
+
+/* The v6 answer to the outstanding query. There is exactly one codec here (PCP), so
+ * a version mismatch is a refusal and not a fallback, and an all-private external
+ * address has no CGNAT meaning over IPv6 — the firewall opening the gateway claims
+ * to a non-routable address is the same useless thing the client-address rule refuses
+ * at the request, so the mapping is refused the way any other unusable grant is
+ * rather than tracked as the v4 sequence's one-off CGNAT diagnosis.
+ * ponytail: the ceiling is that such a grant reads as "no mapping" and not as the
+ * gateway misbehaving; the diag line names which. Upgrade path if a router is ever
+ * found doing this: one process-wide warning beside pm_warn_cgnat, not a new state. */
+static void pm_rx6(struct ntx_portmap *pm, const uint8_t *b, size_t n) {
+    struct pm_seq6 *s6 = &pm->s6;
+    int ph = s6->phase;
+    if (ph < 0) return; /* nothing outstanding: nothing to match an answer against */
+    ntx_pcp_map_resp r;
+    int rc = pcp_parse_map(b, n, s6->nonce, s6->proto, s6->iport, &r);
+    if (rc == 1) { /* NAT-PMP speaks only IPv4: this gateway has no v6 answer for us */
+        pm_no_mapping6(pm, ph, "gateway does not speak PCP");
+        return;
+    }
+    if (rc > 1) {
+        pm_refused_result6(pm, ph, (uint32_t)rc, r.lifetime);
+        return;
+    }
+    if (rc != 0) return; /* -1 garbage, -2 not an answer to our query */
+    if (s6->epoch_seen && pcp_epoch_restarts(s6->epoch, s6->epoch_at, r.epoch)) {
+        s6->epoch = r.epoch; /* the baseline moves first: this reply cannot detect it again (R10) */
+        s6->epoch_at = pm_now();
+        if ((uint32_t)++s6->restarts > PM_MAX_RESTARTS) {
+            pm_no_mapping6(pm, ph, "epoch never agrees with our clock");
+            return;
+        }
+        pm_lost6(pm);
+        return;
+    }
+    s6->restarts = 0;
+    s6->epoch_seen = 1;
+    s6->epoch = r.epoch;
+    s6->epoch_at = pm_now();
+    uint32_t life = pm_cap_life(r.lifetime);
+    if (life == 0) {
+        pm_zero_lifetime6(pm, ph);
+        return;
+    }
+    pm_grant6(pm, ph, r.ext_port, life, r.ext_ip16);
+}
+
+/* The whole v6 schedule, and the twin of the arms ntx_session_portmap_tick runs for
+ * v4: rollback, outstanding retransmission, the one deferred retry, renewals, the
+ * R12 re-acquisition, then the fresh acquisitions. Reached only while the v6 socket
+ * is up, and it reads and writes pm->s6 and pm->fd6 — nothing else. */
+static void pm_tick6(struct ntx_portmap *pm) {
+    struct pm_seq6 *s6 = &pm->s6;
+    if (pm->fd6 < 0) return;
+    uint64_t now = pm_now();
+    if (s6->lost) {
+        s6->lost = 0;
+        pm_start_query6(pm, PM_PH_TCP, ntx_netx_port(pm->netx));
+        return;
+    }
+    if (s6->phase >= 0) {
+        if (now < s6->next_try) return;
+        int ph = s6->phase;
+        if ((uint32_t)s6->tries >= PM_MAX_TRIES) {
+            s6->phase = -1;
+            pm_give_up_phase6(pm, ph, 1);
+            return;
+        }
+        pm_send6(pm);
+        return;
+    }
+    if (s6->gave_up) return;
+    if (s6->retry_ph >= 0) {
+        int ph = s6->retry_ph;
+        if (now >= s6->retry_at) {
+            s6->retry_ph = -1;
+            int first = !s6->retried;
+            s6->retried = 1;
+            s6->failed[ph] = 0;
+            s6->failed[PM_PH_UDP] = 0;
+            if (first && s6->st != NTX_PM_ACTIVE) pm_set_st6(pm, NTX_PM_PENDING);
+            pm_start_query6(pm, ph, s6->ext[ph]);
+            return;
+        }
+    }
+    for (int i = 0; i < PM_NPH; i++)
+        if (s6->active[i] && !s6->failed[i] && now >= s6->renew_at[i]) {
+            pm_start_query6(pm, i, s6->ext[i]); /* keep the granted port across renewals */
+            return;
+        }
+    for (int i = PM_PH_TCP; i < PM_NPH; i++)
+        if (s6->reacq_at[i] && now >= s6->reacq_at[i]) {
+            s6->reacq_at[i] = 0;
+            pm_start_query6(pm, i, ntx_netx_port(pm->netx));
+            return;
+        }
+    if (!s6->active[PM_PH_TCP] && !s6->failed[PM_PH_TCP]) {
+        pm_start_query6(pm, PM_PH_TCP, ntx_netx_port(pm->netx));
+        return;
+    }
+    if (pm_udp_wanted(pm) && !s6->active[PM_PH_UDP] && !s6->failed[PM_PH_UDP])
+        pm_start_query6(pm, PM_PH_UDP, ntx_netx_port(pm->netx));
+}
+
 static void pm_on_rw(int fd, void *ctx) {
     struct ntx_portmap *pm = (struct ntx_portmap *)ctx;
     for (int i = 0; i < PM_RX_BUDGET; i++) {
@@ -901,18 +1332,41 @@ static int pm_drain_err6(struct ntx_portmap *pm) {
 }
 
 /* The v6 socket's verdict on an error (R15/S17b, and the error rules of S08/S10).
- * Both branches end the v6 half of this sequence, and that is the whole treatment
- * while S17b sends nothing: there is no v6 phase to clear, no nonce to retire and
- * nothing to fall back to. They stay written apart because S17c gives them their
- * own arms — the refusal ends the v6 schedule quietly, a hard error must not even
- * be retried.
- * ponytail: the ceiling is that S17b cannot yet show a difference between them
- * beyond `gw6_err`; upgrade path is the v6 MAP schedule of S17c, which judges the
- * refusal the way pm_refused does minus the fallback step. */
+ * ECONNREFUSED is the ICMP port-unreachable of a router with no PCP responder;
+ * anything else is a socket that cannot send at all (EPIPE, ENOBUFS …). Both end the
+ * v6 half of this sequence, and unlike v4 there is nothing left to do about it: there
+ * is no NAT-PMP to step to (RFC 6886 is IPv4-only), the endpoint is the one connect()
+ * chose from the route, and nine retransmissions to a port that answers with ICMP buy
+ * nothing but the ICMP. So the sequence is settled here — NONE, quiet, with the
+ * grants dropped: a socket that is gone cannot renew what it holds, and a state that
+ * still said ACTIVE would claim a firewall opening the gateway is about to forget.
+ * The v4 half is not mentioned by a single line of this, which is the separation S17b
+ * pinned for the socket and S17c pins for the schedule. */
+static void pm_end_seq6(struct ntx_portmap *pm, ntx_pm_state st) {
+    struct pm_seq6 *s6 = &pm->s6;
+    s6->phase = -1;
+    s6->tries = 0;
+    s6->lost = 0;
+    s6->retry_ph = -1;
+    s6->retry_at = 0;
+    s6->gave_up = 1;
+    for (int i = 0; i < PM_NPH; i++) {
+        s6->active[i] = 0;
+        s6->failed[i] = 0;
+        s6->ext[i] = 0;
+        s6->renew_at[i] = 0;
+        s6->expire_at[i] = 0;
+        s6->reacq_at[i] = 0;
+        s6->reacq_gap[i] = 0;
+    }
+    pm_set_st6(pm, st);
+}
+
 static void pm_sock_err6(struct ntx_portmap *pm, int err) {
     if (pm->fd6 < 0) return;
     pm->gw6_err = err;
     pm_close_sock6(pm);
+    pm_end_seq6(pm, NTX_PM_NONE);
 }
 
 static void pm_on_rw6(int fd, void *ctx) {
@@ -924,11 +1378,14 @@ static void pm_on_rw6(int fd, void *ctx) {
         ssize_t n = recvfrom(fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
         if (n <= 0) return;
         pm->rx6_seen++;
-        /* S17b ends here: a datagram that passes the source rule is counted and
-         * dropped, because there is no v6 request outstanding for it to answer and
-         * no v6 parser yet. It must not reach pm_rx, which would read it as an
-         * answer to the v4 sequence's outstanding query. */
-        if (pm_src6_ok(pm, &from)) pm->rx6_ok++;
+        /* A datagram the source rule rejects is counted and dropped — and it must
+         * never reach pm_rx6, whose own match rules (nonce, proto, internal port) are
+         * weaker than "this came from the gateway" (§8 makes the source test the
+         * boundary). It must equally never reach pm_rx, the v4 parser, which would
+         * read it as an answer to the v4 sequence's outstanding query. */
+        if (!pm_src6_ok(pm, &from)) continue;
+        pm->rx6_ok++;
+        pm_rx6(pm, buf, (size_t)n);
     }
 }
 
@@ -943,11 +1400,19 @@ static void pm_on_err6(void *ctx) {
  * the interface it was learned on and so cannot be connected without a scope. */
 static int pm6_link_local(const uint8_t a[16]) { return a[0] == 0xfe && (a[1] & 0xc0) == 0x80; }
 
-/* Open and connect the v6 half. Called from pm_open once per sequence — like the
- * v4 socket, a v6 gateway this kernel refused is not asked again until the next
- * sequence. Nothing here reads or writes a v4 field, and every way out leaves the
- * v4 socket, its phase, its schedule and its grants exactly as they were.
- * Returns 1 when the socket is connected, 0 when v6 is off for this sequence. */
+/* Open and connect the v6 half, then take the PCP client address off the socket.
+ * Called from pm_open once per sequence — like the v4 socket, a v6 gateway this
+ * kernel refused is not asked again until the next sequence. Nothing here reads or
+ * writes a v4 field, and every way out leaves the v4 socket, its phase, its schedule
+ * and its grants exactly as they were.
+ *
+ * The client address of the request is the LOCAL address the kernel picked for the
+ * connect()ed socket (design §8 / RFC 6887 §7.1: the IP header's source is the
+ * client address), read with getsockname — not an address guessed from the route.
+ * It has to be a global one: a request naming a link-local or unique-local client
+ * asks the router to open a port toward an address nothing outside can reach, so the
+ * family is skipped with the state NONE rather than sent (§8).
+ * Returns 1 when the sequence is running, 0 when v6 is off for it. */
 static int pm_open6(struct ntx_portmap *pm) {
     /* Whoever calls this is starting a sequence, so anything the last one left is
      * dropped through the one path that unregisters AND closes — a bare `fd6 = -1`
@@ -963,17 +1428,24 @@ static int pm_open6(struct ntx_portmap *pm) {
     if (!pm->cfg || pm->cfg->proxy || pm->cfg->tunnel) return 0;
     if (!pm->gw6_seen) return 0; /* no usable ::/0 in /proc/net/ipv6_route */
     pm->gw6_tried = 1;
+    pm_set_st6(pm, NTX_PM_PENDING); /* from here on the v6 half has a verdict to give */
     if (pm6_link_local(pm->gw6.addr)) {
         unsigned idx = if_nametoindex(pm->gw6.iface);
         /* A link-local address with no resolvable interface is not a gateway this
          * socket can reach: without a scope the kernel has no way to pick a device
          * (and says EINVAL for the attempt), so v6 is skipped for this sequence
          * rather than connected to an address that means nothing. */
-        if (idx == 0) return 0;
+        if (idx == 0) {
+            pm_set_st6(pm, NTX_PM_NONE);
+            return 0;
+        }
         pm->gw6_scope = idx;
     }
     int fd = ntx_sock_udp6(); /* AF_INET6, non-blocking, IPV6_V6ONLY=1 */
-    if (fd < 0) return 0;
+    if (fd < 0) {
+        pm_set_st6(pm, NTX_PM_NONE);
+        return 0;
+    }
     struct sockaddr_in6 sa;
     memset(&sa, 0, sizeof sa);
     sa.sin6_family = AF_INET6;
@@ -983,8 +1455,33 @@ static int pm_open6(struct ntx_portmap *pm) {
     if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0) {
         pm->gw6_err = errno;
         close(fd);
+        pm_set_st6(pm, NTX_PM_NONE);
         return 0;
     }
+    /* The client address, straight from the kernel. getsockname failing or answering
+     * something the request could not name is a family we know nothing about, so it
+     * is skipped rather than mapped with a made-up address (the same reasoning as
+     * pm_open's abort on the v4 side, R23).
+     *
+     * A routable client address is the precondition of the whole sequence: naming a
+     * loopback, link-local or unique-local client asks the router to open a port
+     * toward an address nothing outside can reach, so the family is SKIPPED — state
+     * NONE, nothing ever sent (§8). The connected socket itself stays up: S17b pins
+     * the source rule on it, and a socket that only reads is no exposure.
+     * pm_client6_cfg is the test's stand-in for the address the kernel picks (see
+     * ntx_portmap_test_set_client6); production never sets it and always reads the
+     * socket, which is what makes the bytes in `client_ip` the getsockname answer. */
+    struct sockaddr_in6 me;
+    socklen_t ml = sizeof me;
+    memset(&me, 0, sizeof me);
+    int have_src = getsockname(fd, (struct sockaddr *)&me, &ml) == 0 && me.sin6_family == AF_INET6;
+    if (have_src) memcpy(pm->s6.client_ip, me.sin6_addr.s6_addr, 16);
+    if (pm_client6_set) {
+        memcpy(pm->s6.client_ip, pm_client6_cfg, 16);
+        have_src = 1;
+    }
+    int routable = have_src && pm6_is_global(pm->s6.client_ip);
+    if (!have_src) memset(pm->s6.client_ip, 0, 16); /* nothing to name at all */
     pm->fd6 = fd;
     pm->gw6_connected = 1;
     ntx_cbs cbs;
@@ -992,6 +1489,7 @@ static int pm_open6(struct ntx_portmap *pm) {
     cbs.r = pm_on_rw6;
     cbs.cl = pm_on_err6;
     ntx_netx_add(pm->netx, fd, EPOLLIN, pm, &cbs);
+    if (!routable) pm_end_seq6(pm, NTX_PM_NONE); /* §8: nothing routable to name */
     return 1;
 }
 
@@ -1078,6 +1576,9 @@ static int pm_open(struct ntx_portmap *pm) {
 
 static void pm_stop_now(struct ntx_portmap *pm) {
     if (pm->fd >= 0 && (pm->active[PM_PH_TCP] || pm->active[PM_PH_UDP])) pm_send_deletes(pm);
+    /* §11.1 for the v6 mappings too, from the same close budget: the deletes are
+     * fire-and-forget, and a v6 half that never mapped anything sends nothing. */
+    if (pm->fd6 >= 0 && (pm->s6.active[PM_PH_TCP] || pm->s6.active[PM_PH_UDP])) pm_send_deletes6(pm);
     pm_reset(pm, NTX_PM_OFF);
 }
 
@@ -1189,7 +1690,16 @@ void ntx_session_portmap_tick(struct ntx_session *s) {
         pm_reset(pm, NTX_PM_OFF);
         return;
     }
-    if (!pm->started && !pm_open(pm)) return;
+    if (!pm->started) (void)pm_open(pm); /* sets `started`; 0 = the v4 half says no, v6 may still run */
+
+    /* S17c · the v6 family first and independently: its own socket, its own
+     * outstanding query, its own retransmission clock, renewals, deferred retry and
+     * §8.5 rollback. It returns immediately when there is no v6 socket, and it cannot
+     * hold the v4 schedule back — the v4 arms below run from this same tick whether or
+     * not a v6 datagram went out, and vice versa. Reading `pm->fd` is what decides the
+     * v4 half alone, so a host with no v4 default still gets its v6 sequence driven. */
+    pm_tick6(pm);
+
     if (pm->fd < 0) return;
 
     /* The §8.5 rollback (R10): the receive path armed this, and the request goes out
@@ -1274,6 +1784,30 @@ void ntx_session_portmap_stop(struct ntx_session *s) {
 
 ntx_pm_state ntx_session_portmap_state(const struct ntx_session *s) {
     return s->pm ? s->pm->st : NTX_PM_OFF;
+}
+
+/* S17c exposes the v6 family's own state and granted port, and nothing reads them
+ * yet: ntx_session_portmap_state() — the value stats' `port_map` carries — keeps its
+ * v4-only meaning until S17d aggregates the families and renders `port_map6` /
+ * `ext_port6`. The distinction that matters for that aggregation is OFF vs the rest:
+ * the v6 half was never brought up for this sequence (no route, no driver, mapping
+ * off), whereas PENDING/ACTIVE/NONE are verdicts, including the §8 skip of a host
+ * with no routable client address.
+ * ponytail: the ceiling is that NONE does not distinguish "gateway refused" from "no
+ * routable client address" from "schedule ran out"; the diag lines do. Upgrade path is
+ * S17d's stats, which wants one number and not the reason. */
+ntx_pm_state ntx_session_portmap_state6(const struct ntx_session *s) {
+    return s->pm ? (ntx_pm_state)s->pm->s6.st : NTX_PM_OFF;
+}
+
+/* The port the v6 gateway forwards, or 0. It is by construction either 0 or the
+ * listen port — pm_grant6 deletes a grant that offers anything else — so this can
+ * never be a port the swarm should have been told about, which is the point of the
+ * rule (`ntx_session_adv_port` stays a v4-only decision). */
+uint16_t ntx_session_ext_port6(const struct ntx_session *s) {
+    const struct ntx_portmap *pm = s->pm;
+    if (!pm || !pm->s6.active[PM_PH_TCP]) return 0;
+    return pm->s6.ext[PM_PH_TCP];
 }
 
 uint16_t ntx_session_adv_port(const struct ntx_session *s) {

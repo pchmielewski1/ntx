@@ -26,6 +26,11 @@ void ntx_session_portmap_want(struct ntx_session *s, int on); /* share add/remov
 void ntx_session_portmap_tick(struct ntx_session *s);
 void ntx_session_portmap_stop(struct ntx_session *s); /* lifetime 0, bounded, at exit */
 ntx_pm_state ntx_session_portmap_state(const struct ntx_session *s);
+/* S17c: the IPv6 family's own verdict and granted port, separate from the two above.
+ * `state()` keeps its v4 meaning (`port_map` in stats) until S17d aggregates them.
+ * ext_port6 is 0 or the listen port — a v6 grant for any other port is deleted (§8). */
+ntx_pm_state ntx_session_portmap_state6(const struct ntx_session *s);
+uint16_t ntx_session_ext_port6(const struct ntx_session *s);
 uint16_t ntx_session_adv_port(const struct ntx_session *s); /* ext port when ACTIVE, else listen port */
 
 #endif

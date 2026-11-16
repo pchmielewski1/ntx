@@ -232,6 +232,25 @@ static const uint8_t V6_NH_FE80_2[16] = {0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 /* [::1], the one v6 address this box routes. */
 static const uint8_t V6_LO_ADDR[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
 
+/* ---- S17c: the addresses a v6 sequence is judged on -------------------------
+ * The gateway of every S17c case is still ::1, because nothing else can be bound
+ * here (`bind(2001:db8::1)` is EADDRNOTAVAIL and `ip -6 addr add` is EPERM — both
+ * probed); what the cases vary is the CLIENT address, which the sandbox can only
+ * supply through the hook (see the T block). The client addresses below are the four
+ * shapes pm6_is_global has to tell apart, and the external address a v6 gateway
+ * hands back. */
+static const uint8_t V6_CLIENT_GLOBAL[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+                                             0, 0, 0, 0, 0, 0, 0x12, 0x34}; /* 2001:db8::1234 */
+static const uint8_t V6_EXT_GLOBAL[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+                                          0, 0, 0, 0, 0, 0, 0, 0x09}; /* 2001:db8::9 */
+static const uint8_t V6_CLIENT_ULA[16] = {0xfd, 0, 0, 0, 0, 0, 0, 0,
+                                          0, 0, 0, 0, 0, 0, 0, 0x01}; /* fd00::1 */
+static const uint8_t V6_CLIENT_LINKLOCAL[16] = {0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+                                                0, 0, 0, 0, 0, 0, 0, 0x11}; /* fe80::11 */
+static const uint8_t V6_CLIENT_MAPPED[16] = {0, 0, 0, 0, 0, 0, 0, 0,
+                                             0, 0, 0xff, 0xff, 192, 0, 2, 1}; /* ::ffff:192.0.2.1 */
+static const uint8_t V6_UNSPEC[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
 /* Default route through the fake gateway. /proc/net/route prints the gateway as
  * a host-byte-order hex u32 (127.0.0.1 → 0100007F, 203.0.113.1 → 017100CB);
  * /proc/net/ipv6_route prints 16 raw bytes in network order. */
@@ -622,6 +641,100 @@ static void pm_start(sess *x) {
     pm_tick(x);
 }
 
+/* ---- S17c: the v6 half of the fake gateway, and the v6 wire probes -----------
+ * The v4 probes above (pcp_grant / pcp_resp / pcp_err24 / pm_sends_in) have v6
+ * siblings rather than parameters: reading the v6 datagram out of gwd would be
+ * reading a socket the v6 sequence never sends on, and the two halves being driven
+ * apart is what the independence cases are made of. The Epoch baseline is the v6
+ * sequence's own (pm->s6.epoch), so a v4 answer cannot stabilise a v6 §8.5 test. */
+
+static uint64_t gw6_reply_at;
+
+static uint32_t gw6_epoch_live(const struct ntx_portmap *pm) {
+    if (!pm || !pm->s6.epoch_seen) return 100;
+    return pm->s6.epoch + (uint32_t)((pm_now() - gw6_reply_at) / 1000u);
+}
+
+static ssize_t gw6_wait(uint8_t *buf, size_t cap, int ms) {
+    for (int i = 0; i <= ms / 2; i++) {
+        ssize_t r = gw6_get(buf, cap);
+        if (r >= 0) return r;
+        struct timespec ts = {0, 2 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
+    return -1;
+}
+
+static int gw6_sends_in(sess *x, uint64_t step_ms, int steps) {
+    uint8_t buf[2048];
+    int n = 0;
+    for (int i = 0; i < steps; i++) {
+        ntx_portmap_test_advance_ms(step_ms);
+        pm_tick(x);
+        pump_ms(x->n, 10);
+        while (gw6_get(buf, sizeof buf) >= 0) n++;
+    }
+    return n;
+}
+
+static uint8_t granted6_nonce[256][12]; /* by protocol: the v6 delete must repeat it (§11.1) */
+
+static int gw6_req_is(const uint8_t *b, ssize_t n, uint8_t proto, uint32_t lifetime) {
+    return n == 60 && b[0] == 2 && b[1] == 1 && b[36] == proto && rd32(b + 4) == lifetime;
+}
+
+/* The v6 reply goes back to whoever sent it, which for a connected socket is the
+ * driver's own endpoint. */
+static void gw6_answer(const uint8_t *b, size_t n) { gw6_to(b, n, &gw6_from); }
+
+static void pcp_grant6_epoch(sess *x, uint8_t proto, uint16_t ext_port, const uint8_t ext_ip[16],
+                             uint32_t lifetime, uint32_t epoch) {
+    uint8_t req[2048], rsp[64];
+    for (int spins = 0; spins < 400; spins++) {
+        ssize_t n = gw6_get(req, sizeof req);
+        if (n < 0) {
+            ntx_portmap_test_advance_ms(250);
+            pm_tick(x);
+            ntx_netx_run_once(x->n, 2);
+            continue;
+        }
+        if (!gw6_req_is(req, n, proto, 7200)) continue;
+        memcpy(granted6_nonce[proto], req + 24, 12);
+        gw6_reply_at = pm_now();
+        pcp_resp(rsp, req, ext_port, ext_ip, lifetime, epoch);
+        gw6_answer(rsp, 60);
+        pump_ms(x->n, 20);
+        return;
+    }
+    printf("FAIL no v6 pcp request proto=%u\n", proto);
+    fails++;
+}
+
+static void pcp_grant6(sess *x, uint8_t proto, uint16_t ext_port, const uint8_t ext_ip[16], uint32_t lifetime) {
+    pcp_grant6_epoch(x, proto, ext_port, ext_ip, lifetime, gw6_epoch_live(x->s->pm));
+}
+
+/* Wait (clock-walking, bounded) for the next v6 MAP request of `proto` and copy it
+ * out; 1 on success, 0 if none appeared. The caller answers it — which is what makes
+ * a case that must NOT answer one expressible. */
+static int pcp6_next_req(sess *x, uint8_t proto, uint8_t out[60]) {
+    uint8_t req[2048];
+    for (int spins = 0; spins < 800; spins++) {
+        ssize_t n = gw6_get(req, sizeof req);
+        if (n >= 0 && gw6_req_is(req, n, proto, 7200)) {
+            memcpy(out, req, 60);
+            return 1;
+        }
+        ntx_portmap_test_advance_ms(250);
+        pm_tick(x);
+        ntx_netx_run_once(x->n, 2);
+    }
+    return 0;
+}
+
+/* v6 state reads: the accessors are NULL-safe, so no probe helper is needed. */
+static long pm6_state6(const sess *x) { return (long)ntx_session_portmap_state6(x->s); }
+static long pm6_ext6(const sess *x) { return (long)ntx_session_ext_port6(x->s); }
 /* ---- retransmission pacing probes (R11) -------------------------------------
  * The schedule is read from the driver at the instant a datagram was observed,
  * which is also the instant the driver computed the next one: `next_try - now` is
@@ -2920,7 +3033,11 @@ int main(void) {
         ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "S1_v4_sequence_untouched");
         ck_eq(x.s->pm->phase, PM_PH_TCP, "S1_v4_phase_untouched");
         ck(gw_pending(), "S1_v4_request_still_on_v4_wire");
-        ck(!gw6_pending(), "S1b_no_v6_request_yet"); /* no v6 MAP before S17c */
+        /* Nothing is sent on the v6 socket yet, for the reason S17c made decisive: on
+         * this box the kernel answers ::1 for the connected socket's own address, and
+         * §8 refuses a request that names a loopback client. T1 is the case that does
+         * put a MAP request on this wire, and T10 pins this one. */
+        ck(!gw6_pending(), "S1b_no_v6_request_yet");
         ntx_session_portmap_stop(x.s);
         sess_close(&x);
 
@@ -3347,6 +3464,674 @@ int main(void) {
         sess_close(&x);
     }
 
+    /* ---- T. R15 / S17c: PCP MAP over IPv6.
+
+     * What S17b left undone: nothing was ever sent on fd6. These cases put MAP
+     * requests on that socket and pin the rules the sub-step is made of — the client
+     * address is the getsockname() address of the connected socket and must be
+     * routable (a ULA or link-local one SKIPS the family, state NONE, nothing on the
+     * wire), the granted external port MUST equal the listen port or the mapping is
+     * deleted with its own nonce, and v4/v6 keep separate state and separate
+     * schedules.
+     *
+     * Two things the sandbox forces. (1) The gateway's address cannot be invented:
+     * every bind outside lo is EADDRNOTAVAIL and `ip -6 addr add` is EPERM (both
+     * probed), so the v6 route names a real loopback address and the fake gateway
+     * binds it. (2) The CLIENT address the kernel picks for a socket connected to
+     * [::1] is always ::1, which is exactly the address §8 refuses to name in a
+     * request, so the sequence would never start: ntx_portmap_test_set_client6()
+     * hands the driver the address the kernel would have answered on a real host, and
+     * pm6_is_global still judges it. Every case that does NOT set it runs the real
+     * getsockname path (T10 pins that that is ::1 and that it means silence). */
+    {
+        /* T1. the wire format of a v6 TCP MAP request. */
+        sess x;
+        sess_open(&x, "t1");
+        x.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&x);
+        uint8_t req[2048];
+        ck_eq(gw6_wait(req, sizeof req, 400), 60, "T1_v6_request_on_wire");
+        ck_eq(req[0], 2, "T1_pcp_version");
+        ck_eq(req[1], 1, "T1_opcode_map_request");
+        ck_eq(req[2], 0, "T1_reserved_zero");
+        ck_eq(req[3], 0, "T1_reserved_zero_3");
+        ck_eq(rd32(req + 4), 7200, "T1_lifetime_two_hours");
+        ck(memcmp(req + 8, V6_CLIENT_GLOBAL, 16) == 0, "T1_client_ip_is_getsockname_addr");
+        ck_eq(req[36], NTX_PCP_PROTO_TCP, "T1_protocol_tcp");
+        ck_eq(req[37] | req[38] | req[39], 0, "T1_map_reserved_zero");
+        ck_eq(req_int_port(req), ntx_netx_port(x.n), "T1_internal_port_is_listen_port");
+        ck_eq((req[42] << 8) | req[43], ntx_netx_port(x.n), "T1_suggested_port_is_listen_port");
+        uint8_t zeros[16];
+        memset(zeros, 0, sizeof zeros);
+        ck(memcmp(req + 44, zeros, 16) == 0, "T1_fresh_ask_no_suggested_ip");
+        /* The client address is the socket's own — the byte-for-byte identity with
+         * what the kernel reports is the rule, not a value copied into the fixture. */
+        ck_eq(x.s->pm->s6.client_ip[0], 0x20, "T1_client_ip_is_native_v6");
+        ck(memcmp(x.s->pm->s6.client_ip, V6_CLIENT_GLOBAL, 16) == 0, "T1_driver_keeps_the_address");
+        ck_eq(ntx_session_portmap_state(x.s), NTX_PM_PENDING, "T1_v4_pending_too");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        gw_drain();
+        gw6_drain();
+    }
+
+    /* T2. a grant whose external port IS the listen port: v6 ACTIVE, renewal reuses
+     * the grant nonce and suggests the granted address (§11.2), the delete at stop
+     * carries that same nonce (§11.1). */
+    {
+        sess x;
+        sess_open(&x, "t2");
+        x.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&x);
+        uint16_t lp = ntx_netx_port(x.n);
+        pcp_grant6(&x, NTX_PCP_PROTO_TCP, lp, V6_EXT_GLOBAL, 7200);
+        ck_eq(pm6_state6(&x), NTX_PM_ACTIVE, "T2_v6_active");
+        ck_eq(pm6_ext6(&x), (long)lp, "T2_ext_port6_is_listen_port");
+        ck_eq(x.s->pm->s6.active[PM_PH_TCP], 1, "T2_tcp_active");
+        uint8_t gn[12];
+        memcpy(gn, granted6_nonce[NTX_PCP_PROTO_TCP], 12);
+        /* The v4 half, driven from the same tick, is untouched by the v6 grant. */
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "T2_v4_state_untouched");
+        ck_eq(ntx_session_adv_port(x.s), lp, "T2_adv_port_not_moved_by_v6");
+        gw6_drain();
+        ntx_portmap_test_advance_ms(3601000); /* past half of the 7200 s grant */
+        pm_tick(&x);
+        uint8_t req[2048];
+        ck_eq(gw6_get(req, sizeof req), 60, "T2_v6_renewal_sent");
+        ck(gw6_req_is(req, 60, NTX_PCP_PROTO_TCP, 7200), "T2_renewal_is_pcp_tcp");
+        ck(memcmp(req + 24, gn, 12) == 0, "T2_renewal_reuses_grant_nonce");
+        ck_eq((req[42] << 8) | req[43], lp, "T2_renewal_suggests_granted_port");
+        ck(memcmp(req + 44, V6_EXT_GLOBAL, 16) == 0, "T2_renewal_suggests_granted_ip");
+        ck(memcmp(req + 8, V6_CLIENT_GLOBAL, 16) == 0, "T2_renewal_client_ip_stable");
+        ntx_session_portmap_stop(x.s);
+        int dels = 0;
+        while (gw6_get(req, sizeof req) >= 0) {
+            if (rd32(req + 4) != 0 || req[36] != NTX_PCP_PROTO_TCP) continue;
+            dels++;
+            ck(memcmp(req + 24, gn, 12) == 0, "T2_delete_repeats_grant_nonce");
+            ck_eq((req[42] << 8) | req[43], lp, "T2_delete_suggests_granted_port");
+            ck(memcmp(req + 44, V6_EXT_GLOBAL, 16) == 0, "T2_delete_suggests_granted_ip");
+        }
+        ck_eq(dels, 1, "T2_one_v6_delete_at_stop");
+        ck_eq(pm6_state6(&x), NTX_PM_OFF, "T2_v6_off_after_stop");
+        ck_eq(pm6_ext6(&x), 0, "T2_no_ext_port_after_stop");
+        ntx_portmap_test_set_client6(NULL);
+        sess_close(&x);
+        gw_drain();
+        gw6_drain();
+    }
+
+    /* T3. THE RULE: a grant whose external port is not the listen port is deleted
+     * with the nonce it was granted, warned on the diag, and never advertised. The
+     * announce carries ONE port (ntx_session_adv_port is a v4 decision), so a v6
+     * mapping on any other port is a firewall hole for a port no peer can be told. */
+    {
+        char diagpath[256];
+        snprintf(diagpath, sizeof diagpath, "%s/diag_t3.log", SCRATCH);
+        unlink(diagpath);
+        ck_eq(ntx_diag_open(diagpath), 0, "T3_diag_capture");
+        sess x;
+        sess_open(&x, "t3");
+        x.cfg.port_map = 1;
+        one_torrent(&x);
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&x);
+        uint16_t lp = ntx_netx_port(x.n);
+        uint8_t req[2048];
+        ck_eq(gw6_wait(req, sizeof req, 400), 60, "T3_request");
+        uint8_t rsp[64], gn[12];
+        memcpy(gn, req + 24, 12);
+        gw6_reply_at = pm_now();
+        pcp_resp(rsp, req, EXT_PORT, V6_EXT_GLOBAL, 7200, gw6_epoch_live(x.s->pm)); /* != listen port */
+        gw6_answer(rsp, 60);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        int dels = 0;
+        while (gw6_get(req, sizeof req) >= 0) {
+            if (rd32(req + 4) != 0) continue;
+            dels++;
+            ck(memcmp(req + 24, gn, 12) == 0, "T3_delete_uses_the_grant_nonce");
+            ck_eq((req[42] << 8) | req[43], EXT_PORT, "T3_delete_names_the_wrong_port");
+            ck(memcmp(req + 44, V6_EXT_GLOBAL, 16) == 0, "T3_delete_suggests_granted_ip");
+        }
+        ck_eq(dels, 1, "T3_bad_grant_is_deleted");
+        ck_eq(pm6_state6(&x), NTX_PM_NONE, "T3_v6_none_after_bad_grant");
+        ck_eq(pm6_ext6(&x), 0, "T3_ext_port6_never_the_wrong_port");
+        ck_eq(x.s->pm->s6.active[PM_PH_TCP], 0, "T3_not_active");
+        ck_eq(ntx_session_adv_port(x.s), lp, "T3_adv_port_stays_the_listen_port");
+        /* And it stays that way: no re-request against a gateway that already answered. */
+        ck_eq(gw6_sends_in(&x, 60000, 6), 0, "T3_no_further_v6_request");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        char *text = read_all(diagpath);
+        ck(text && strstr(text, "not the listen port"), "T3_warning_on_diag");
+        ck(text && strstr(text, "mapping removed"), "T3_warning_says_removed");
+        free(text);
+        ntx_diag_close();
+        ntx_portmap_test_set_client6(NULL);
+        gw_drain();
+        gw6_drain();
+    }
+
+    /* T4. only a non-routable client address: the family is SKIPPED with state NONE
+     * and nothing reaches the wire (§8). Three shapes of it — ULA, link-local and the
+     * loopback this box actually gets from getsockname() — plus the v4-mapped shape
+     * that R15 was about. */
+    {
+        struct {
+            const uint8_t *addr;
+            const char *what;
+        } bad[] = {
+            {V6_CLIENT_ULA, "T4_ula_skipped"},
+            {V6_CLIENT_LINKLOCAL, "T4_link_local_skipped"},
+            {V6_LO_ADDR, "T4_loopback_skipped"},
+            {V6_CLIENT_MAPPED, "T4_v4_mapped_skipped"},
+        };
+        for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+            sess x;
+            char tag[32];
+            snprintf(tag, sizeof tag, "t4_%u", (unsigned)i);
+            sess_open(&x, tag);
+            x.cfg.port_map = 1;
+            write_route6(V6_DEFAULT_LO, v4path);
+            ntx_portmap_test_set_client6(bad[i].addr);
+            pm_start(&x);
+            pump_ms(x.n, 20);
+            ck_eq(pm6_state6(&x), NTX_PM_NONE, bad[i].what);
+            ck_eq(pm6_ext6(&x), 0, "T4_no_ext_port_when_skipped");
+            ck(!gw6_pending(), "T4_nothing_on_the_v6_wire");
+            ck_eq(x.s->pm->s6.phase, -1, "T4_no_v6_query_outstanding");
+            ck_eq(gw6_sends_in(&x, 60000, 6), 0, "T4_stays_quiet");
+            /* Skipped means v6 only: the v4 sequence runs exactly as if v6 were absent. */
+            ck(x.s->pm->fd >= 0, "T4_v4_socket_alive");
+            ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "T4_v4_unaffected");
+            ck(gw_pending(), "T4_v4_request_still_on_wire");
+            ntx_portmap_test_set_client6(NULL);
+            ntx_session_portmap_stop(x.s);
+            sess_close(&x);
+            gw_drain();
+            gw6_drain();
+        }
+
+        /* The predicate itself, on the addresses the socket can come back with. */
+        ck(pm6_is_global(V6_CLIENT_GLOBAL), "T4_global_accepted");
+        ck(pm6_is_global(V6_EXT_GLOBAL), "T4_documentation_prefix_accepted");
+        ck(!pm6_is_global(V6_CLIENT_ULA), "T4_ula_refused");
+        ck(!pm6_is_global(V6_CLIENT_LINKLOCAL), "T4_link_local_refused");
+        ck(!pm6_is_global(V6_LO_ADDR), "T4_loopback_refused");
+        ck(!pm6_is_global(V6_CLIENT_MAPPED), "T4_v4_mapped_refused");
+        ck(!pm6_is_global(V6_UNSPEC), "T4_unspecified_refused");
+        uint8_t mc[16];
+        memset(mc, 0, sizeof mc);
+        mc[0] = 0xff;
+        ck(!pm6_is_global(mc), "T4_multicast_refused");
+    }
+
+    /* T5. result codes over v6 (§7.4): NOT_AUTHORIZED ends the schedule, the §8.5
+     * epoch restart costs exactly one bounded re-request, and the retryable pair gets
+     * one deferred retry no sooner than 60 s. All three are the v4 rules of S10/S11/
+     * R14 replayed against the v6 gateway. */
+    {
+        char diagpath[256];
+        snprintf(diagpath, sizeof diagpath, "%s/diag_t5.log", SCRATCH);
+        unlink(diagpath);
+        ck_eq(ntx_diag_open(diagpath), 0, "T5_diag_capture");
+        sess x;
+        sess_open(&x, "t5a");
+        x.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&x);
+        uint8_t req[2048], err[24];
+        ck_eq(gw6_wait(req, sizeof req, 400), 60, "T5a_request");
+        pcp_err24(err, PCP_RES_NOT_AUTHORIZED, 1800);
+        gw6_answer(err, sizeof err);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck_eq(pm6_state6(&x), NTX_PM_NONE, "T5a_none_after_not_authorized");
+        ck_eq(x.s->pm->s6.phase, -1, "T5a_nothing_outstanding");
+        ck_eq(x.s->pm->s6.tries, 0, "T5a_no_retries");
+        ck_eq(gw6_sends_in(&x, 60000, 6), 0, "T5a_no_further_resend");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        char *text = read_all(diagpath);
+        ck(text && strstr(text, "NOT_AUTHORIZED"), "T5a_result_named_on_diag");
+        free(text);
+        ntx_diag_close();
+        gw_drain();
+        gw6_drain();
+
+        /* T5b. §8.5: the gateway's Epoch fails the restart test → every v6 grant is
+         * dropped and ONE fresh query goes out (new nonce, no suggested address). */
+        sess y;
+        sess_open(&y, "t5b");
+        y.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&y);
+        uint16_t lp = ntx_netx_port(y.n);
+        pcp_grant6(&y, NTX_PCP_PROTO_TCP, lp, V6_EXT_GLOBAL, 7200);
+        ck_eq(pm6_state6(&y), NTX_PM_ACTIVE, "T5b_active_before_restart");
+        uint8_t gn[12];
+        memcpy(gn, granted6_nonce[NTX_PCP_PROTO_TCP], 12);
+        gw6_drain();
+        ntx_portmap_test_advance_ms(3601000);
+        pm_tick(&y);
+        uint8_t rsp[64];
+        ck_eq(gw6_get(req, sizeof req), 60, "T5b_renewal_sent");
+        gw6_reply_at = pm_now();
+        pcp_resp(rsp, req, lp, V6_EXT_GLOBAL, 7200, 0); /* the counter starts over */
+        gw6_answer(rsp, 60);
+        pump_ms(y.n, 20);
+        pm_tick(&y); /* the tick owes the one fresh query of the rollback (R10) */
+        ck_eq(gw6_get(req, sizeof req), 60, "T5b_fresh_query_sent");
+        ck(gw6_req_is(req, 60, NTX_PCP_PROTO_TCP, 7200), "T5b_fresh_query_is_pcp_tcp");
+        ck(memcmp(req + 24, gn, 12) != 0, "T5b_new_acquisition_draws_new_nonce");
+        uint8_t zeros[16];
+        memset(zeros, 0, sizeof zeros);
+        ck(memcmp(req + 44, zeros, 16) == 0, "T5b_fresh_ask_no_suggested_ip");
+        ck_eq(pm6_state6(&y), NTX_PM_PENDING, "T5b_pending_after_rollback");
+        /* The one re-request is the whole rollback: with the IRT at 3 s (jittered to
+         * no sooner than 2,7 s) two 1 s of clock must still buy nothing. */
+        ck_eq(gw6_sends_in(&y, 1000, 2), 0, "T5b_one_query_not_a_loop");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(y.s);
+        sess_close(&y);
+        gw_drain();
+        gw6_drain();
+
+        /* T5c. §7.4 NO_RESOURCES with a retry-after: schedule stops, ONE attempt after
+         * the wait the reply names. */
+        sess z;
+        sess_open(&z, "t5c");
+        z.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&z);
+        ck_eq(gw6_wait(req, sizeof req, 400), 60, "T5c_request");
+        pcp_err24(err, PCP_RES_NO_RESOURCES, 120);
+        gw6_answer(err, sizeof err);
+        pump_ms(z.n, 40);
+        pm_tick(&z);
+        ck_eq(pm6_state6(&z), NTX_PM_NONE, "T5c_none_while_waiting");
+        ck_eq(gw6_sends_in(&z, 30000, 3), 0, "T5c_quiet_before_120s"); /* 0..90 s */
+        ck_eq(gw6_sends_in(&z, 29000, 1), 0, "T5c_still_quiet_at_119s");
+        ck_eq(gw6_sends_in(&z, 2000, 1), 1, "T5c_one_retry_after_lifetime");
+        ck_eq(z.s->pm->s6.phase, PM_PH_TCP, "T5c_retry_outstanding");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(z.s);
+        sess_close(&z);
+        gw_drain();
+        gw6_drain();
+
+        /* T5c2. the 60 s floor: the 10 s the reply names must not buy a retry at 10 s
+         * (PM_RETRY_MIN_S, the same floor the v4 sequence of M7b obeys). */
+        sess v;
+        sess_open(&v, "t5c2");
+        v.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&v);
+        ck_eq(gw6_wait(req, sizeof req, 400), 60, "T5c2_request");
+        pcp_err24(err, PCP_RES_NETWORK_FAILURE, 10);
+        gw6_answer(err, sizeof err);
+        pump_ms(v.n, 40);
+        pm_tick(&v);
+        ck_eq(gw6_sends_in(&v, 29000, 2), 0, "T5c2_quiet_below_60s_floor"); /* 0..58 s */
+        ck_eq(gw6_sends_in(&v, 3000, 1), 1, "T5c2_retry_at_the_floor");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(v.s);
+        sess_close(&v);
+        gw_drain();
+        gw6_drain();
+
+        /* T5c3. lifetime 0 in the reply names no retry at all: `none` is final. */
+        sess u;
+        sess_open(&u, "t5c3");
+        u.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&u);
+        ck_eq(gw6_wait(req, sizeof req, 400), 60, "T5c3_request");
+        pcp_err24(err, PCP_RES_NO_RESOURCES, 0);
+        gw6_answer(err, sizeof err);
+        pump_ms(u.n, 40);
+        pm_tick(&u);
+        ck_eq(pm6_state6(&u), NTX_PM_NONE, "T5c3_none");
+        ck_eq(gw6_sends_in(&u, 60000, 12), 0, "T5c3_lifetime0_no_retry");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(u.s);
+        sess_close(&u);
+        gw_drain();
+        gw6_drain();
+
+        /* T5d. the NAT-PMP shape of an answer (version 0): RFC 6886 has no IPv6 form,
+         * so a v6 gateway that speaks only NAT-PMP is a refusal, not a fallback. The
+         * v4 half is still free to fall back on its own socket. */
+        sess w;
+        sess_open(&w, "t5d");
+        w.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&w);
+        ck_eq(gw6_wait(req, sizeof req, 400), 60, "T5d_request");
+        const uint8_t unsupp[4] = {0, 0, 0, 1};
+        gw6_answer(unsupp, sizeof unsupp);
+        pump_ms(w.n, 40);
+        pm_tick(&w);
+        ck_eq(pm6_state6(&w), NTX_PM_NONE, "T5d_natpmp_answer_is_a_refusal");
+        ck_eq(w.s->pm->fam, PM_PCP, "T5d_no_fallback_from_the_v6_answer");
+        ck_eq(gw6_sends_in(&w, 60000, 4), 0, "T5d_v6_stays_quiet");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(w.s);
+        sess_close(&w);
+        gw_drain();
+        gw6_drain();
+    }
+
+    /* T6. UDP is mapped over v6 only with --utp, exactly as v4 (§8). */
+    {
+        sess x;
+        sess_open(&x, "t6a");
+        x.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&x);
+        uint16_t lp = ntx_netx_port(x.n);
+        pcp_grant6(&x, NTX_PCP_PROTO_TCP, lp, V6_EXT_GLOBAL, 7200);
+        ck_eq(gw6_sends_in(&x, 5000, 6), 0, "T6_no_udp_query_without_utp");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        gw_drain();
+        gw6_drain();
+
+        sess y;
+        sess_open(&y, "t6b");
+        y.cfg.port_map = 1;
+        y.cfg.utp = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&y);
+        lp = ntx_netx_port(y.n);
+        pcp_grant6(&y, NTX_PCP_PROTO_TCP, lp, V6_EXT_GLOBAL, 7200);
+        uint8_t req[2048];
+        ck(pcp6_next_req(&y, NTX_PCP_PROTO_UDP, req), "T6_udp_query_with_utp");
+        ck_eq(req_int_port(req), lp, "T6_udp_internal_port_is_listen_port");
+        ck_eq((req[42] << 8) | req[43], lp, "T6_udp_suggested_port_is_listen_port");
+        ck(memcmp(req + 8, V6_CLIENT_GLOBAL, 16) == 0, "T6_udp_client_ip_same_as_tcp");
+        uint8_t rsp[64];
+        gw6_reply_at = pm_now();
+        pcp_resp(rsp, req, lp, V6_EXT_GLOBAL, 7200, gw6_epoch_live(y.s->pm));
+        gw6_answer(rsp, 60);
+        pump_ms(y.n, 20);
+        ck_eq(y.s->pm->s6.active[PM_PH_UDP], 1, "T6_udp_active_on_the_right_port");
+        ck_eq(y.s->pm->s6.ext[PM_PH_UDP], (long)lp, "T6_udp_ext_is_the_listen_port");
+        ck_eq(pm6_state6(&y), NTX_PM_ACTIVE, "T6_active_with_udp_too");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(y.s);
+        sess_close(&y);
+        gw_drain();
+        gw6_drain();
+    }
+
+    /* T7. the families are independent: v6 ACTIVE with v4 NONE, v4 ACTIVE with v6
+     * refused, each keeping its own renewals, and a v6 socket error leaving the v4
+     * schedule exactly where it was (S17b pinned the socket half; this is the
+     * sequence half). */
+    {
+        /* (a) v6 granted, v4 gateway silent: v6 keeps renewing, v4 stays on its own
+         * retransmission schedule, and adv_port never picks the v6 grant up. The v4
+         * half gets a socket that is bound and never read rather than dead_port(),
+         * whose ICMP would have it take the NAT-PMP step and end the sequence — the
+         * point here is a schedule still running, not one already settled. */
+        sess x;
+        uint16_t silent4 = 0;
+        int silent_fd = udp_loopback(&silent4);
+        sess_open(&x, "t7a");
+        x.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        const uint16_t keep4 = gw_port;
+        ntx_portmap_test_set_gateway_port(silent4);
+        pm_start(&x);
+        uint16_t lp = ntx_netx_port(x.n);
+        pcp_grant6(&x, NTX_PCP_PROTO_TCP, lp, V6_EXT_GLOBAL, 7200);
+        ck_eq(pm6_state6(&x), NTX_PM_ACTIVE, "T7a_v6_active");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "T7a_v4_pending");
+        ck_eq(ntx_session_adv_port(x.s), lp, "T7a_adv_port_still_listen");
+        gw_drain();
+        /* v6 ACTIVE while the v4 sequence is mid-schedule: 60 s of clock moves the v4
+         * retransmissions along (their own IRT/MRT clock, jitter included) without
+         * touching the v6 grant, and without adv_port ever taking it. */
+        ck_eq(gw6_sends_in(&x, 15000, 4), 0, "T7a_v6_silent_while_v4_retries");
+        ck_eq(x.s->pm->phase, PM_PH_TCP, "T7a_v4_query_still_outstanding");
+        ck(x.s->pm->tries >= 3, "T7a_v4_schedule_moved_on_its_own");
+        ck_eq(ntx_session_portmap_state(x.s), NTX_PM_PENDING, "T7a_v4_state_alive");
+        ck_eq(pm6_state6(&x), NTX_PM_ACTIVE, "T7a_v6_still_active_during_v4_retries");
+        ntx_portmap_test_advance_ms(3601000 - 60000); /* past half of the 7200 s grant */
+        pm_tick(&x);
+        uint8_t areq[2048];
+        ck_eq(gw6_get(areq, sizeof areq), 60, "T7a_v6_renewal_goes_out");
+        ck(gw6_req_is(areq, 60, NTX_PCP_PROTO_TCP, 7200), "T7a_renewal_is_tcp");
+        ck_eq(pm6_state6(&x), NTX_PM_ACTIVE, "T7a_still_active_while_renewal_in_flight");
+        close(silent_fd);
+        ntx_portmap_test_set_gateway_port(keep4);
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        gw_drain();
+        gw6_drain();
+
+        /* (b) v4 granted, v6 refused with NOT_AUTHORIZED: v4 keeps its grant and its
+         * renewals; the v6 verdict changes nothing about them. */
+        sess y;
+        sess_open(&y, "t7b");
+        y.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&y);
+        lp = ntx_netx_port(y.n);
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pcp_grant(&y, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200); /* v4 grants a DIFFERENT port */
+        ck(ntx_session_portmap_state(y.s) == NTX_PM_ACTIVE, "T7b_v4_active");
+        ck_eq(ntx_session_adv_port(y.s), EXT_PORT, "T7b_adv_port_is_the_v4_grant");
+        uint8_t req[2048], err[24];
+        ck(pcp6_next_req(&y, NTX_PCP_PROTO_TCP, req), "T7b_v6_query_out");
+        pcp_err24(err, PCP_RES_NOT_AUTHORIZED, 0);
+        gw6_answer(err, sizeof err);
+        pump_ms(y.n, 40);
+        pm_tick(&y);
+        ck_eq(pm6_state6(&y), NTX_PM_NONE, "T7b_v6_refused");
+        ck(ntx_session_portmap_state(y.s) == NTX_PM_ACTIVE, "T7b_v4_still_active");
+        ck_eq(ntx_session_adv_port(y.s), EXT_PORT, "T7b_adv_port_unmoved_by_v6_refusal");
+        gw_drain();
+        ntx_portmap_test_advance_ms(3601000);
+        pm_tick(&y);
+        ck_eq(gw_get(req, sizeof req), 60, "T7b_v4_renewal_still_goes_out");
+        ck(req_is(req, 60, NTX_PCP_PROTO_TCP, 7200), "T7b_v4_renewal_is_tcp");
+        ck_eq(gw6_sends_in(&y, 60000, 4), 0, "T7b_v6_stays_refused");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(y.s);
+        sess_close(&y);
+        gw_drain();
+        gw6_drain();
+
+        /* (c) a v6 socket error mid-sequence: the v4 grants, phases, tries and state
+         * are bit-for-bit what they were (the S174 separation, now with a live v6
+         * schedule on the other socket). */
+        sess z;
+        sess_open(&z, "t7c");
+        z.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&z);
+        lp = ntx_netx_port(z.n);
+        pcp_grant6(&z, NTX_PCP_PROTO_TCP, lp, V6_EXT_GLOBAL, 7200);
+        pcp_grant(&z, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        ck_eq(pm6_state6(&z), NTX_PM_ACTIVE, "T7c_both_active_precondition");
+        const int v4_fd = z.s->pm->fd;
+        const int v4_phase = z.s->pm->phase;
+        const int v4_tries = z.s->pm->tries;
+        const uint32_t v4_epoch = z.s->pm->epoch;
+        pm_sock_err6(z.s->pm, EHOSTUNREACH);
+        ck_eq(z.s->pm->fd6, -1, "T7c_v6_socket_gone");
+        ck_eq(pm6_state6(&z), NTX_PM_NONE, "T7c_v6_half_ended");
+        ck_eq(z.s->pm->s6.active[PM_PH_TCP], 0, "T7c_v6_grant_dropped_with_the_socket");
+        ck_eq(pm6_ext6(&z), 0, "T7c_no_ext_port6_after_error");
+        ck_eq(z.s->pm->fd, (long)v4_fd, "T7c_same_v4_fd");
+        ck_eq(z.s->pm->phase, (long)v4_phase, "T7c_v4_phase_untouched");
+        ck_eq(z.s->pm->tries, (long)v4_tries, "T7c_v4_schedule_untouched");
+        ck_eq(z.s->pm->epoch, (long)v4_epoch, "T7c_v4_epoch_baseline_untouched");
+        ck(ntx_session_portmap_state(z.s) == NTX_PM_ACTIVE, "T7c_v4_still_ACTIVE");
+        ck_eq(ntx_session_adv_port(z.s), EXT_PORT, "T7c_v4_adv_port_survives_v6_error");
+        long iters = pm_loop_iters(z.n, 300);
+        if (iters >= 5000) printf("  (v6 spin: %ld loop iterations in 0,3 s)\n", iters);
+        ck(iters < 5000, "T7c_bounded_loop_after_v6_hard_error");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(z.s);
+        sess_close(&z);
+        gw_drain();
+        gw6_drain();
+
+        /* (d) the reverse: v4 refuses outright and the v6 sequence still runs. A host
+         * whose v4 default is gone is the R15 case that got nothing. */
+        char nov4[256];
+        snprintf(nov4, sizeof nov4, "%s/t7d_no_v4", SCRATCH);
+        wr(nov4, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+                 "wlP9s9\t0101A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n");
+        sess w;
+        sess_open(&w, "t7d");
+        w.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, nov4);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&w);
+        ck(w.s->pm->fd < 0, "T7d_no_v4_socket");
+        ck(ntx_session_portmap_state(w.s) == NTX_PM_NONE, "T7d_v4_none");
+        ck_eq(pm6_state6(&w), NTX_PM_PENDING, "T7d_v6_still_running");
+        pcp_grant6(&w, NTX_PCP_PROTO_TCP, ntx_netx_port(w.n), V6_EXT_GLOBAL, 7200);
+        ck_eq(pm6_state6(&w), NTX_PM_ACTIVE, "T7d_v6_active_without_any_v4");
+        ck_eq(ntx_session_adv_port(w.s), ntx_netx_port(w.n), "T7d_adv_port_still_listen");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(w.s);
+        sess_close(&w);
+        gw_drain();
+        gw6_drain();
+    }
+
+    /* T8. exit deletes: stop() sends lifetime 0 for both v6 mappings, fire-and-forget
+     * like v4, and a half that mapped nothing sends nothing. */
+    {
+        sess x;
+        sess_open(&x, "t8");
+        x.cfg.port_map = 1;
+        x.cfg.utp = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&x);
+        uint16_t lp = ntx_netx_port(x.n);
+        pcp_grant6(&x, NTX_PCP_PROTO_TCP, lp, V6_EXT_GLOBAL, 7200);
+        pcp_grant6(&x, NTX_PCP_PROTO_UDP, lp, V6_EXT_GLOBAL, 7200);
+        uint8_t tcp_nonce[12], udp_nonce[12];
+        memcpy(tcp_nonce, granted6_nonce[NTX_PCP_PROTO_TCP], 12);
+        memcpy(udp_nonce, granted6_nonce[NTX_PCP_PROTO_UDP], 12);
+        ck(memcmp(tcp_nonce, udp_nonce, 12) != 0, "T8_fresh_nonce_per_mapping");
+        gw6_drain();
+        ntx_session_portmap_stop(x.s);
+        uint8_t req[2048];
+        int zero = 0, total = 0, del_tcp = 0, del_udp = 0;
+        for (ssize_t r; (r = gw6_get(req, sizeof req)) >= 0;) {
+            total++;
+            if (r != 60 || rd32(req + 4) != 0) continue;
+            zero++;
+            if (req[36] == NTX_PCP_PROTO_TCP && memcmp(req + 24, tcp_nonce, 12) == 0) del_tcp++;
+            if (req[36] == NTX_PCP_PROTO_UDP && memcmp(req + 24, udp_nonce, 12) == 0) del_udp++;
+        }
+        ck_eq(total, 2, "T8_stop_sends_only_the_deletes");
+        ck_eq(zero, 2, "T8_lifetime0");
+        ck_eq(del_tcp, 1, "T8_tcp_delete_same_nonce");
+        ck_eq(del_udp, 1, "T8_udp_delete_same_nonce");
+        sess_close(&x);
+        gw_drain();
+        gw6_drain();
+
+        /* Nothing held: nothing sent. */
+        sess y;
+        sess_open(&y, "t8b");
+        y.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&y);
+        gw6_drain();
+        ntx_session_portmap_stop(y.s);
+        ck(!gw6_pending(), "T8b_no_delete_without_a_grant");
+        sess_close(&y);
+        gw_drain();
+        gw6_drain();
+    }
+
+    /* T9. --proxy / --tunnel: no v6 request at all (§5), and the state stays OFF
+     * rather than claiming a verdict it never reached. */
+    {
+        sess x;
+        sess_open_pm(&x, "t9", 1, 1);
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&x);
+        pump_ms(x.n, 20);
+        ck(!gw6_pending(), "T9_no_v6_datagram_under_proxy");
+        ck_eq(pm6_state6(&x), NTX_PM_OFF, "T9_off_under_proxy");
+        ntx_portmap_test_set_client6(NULL);
+        sess_close(&x);
+
+        sess_open(&x, "t9b");
+        x.cfg.port_map = 1;
+        x.cfg.tunnel = 1;
+        x.cfg.tunnel_host = "127.0.0.1";
+        x.cfg.tunnel_port = 4444;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&x);
+        pump_ms(x.n, 20);
+        ck(!gw6_pending(), "T9_no_v6_datagram_under_tunnel");
+        ck_eq(pm6_state6(&x), NTX_PM_OFF, "T9_off_under_tunnel");
+        ntx_portmap_test_set_client6(NULL);
+        sess_close(&x);
+        gw_drain();
+        gw6_drain();
+    }
+
+    /* T10. the production path, with the hook cleared: the client address IS what
+     * getsockname answers, and on this box that is ::1 — so the family is skipped.
+     * Without this case the hook could stand in for the rule forever. */
+    {
+        sess x;
+        sess_open(&x, "t10");
+        x.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        pm_start(&x);
+        pump_ms(x.n, 20);
+        ck(x.s->pm->fd6 >= 0, "T10_socket_up");
+        struct sockaddr_in6 me;
+        ck(pm6_sockname(x.s->pm, &me) == 0, "T10_getsockname");
+        ck(memcmp(me.sin6_addr.s6_addr, V6_LO_ADDR, 16) == 0, "T10_kernel_picks_loopback");
+        ck_eq(pm6_state6(&x), NTX_PM_NONE, "T10_skipped_on_the_real_address");
+        ck(!gw6_pending(), "T10_nothing_on_wire_with_the_real_address");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        gw_drain();
+        gw6_drain();
+    }
+
+    ntx_portmap_test_set_client6(NULL);
     write_routes(GW_LO);
     gw_drain();
     gw6_drain();
