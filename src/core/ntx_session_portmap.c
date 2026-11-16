@@ -8,6 +8,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <net/if.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,6 +69,15 @@
 enum { PM_PH_ADDR = 0, PM_PH_TCP, PM_PH_UDP, PM_NPH };
 enum { PM_PCP = 0, PM_NATPMP = 1 };
 
+/* The ::/0 gateway of /proc/net/ipv6_route: the NATIVE v6 nexthop (never widened to
+ * v4-mapped — an IPv4-mapped address there is the bug R15 was) and the interface it
+ * is reachable through, which S17b needs for sin6_scope_id on a link-local router.
+ * Declared before the driver because pm_open keeps one. */
+struct pm_gw6 {
+    uint8_t addr[16]; /* network order, exactly as the kernel printed it */
+    char iface[IF_NAMESIZE];
+};
+
 struct ntx_portmap {
     ntx_netx *netx;
     const ntx_config *cfg;
@@ -83,6 +93,12 @@ struct ntx_portmap {
     uint32_t gap;             /* interval before the next retransmission, ms */
     uint64_t next_try;        /* virtual ms of the next retransmission */
     uint32_t gw;              /* default-route gateway, network order */
+    /* R15 / S17a: the ::/0 gateway of /proc/net/ipv6_route — the NATIVE v6 nexthop
+     * (network order, never v4-mapped) and the interface it is reachable through,
+     * which is what a link-local router needs for sin6_scope_id. The v6 socket that
+     * consumes them is S17b; the parser runs and the test pins the fields. */
+    struct pm_gw6 gw6;
+    int gw6_seen;             /* the v6 route was read this sequence and named a gateway */
     uint8_t client_ip[16];    /* our address on that route, IPv4-mapped */
     uint8_t req[60];
     size_t reqlen;
@@ -184,55 +200,102 @@ static int pm_route4(uint32_t *gw_net) {
     return found;
 }
 
-/* The ::/0 line of /proc/net/ipv6_route whose nexthop is IPv4-mapped — the only
- * v6-route form a UDP mapping to a v4 gateway can use. Both 32-hex fields are
- * printed in network order. */
-static int pm_route6_line(const char *line, uint32_t *gw_net, unsigned *metric_out) {
-    char dst[40], src[40], nh[40], iface[64];
-    unsigned dpl, spl, hops, mtu, ref, metric, flags;
-    if (sscanf(line, "%39s %x %39s %x %39s %u %u %u %u %u %63s", dst, &dpl, src, &spl, nh, &hops, &mtu, &ref,
-               &metric, &flags, iface) != 11)
-        return 0;
-    if (dpl != 0 || strlen(dst) != 32 || strlen(nh) != 32) return 0;
-    uint8_t d[16], n[16];
-    for (int i = 0; i < 16; i++) {
-        int hi = pm_nib(dst[2 * i]), lo = pm_nib(dst[2 * i + 1]);
-        int h2 = pm_nib(nh[2 * i]), l2 = pm_nib(nh[2 * i + 1]);
-        if (hi < 0 || lo < 0 || h2 < 0 || l2 < 0) return 0;
-        d[i] = (uint8_t)((hi << 4) | lo);
-        n[i] = (uint8_t)((h2 << 4) | l2);
+/* /proc/net/ipv6_route, in the layout the kernel actually writes
+ * (net/ipv6/route.c: ipv6_route_seq_show):
+ *
+ *   dst(32hex) dpl(2hex) src(32hex) spl(2hex) nexthop(32hex) metric(8hex)
+ *   refcnt(8hex) use(8hex) flags(8hex) iface
+ *
+ * The three addresses are 16 raw bytes printed in network order and EVERY number
+ * is hex — the prefix lengths included (a host route reads "80", not "128").
+ * Reading metric/refcnt/use/flags as decimal, or the nexthop out of the src field,
+ * therefore judges a different route than the one on the line (R15). */
+#define PM_RTF_UP 0x00000001u
+#define PM_RTF_GATEWAY 0x00000002u
+#define PM_RTF_REJECT 0x00000200u
+#define PM_METRIC_DEAD 0xffffffffu /* the unreachable ::/0 networkd keeps on lo */
+
+/* Exactly n hex nibbles and nothing after them: a short, long or non-hex token is a
+ * line we know nothing about, so it is ignored rather than guessed at. No strtoul,
+ * so no overflow and no partial read to reason about. */
+static int pm_hexbytes(const char *tok, size_t nbytes, uint8_t *out) {
+    for (size_t i = 0; i < nbytes; i++) {
+        int hi = pm_nib(tok[2 * i]), lo = pm_nib(tok[2 * i + 1]);
+        if (hi < 0 || lo < 0) return 0;
+        out[i] = (uint8_t)((hi << 4) | lo);
     }
+    return tok[2 * nbytes] == '\0';
+}
+
+static int pm_hexw(const char *tok, size_t n, uint32_t *out) {
+    uint32_t v = 0;
+    for (size_t i = 0; i < n; i++) {
+        int d = pm_nib(tok[i]);
+        if (d < 0) return 0;
+        v = (v << 4) | (uint32_t)d;
+    }
+    if (tok[n] != '\0') return 0;
+    *out = v;
+    return 1;
+}
+
+/* One line, judged on its own: 1 when it is a usable ::/0 via a gateway, with the
+ * nexthop and interface returned and the metric handed out for the comparison. */
+static int pm_route6_line(const char *line, struct pm_gw6 *gw, uint32_t *metric_out) {
+    /* Every token is one wider than the field the kernel prints, so a field that is
+     * too long is truncated into a token the exact-length check below rejects instead
+     * of into a value that happens to parse. `src` and `use`/`refcnt` are read for
+     * their positions only: drop one of them and the nexthop shifts into another
+     * slot, which is exactly how the old parser ended up reading src as the gateway. */
+    char dst[34], dpl[4], src[34], spl[4], nh[34], met[10], ref[10], use[10], flags[10], iface[64];
+    if (sscanf(line, "%33s %3s %33s %3s %33s %9s %9s %9s %9s %63s", dst, dpl, src, spl, nh, met, ref, use,
+               flags, iface) != 10)
+        return 0;
+    uint32_t dplen, metric, fl;
+    if (!pm_hexw(dpl, 2, &dplen) || dplen != 0) return 0; /* only ::/0 is a default */
+    if (!pm_hexw(met, 8, &metric) || !pm_hexw(flags, 8, &fl)) return 0;
+    if (!(fl & PM_RTF_UP) || !(fl & PM_RTF_GATEWAY) || (fl & PM_RTF_REJECT)) return 0;
+    if (metric == PM_METRIC_DEAD) return 0; /* no route, whatever the flags claim */
+    uint32_t splen;
+    if (!pm_hexw(spl, 2, &splen)) return 0;
+    uint8_t d[16], n[16];
+    if (!pm_hexbytes(dst, 16, d) || !pm_hexbytes(nh, 16, n)) return 0;
     for (int i = 0; i < 16; i++)
-        if (d[i]) return 0;
-    for (int i = 0; i < 10; i++)
-        if (n[i]) return 0;
-    if (n[10] != 0xff || n[11] != 0xff) return 0;
-    if (n[12] == 0 && n[13] == 0) return 0; /* ::ffff:0.0.0.0 is not a gateway */
-    memcpy(gw_net, n + 12, 4);
+        if (d[i]) return 0; /* dst is not :: */
+    int zero_nh = 1;
+    for (int i = 0; i < 16; i++)
+        if (n[i]) zero_nh = 0;
+    if (zero_nh) return 0; /* directly connected: there is no gateway to ask */
+    if (strlen(iface) >= IF_NAMESIZE) return 0; /* longer than the kernel can print */
+    memcpy(gw->addr, n, 16);
+    memcpy(gw->iface, iface, strlen(iface) + 1);
     *metric_out = metric;
     return 1;
 }
 
-static int pm_route6(uint32_t *gw_net) {
+/* The default-route gateway of the IPv6 table, or 0: no file (a kernel built
+ * without IPv6), no usable ::/0, or nothing readable in it. */
+static int pm_route6(struct pm_gw6 *out) {
     FILE *f = fopen(pm_route6_path ? pm_route6_path : "/proc/net/ipv6_route", "r");
     if (!f) return 0;
     char line[512];
     int found = 0;
-    unsigned best = 0;
-    uint32_t gw = 0;
+    struct pm_gw6 best;
+    uint32_t best_metric = 0;
     while (fgets(line, sizeof line, f)) {
-        uint32_t g;
-        unsigned metric;
-        if (!pm_route6_line(line, &g, &metric)) continue;
-        if (!found || metric < best) {
+        struct pm_gw6 cand;
+        uint32_t metric;
+        if (!pm_route6_line(line, &cand, &metric)) continue;
+        if (!found || metric < best_metric) {
             found = 1;
-            best = metric;
-            gw = g;
+            best_metric = metric;
+            best = cand;
         }
     }
     fclose(f);
-    if (found) *gw_net = gw;
-    return found;
+    if (!found) return 0;
+    *out = best;
+    return 1;
 }
 
 static void pm_widen4(uint8_t out16[16], uint32_t ip_net) {
@@ -311,6 +374,10 @@ static void pm_reset(struct ntx_portmap *pm, ntx_pm_state st) {
     pm->retried = 0;
     pm->lost = 0;
     pm->restarts = 0;
+    /* The route is re-read with the next sequence, so a gateway that appeared or went
+     * away between sequences cannot be answered from the previous answer. */
+    memset(&pm->gw6, 0, sizeof pm->gw6);
+    pm->gw6_seen = 0;
     pm->st = st;
 }
 
@@ -751,7 +818,21 @@ static int pm_open(struct ntx_portmap *pm) {
     pm->started = 1;
     uint32_t gw = 0;
     int have = pm_route4(&gw);
-    if (!have) have = pm_route6(&gw);
+    /* R15 / S17a: the v6 default is read and kept on every sequence, whether or not
+     * the v4 one answered. S17b is what dials it; until then the driver stays on the
+     * v4 socket, so a v6-only host still maps nothing — but the address the next
+     * sub-step needs is parsed, judged and pinned by the test. */
+    struct pm_gw6 g6;
+    if (pm_route6(&g6)) {
+        pm->gw6 = g6;
+        pm->gw6_seen = 1;
+    }
+    /* No v4 route means no v4 gateway to dial: the v6 nexthop cannot be widened into
+     * one (that v4-mapped read is R15), and the socket here is AF_INET. The answer is
+     * NONE today and an AF_INET6 PCP sequence in S17b.
+     * ponytail: the ceiling of S17a — `gw6` is parsed, judged and kept, and nothing
+     * dials it yet. Upgrade path: S17b connects AF_INET6 UDP to gw6.addr:5351 with
+     * sin6_scope_id = if_nametoindex(gw6.iface) and takes this branch instead. */
     if (!have) {
         pm->st = NTX_PM_NONE;
         pm->gave_up = 1;

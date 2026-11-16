@@ -178,6 +178,46 @@ static void mk_file(const char *path, uint64_t size, uint8_t seed) {
     close(fd);
 }
 
+/* ---- R15 fixtures: lines copied verbatim out of `cat /proc/net/ipv6_route` on
+ * this host, kernel padding included. The layout is
+ * dst(32hex) dpl(2hex) src(32hex) spl(2hex) nexthop(32hex) metric(8hex)
+ * refcnt(8hex) use(8hex) flags(8hex) iface,
+ * the three addresses as 16 raw bytes in network order and EVERY number in hex —
+ * prefix lengths too, so a host route reads 80 and the dead metric ffffffff. */
+
+/* The fields of the RA-learned default of this box, spelled out once so a gate
+ * fixture can differ from the kernel's own line in the ONE field it is about:
+ * ::/0 via fe80::1 on wlP9s9, metric 00000258, flags 00000003 = RTF_UP|RTF_GATEWAY. */
+#define V6_DPY "00000000000000000000000000000000 00 00000000000000000000000000000000 00 " /* dst dpl src spl */
+#define V6_NH1 "fe800000000000000000000000000001 "                                         /* nexthop fe80::1 */
+#define V6_NH2 "fe800000000000000000000000000002 "                                         /* nexthop fe80::2 */
+#define V6_RU "0000000e 00000000 "                                                          /* refcnt use */
+#define V6_MET "00000258 "                                                                  /* metric 600 */
+#define V6_IF "   wlP9s9\n"                                                                 /* iface, padding kept */
+#define V6_FLAGS(f) V6_DPY V6_NH1 V6_MET V6_RU f V6_IF
+#define V6_DEFAULT V6_FLAGS("00000003")
+#define V6_METRIC(m) V6_DPY V6_NH1 m " " V6_RU "00000003" V6_IF
+
+/* networkd's blackhole on an IPv4-only box: ::/0 on lo, no RTF_UP, RTF_REJECT
+ * (0x200) set and metric ffffffff. The parser must refuse it, and this is exactly
+ * the line a "dst is :: and dpl is 0" check would accept. */
+#define V6_LO_BLACKHOLE "00000000000000000000000000000000 00 00000000000000000000000000000000 00 "                \
+                        "00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo\n"
+
+/* What the driver's route fixture holds: this host's table cut to the lines that
+ * matter — two on-link prefixes, the fe80::1 default, a /128 on lo and the
+ * blackhole. Nothing here is invented. */
+static const char V6_ROUTES_REAL[] =
+    "20011b81051170000000000000000000 40 00000000000000000000000000000000 00 "
+    "00000000000000000000000000000000 00000258 00000001 00000000 00000001   wlP9s9\n"
+    "fe800000000000000000000000000000 40 00000000000000000000000000000000 00 "
+    "00000000000000000000000000000000 00000400 00000015 00000000 00000001   wlP9s9\n" V6_DEFAULT
+    "00000000000000000000000000000001 80 00000000000000000000000000000000 00 "
+    "00000000000000000000000000000000 00000000 00000017 00000000 80200001       lo\n" V6_LO_BLACKHOLE;
+
+static const uint8_t V6_NH_FE80_1[16] = {0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+static const uint8_t V6_NH_FE80_2[16] = {0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2};
+
 /* Default route through the fake gateway. /proc/net/route prints the gateway as
  * a host-byte-order hex u32 (127.0.0.1 → 0100007F, 203.0.113.1 → 017100CB);
  * /proc/net/ipv6_route prints 16 raw bytes in network order. */
@@ -192,11 +232,25 @@ static void write_routes(const char *gw_host_hex, const char *gw_net_hex) {
              "lo\t00000000\t%s\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
              "lo\t0100007F\t00000000\t0001\t0\t0\t100\t000000FF\t0\t0\t0\n", gw_host_hex);
     wr(v4path, line);
-    snprintf(line, sizeof line,
-             "00000000000000000000000000000000 00 00000000000000000000FFFF%s 40 "
-             "00000000000000000000000000000000 00000100 00000001 00000000 00000001 lo\n", gw_net_hex);
-    wr(v6path, line);
+    /* R15: the v6 file used to hold ONE invented line — the nexthop written into the
+     * src field with spl 40, a ::ffff:a.b.c.d gateway and decimal-looking numbers. No
+     * kernel ever writes that shape, so the parser it was written against matched
+     * nothing real and the fixture hid it. Real lines of this host's table now stand
+     * in its place. gw_net_hex is unused: the v4 route is what the driver dials, and
+     * both fake gateways are 127.0.0.1, so the v6 router is the same box either way. */
+    (void)gw_net_hex;
+    wr(v6path, V6_ROUTES_REAL);
     ntx_portmap_test_set_route_files(v4path, v6path);
+}
+
+/* One /proc/net/ipv6_route fixture pointed at the parser, with the v4 file of the
+ * caller's choosing beside it (NULL = none readable). */
+static const char *write_route6(const char *text, const char *v4) {
+    static char path[256];
+    snprintf(path, sizeof path, "%s/r15_route6", SCRATCH);
+    wr(path, text);
+    ntx_portmap_test_set_route_files(v4, path);
+    return path;
 }
 
 #define GW_LO "0100007F", "7F000001"
@@ -2468,6 +2522,211 @@ int main(void) {
     }
 
     ntx_portmap_test_set_gateway_port(gw_port);
+
+    /* ---- R. R15 / S17a: the /proc/net/ipv6_route default-route parser.
+     *
+     * The kernel writes
+     * dst(32hex) dpl(2hex) src(32hex) spl(2hex) nexthop(32hex) metric(8hex)
+     * refcnt(8hex) use(8hex) flags(8hex) iface,
+     * addresses as 16 raw bytes in network order and every number in hex. A default
+     * route is dst all-zero with dpl 0, and is only a gateway if RTF_UP (0x1) and
+     * RTF_GATEWAY (0x2) are set, RTF_REJECT (0x200) is not, and the metric is not
+     * ffffffff (the unreachable ::/0 networkd leaves on lo). The nexthop is a NATIVE
+     * v6 address — the old parser read the src field as the nexthop, expected a
+     * v4-mapped one, and read the four hex numbers as decimal, so no real line could
+     * ever match (R15). Every fixture below is a line of a real
+     * `cat /proc/net/ipv6_route` from this host, only the field under test changed.
+     *
+     * S17a is the parser only: nothing here dials the v6 gateway (S17b). */
+    {
+        /* R1. the real table of this host: the fe80::1 default is found, the lo
+         * blackhole is not, and the gateway is the native address, byte for byte. */
+        struct pm_gw6 g;
+        write_route6(V6_ROUTES_REAL, NULL);
+        ck(pm_route6(&g) == 1, "R1_real_table_found");
+        ck(memcmp(g.addr, V6_NH_FE80_1, 16) == 0, "R1_nexthop_is_fe80_1_bytes");
+        ck(g.addr[10] != 0xff || g.addr[11] != 0xff, "R1_nexthop_not_v4_mapped");
+        ck(strcmp(g.iface, "wlP9s9") == 0, "R1_iface_captured");
+
+        /* R1b. the lo line alone — metric ffffffff, RTF_REJECT, no RTF_UP: refused.
+         * This is the line the fix had to start rejecting; the pre-fix parser could
+         * not read it at all, so a parser that only checked "dst is :: and dpl is 0"
+         * would accept it and keep declaring an IPv4-only host IPv6-capable. */
+        memset(&g, 0xA5, sizeof g);
+        write_route6(V6_LO_BLACKHOLE, NULL);
+        ck(pm_route6(&g) == 0, "R1b_lo_blackhole_rejected");
+        ck(g.addr[0] == 0xA5 && g.iface[0] == (char)0xA5, "R1b_rejected_line_writes_nothing");
+
+        /* R2. two usable defaults: the LOWEST metric wins, in either order. The
+         * metrics differ by one (0x258 = 600 against 0x1f4 = 500) and the two nexthops
+         * differ in the last byte only, so first-wins and decimal-metric reads both
+         * show up here. */
+        const char *hi = V6_DEFAULT;                                            /* fe80::1, 0x258 */
+        const char *lo = V6_DPY V6_NH2 "000001f4 " V6_RU "00000003" V6_IF;      /* fe80::2, 0x1f4 */
+        char both[1024];
+        snprintf(both, sizeof both, "%s%s", hi, lo);
+        memset(&g, 0, sizeof g);
+        write_route6(both, NULL);
+        ck(pm_route6(&g) == 1, "R2_lowest_metric_found");
+        ck(memcmp(g.addr, V6_NH_FE80_2, 16) == 0, "R2_lowest_metric_wins");
+        snprintf(both, sizeof both, "%s%s", lo, hi); /* same table, other order */
+        memset(&g, 0, sizeof g);
+        write_route6(both, NULL);
+        ck(pm_route6(&g) == 1, "R2_reversed_found");
+        ck(memcmp(g.addr, V6_NH_FE80_2, 16) == 0, "R2_lowest_metric_wins_reversed");
+
+        /* R3. the gates, one field at a time, each against the real line. */
+        struct {
+            const char *line;
+            const char *what;
+        } bad[] = {
+            {V6_FLAGS("00000001"), "R3_no_rtf_gateway_rejected"},
+            {V6_FLAGS("00000002"), "R3_no_rtf_up_rejected"},
+            {V6_FLAGS("00000203"), "R3_rtf_reject_rejected"},
+            {V6_FLAGS("00000000"), "R3_no_flags_rejected"},
+            {V6_METRIC("ffffffff"), "R3_dead_metric_rejected"},
+            {V6_METRIC("FFFFFFFE"), "R3_uppercase_hex_accepted"}, /* sanity: this one is fine */
+        };
+        for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+            memset(&g, 0, sizeof g);
+            write_route6(bad[i].line, NULL);
+            int got = pm_route6(&g);
+            if (i == 5) { /* the only accepted line in the table */
+                ck(got == 1, bad[i].what);
+                ck(memcmp(g.addr, V6_NH_FE80_1, 16) == 0, "R3_uppercase_metric_gate_nexthop");
+            } else {
+                ck(got == 0, bad[i].what);
+            }
+        }
+
+        /* R3b. prefix traps: ::/0 means dst all-zero AND dpl 0. */
+        struct {
+            const char *line;
+            const char *what;
+        } prefix[] = {
+            /* non-zero dst at prefix 0 — looks like a default to a startswith test */
+            {"20010db8000000000000000000000000 00 00000000000000000000000000000000 00 "
+             "fe800000000000000000000000000001 00000258 00000015 00000000 00000003   wlP9s9\n",
+             "R3b_nonzero_dst_prefix0_rejected"},
+            /* all-zero dst at prefix 40 — an on-link prefix, not a default */
+            {"00000000000000000000000000000000 40 00000000000000000000000000000000 00 "
+             "fe800000000000000000000000000001 00000258 00000015 00000000 00000003   wlP9s9\n",
+             "R3b_zero_dst_prefix40_rejected"},
+            /* ::1 at prefix 0 */
+            {"00000000000000000000000000000001 00 00000000000000000000000000000000 00 "
+             "fe800000000000000000000000000001 00000258 00000015 00000000 00000003   wlP9s9\n",
+             "R3b_loopback_dst_rejected"},
+            /* a directly-connected default: RTF_UP|RTF_GATEWAY as usual, but the
+             * kernel wrote an all-zero nexthop — there is no gateway to ask */
+            {V6_DPY "00000000000000000000000000000000 00000258 " V6_RU "00000003" V6_IF,
+             "R3b_zero_nexthop_rejected"},
+        };
+        for (size_t i = 0; i < sizeof prefix / sizeof prefix[0]; i++) {
+            memset(&g, 0, sizeof g);
+            write_route6(prefix[i].line, NULL);
+            ck(pm_route6(&g) == 0, prefix[i].what);
+        }
+
+        /* R4. robustness: garbage, truncation, overflow-sized hex, a missing file.
+         * None of these may be selected and none may crash or read out of bounds. */
+        struct {
+            const char *line;
+            const char *what;
+        } junk[] = {
+            {"", "R4_empty_file"},
+            {"\n\n   \n\t\n", "R4_blank_lines"},
+            {"garbage\n", "R4_prose_line"},
+            {"00000000000000000000000000000000 00\n", "R4_truncated_line"},
+            {V6_DPY "fe8000000000000000000000000000001 00000258 00000015 00000000\n",
+             "R4_missing_iface_field"},
+            {V6_DPY "fe800000000000000000000000000000g 00000258 00000015 00000000 00000003   wlP9s9\n",
+             "R4_non_hex_nexthop"},
+            {"00000000000000000000000000000000x 00 00000000000000000000000000000000 00 "
+             "fe800000000000000000000000000001 00000258 00000015 00000000 00000003   wlP9s9\n",
+             "R4_overlong_dst"},
+            {V6_DPY "fe8000000000000000000000000000001 00000258 00000015 00000000 "
+             "0000000000000003   wlP9s9\n",
+             "R4_overlong_flags"},
+            {V6_DPY "fe8000000000000000000000000000001 ffffffff0 00000015 00000000 00000003   wlP9s9\n",
+             "R4_overlong_metric"},
+            {V6_DPY "fe8000000000000000000000000000001 00000258 00000015 00000000 00000003 "
+             "averyveryverylonginterfacesnamethatthekernelcannotprint\n",
+             "R4_overlong_iface"},
+        };
+        for (size_t i = 0; i < sizeof junk / sizeof junk[0]; i++) {
+            memset(&g, 0, sizeof g);
+            write_route6(junk[i].line, NULL);
+            ck(pm_route6(&g) == 0, junk[i].what);
+        }
+        memset(&g, 0, sizeof g);
+        ntx_portmap_test_set_route_files(NULL, SCRATCH "/definitely_absent");
+        ck(pm_route6(&g) == 0, "R4_missing_file_no_route");
+
+        /* The interface name has to fit the buffer the driver keeps for
+         * sin6_scope_id (S17b): IF_NAMESIZE-1 characters is the longest the kernel
+         * can print — br-138d098fd78d on this host is one — and anything longer is
+         * not a line it wrote. */
+        {
+            char line[256];
+            snprintf(line, sizeof line, V6_DPY V6_NH1 V6_MET V6_RU "00000003"
+                     "   abcdefghijklmno\n"); /* 15 = IF_NAMESIZE - 1 */
+            memset(&g, 0, sizeof g);
+            write_route6(line, NULL);
+            ck(pm_route6(&g) == 1, "R4_iface_of_IF_NAMESIZE_minus_1_accepted");
+            ck(strcmp(g.iface, "abcdefghijklmno") == 0, "R4_long_iface_name_captured");
+            snprintf(line, sizeof line, V6_DPY V6_NH1 V6_MET V6_RU "00000003"
+                     "   abcdefghijklmnop\n"); /* 16 = IF_NAMESIZE: cannot be printed */
+            memset(&g, 0, sizeof g);
+            write_route6(line, NULL);
+            ck(pm_route6(&g) == 0, "R4_iface_of_IF_NAMESIZE_rejected");
+        }
+
+        /* A junk line between the real default and the blackhole changes nothing:
+         * the good line is still read, the bad one still refused. */
+        memset(&g, 0, sizeof g);
+        write_route6(V6_DEFAULT "junk\n" V6_LO_BLACKHOLE, NULL);
+        ck(pm_route6(&g) == 1, "R4_junk_line_between_good_and_bad");
+        ck(memcmp(g.addr, V6_NH_FE80_1, 16) == 0, "R4_junk_line_nexthop_survives");
+        ck(strcmp(g.iface, "wlP9s9") == 0, "R4_junk_line_iface_survives");
+
+        /* R5. the parser is on the production path: pm_open reads the v6 default and
+         * keeps the gateway address and the interface for S17b, without dialing it
+         * (the socket it opens today is the AF_INET one, and NAT-PMP is IPv4-only). */
+        write_routes(GW_LO);
+        sess x;
+        sess_open(&x, "r1");
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        ck_eq(x.s->pm->gw6_seen, 1, "R5_driver_read_the_v6_route");
+        ck(memcmp(x.s->pm->gw6.addr, V6_NH_FE80_1, 16) == 0, "R5_driver_gw6_bytes");
+        ck(strcmp(x.s->pm->gw6.iface, "wlP9s9") == 0, "R5_driver_gw6_iface");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "R5_v4_sequence_untouched");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+
+        /* R5b. S17a's boundary stated: a host with no IPv4 default but a usable v6
+         * one has its route parsed and kept, and still maps nothing — S17b is what
+         * turns that state into an AF_INET6 PCP sequence. */
+        {
+            char v4path2[256];
+            snprintf(v4path2, sizeof v4path2, "%s/r15_no_v4_default", SCRATCH);
+            wr(v4path2, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+                        "wlP9s9\t0101A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n");
+            write_route6(V6_ROUTES_REAL, v4path2);
+            sess y;
+            sess_open(&y, "r2");
+            y.cfg.port_map = 1;
+            pm_start(&y);
+            pump_ms(y.n, 20);
+            ck_eq(y.s->pm->gw6_seen, 1, "R5b_v6_route_parsed_without_v4_default");
+            ck(memcmp(y.s->pm->gw6.addr, V6_NH_FE80_1, 16) == 0, "R5b_gw6_kept_without_v4_default");
+            ck(ntx_session_portmap_state(y.s) == NTX_PM_NONE, "R5b_no_v6_socket_yet");
+            ck(!gw_pending(), "R5b_no_datagram_without_v4_default");
+            sess_close(&y);
+        }
+        write_routes(GW_LO);
+        gw_drain();
+    }
 
     close(gwd);
     if (fails) {
