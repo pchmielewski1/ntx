@@ -82,6 +82,38 @@ struct ntx_portmap {
     ntx_netx *netx;
     const ntx_config *cfg;
     int fd;                   /* UDP socket connected to gateway:5351, -1 = closed */
+    /* ---- S17b · the IPv6 half, and deliberately SEPARATE state.
+     * Nothing here is read by the v4 sequence and no v4 field is written from the v6
+     * path, so a v6 gateway that refuses, answers or never shows up cannot disturb the
+     * v4 timers, phases, retries or grants (S17c puts MAP requests on this socket,
+     * S17d aggregates the stats). Kept next to `fd` rather than in its own struct
+     * because the two halves share the one netx loop and the one route read.
+     *   fd6           AF_INET6 UDP socket connected to gw6.addr:5351, -1 when v6 is
+     *                 not wanted, not reachable, or already given up.
+     *   gw6_scope     the if_nametoindex(gw6.iface) handed to connect() for a
+     *                 link-local gateway, 0 when the address needed none. It is also
+     *                 what the source rule compares an incoming scope against — the
+     *                 only witness of it, since getpeername answers sk_bound_dev_if
+     *                 and not the connect-time scope (reads 0 either way).
+     *   gw6_tried     connect() was attempted at all (a link-local gateway with no
+     *                 resolvable interface must not be connected, and 0 tells that
+     *                 refusal apart from an attempt the kernel refused).
+     *   gw6_connected connect() took it, so the socket is registered and live.
+     *   rx6_seen / rx6_ok  datagrams the v6 callback read, and the ones the source
+     *                 rule let through. Until S17c nothing consumes a v6 datagram, so
+     *                 without them the two rules (gateway address, gateway port) have
+     *                 no observable effect at all to test against.
+     *   gw6_err      errno of the last thing the v6 half judged wrong: the kernel's
+     *                 answer to connect(), or the SO_ERROR it reported later. The
+     *                 reason a refusal happened, which nothing else on this socket
+     *                 can report after the fd is gone. */
+    int fd6;
+    unsigned gw6_scope;
+    int gw6_tried;
+    int gw6_connected;
+    int gw6_err;
+    uint32_t rx6_seen;
+    uint32_t rx6_ok;
     ntx_pm_state st;
     int want;                 /* mapping requested; the tick is what starts anything */
     int started;              /* the route was read and the socket opened */
@@ -137,6 +169,10 @@ static uint64_t pm_voff;
 static const char *pm_route4_path;
 static const char *pm_route6_path;
 static uint16_t pm_gw_port_cfg;
+/* S17b: the v6 gateway's port is its own hook. One hook for both families would
+ * make "v4 gateway alive, v6 gateway gone" — the case that proves the halves are
+ * independent — impossible to build. */
+static uint16_t pm_gw6_port_cfg;
 static int pm_cgnat_warned;
 
 void ntx_portmap_test_set_route_files(const char *v4, const char *v6) {
@@ -146,9 +182,14 @@ void ntx_portmap_test_set_route_files(const char *v4, const char *v6) {
 
 void ntx_portmap_test_set_gateway_port(uint16_t port) { pm_gw_port_cfg = port; }
 
+void ntx_portmap_test_set_gateway6_port(uint16_t port) { pm_gw6_port_cfg = port; }
+
 void ntx_portmap_test_advance_ms(uint64_t ms) { pm_voff += ms; }
 
 static uint16_t pm_gw_port(void) { return pm_gw_port_cfg ? pm_gw_port_cfg : NTX_PCP_PORT; }
+
+/* RFC 6887 §8: both families ask on the same well-known port. */
+static uint16_t pm_gw6_port(void) { return pm_gw6_port_cfg ? pm_gw6_port_cfg : NTX_PCP_PORT; }
 
 static uint64_t pm_now(void) { return ntx_mono_ms() + pm_voff; }
 
@@ -327,6 +368,7 @@ static struct ntx_portmap *pm_alloc(struct ntx_session *s) {
     struct ntx_portmap *pm = calloc(1, sizeof *pm);
     if (!pm) return NULL;
     pm->fd = -1;
+    pm->fd6 = -1;
     pm->phase = -1;
     pm->retry_ph = -1;
     pm->netx = s->netx;
@@ -340,6 +382,16 @@ static void pm_close_sock(struct ntx_portmap *pm) {
     ntx_netx_del(pm->netx, pm->fd);
     close(pm->fd);
     pm->fd = -1;
+}
+
+/* The v6 socket's own teardown: the v4 fd, its registration and everything the v4
+ * sequence holds are untouched, and nothing here clears a grant or a timer. */
+static void pm_close_sock6(struct ntx_portmap *pm) {
+    if (pm->fd6 < 0) return;
+    ntx_netx_del(pm->netx, pm->fd6);
+    close(pm->fd6);
+    pm->fd6 = -1;
+    pm->gw6_connected = 0;
 }
 
 /* Every trace of a mapping is gone, including the debt R12 records: a caller that
@@ -360,6 +412,7 @@ static void pm_clear_grants(struct ntx_portmap *pm) {
 
 static void pm_reset(struct ntx_portmap *pm, ntx_pm_state st) {
     pm_close_sock(pm);
+    pm_close_sock6(pm);
     pm_clear_grants(pm);
     for (int i = 0; i < PM_NPH; i++) pm->failed[i] = 0;
     pm->phase = -1;
@@ -378,6 +431,17 @@ static void pm_reset(struct ntx_portmap *pm, ntx_pm_state st) {
      * away between sequences cannot be answered from the previous answer. */
     memset(&pm->gw6, 0, sizeof pm->gw6);
     pm->gw6_seen = 0;
+    /* The v6 half is reset with the sequence too: the scope belongs to the route that
+     * is about to be re-read, and the try/connected pair is what tells "no v6 route"
+     * from "a v6 route the kernel refused" for the sequence that is starting. */
+    pm->gw6_scope = 0;
+    pm->gw6_tried = 0;
+    pm->gw6_err = 0;
+    /* The rx counters belong to the socket this sequence is about to open, so they
+     * start over with it — otherwise a second sequence would report the datagrams the
+     * first one's socket read. */
+    pm->rx6_seen = 0;
+    pm->rx6_ok = 0;
     pm->st = st;
 }
 
@@ -667,6 +731,23 @@ static int pm_src_ok(const struct ntx_portmap *pm, const struct sockaddr_in *sa)
     return ntohs(sa->sin_port) == pm_gw_port();
 }
 
+/* The v6 sibling, with the scope added: a link-local gateway address is only
+ * meaningful together with the interface it lives on, so "the same address" here
+ * means the same 16 bytes AND the same scope the socket was connected through.
+ * The scope on an incoming datagram is what the kernel reports for the ingress
+ * device, which is why an unscoped fe80:: match is not accepted either.
+ * ponytail: the ceiling of S17b — the comparison is against the scope connect()
+ * was given, and a kernel that reports 0 for a loopback-delivered packet (what it
+ * does for ::1, probed) only matches a gateway whose scope is 0 too. Upgrade path:
+ * for S17c's real routers, compare against the route's ifindex as reported by
+ * IPV6_PKTINFO if a gateway is ever found whose packets arrive with a scope set. */
+static int pm_src6_ok(const struct ntx_portmap *pm, const struct sockaddr_in6 *sa) {
+    if (sa->sin6_family != AF_INET6) return 0;
+    if (memcmp(sa->sin6_addr.s6_addr, pm->gw6.addr, 16) != 0) return 0;
+    if (sa->sin6_scope_id != pm->gw6_scope) return 0;
+    return ntohs(sa->sin6_port) == pm_gw6_port();
+}
+
 /* RFC 6887 §8.5: the client keeps the Epoch of the last answer (seconds since the
  * gateway's boot, §8.7) and the instant it received it, then compares the two
  * differences — how far the gateway's counter moved against how far our own clock
@@ -802,6 +883,118 @@ static void pm_on_rw(int fd, void *ctx) {
     }
 }
 
+/* ---- S17b · the receive and error side of the v6 socket --------------------
+ * Separate callbacks on purpose: pm_on_rw / pm_on_err reach into pm->phase,
+ * pm->tries, pm->fam and the grants, all of which are the v4 sequence's own, and
+ * RFC 6886 has no IPv6 form at all — a v6 socket that reports a refusal has no
+ * NAT-PMP to step to, so routing a v6 error through pm_sock_err would both hand
+ * the v4 sequence a verdict it never asked for and invent a fallback. */
+
+/* SO_ERROR of the v6 socket, read and thereby cleared — the v6 twin of
+ * pm_drain_err, and for the same reason: an unread error holds EPOLLERR asserted
+ * on a level-triggered loop that then never blocks again (R9). */
+static int pm_drain_err6(struct ntx_portmap *pm) {
+    int err = 0;
+    socklen_t len = sizeof err;
+    if (getsockopt(pm->fd6, SOL_SOCKET, SO_ERROR, &err, &len) != 0) return 0;
+    return err;
+}
+
+/* The v6 socket's verdict on an error (R15/S17b, and the error rules of S08/S10).
+ * Both branches end the v6 half of this sequence, and that is the whole treatment
+ * while S17b sends nothing: there is no v6 phase to clear, no nonce to retire and
+ * nothing to fall back to. They stay written apart because S17c gives them their
+ * own arms — the refusal ends the v6 schedule quietly, a hard error must not even
+ * be retried.
+ * ponytail: the ceiling is that S17b cannot yet show a difference between them
+ * beyond `gw6_err`; upgrade path is the v6 MAP schedule of S17c, which judges the
+ * refusal the way pm_refused does minus the fallback step. */
+static void pm_sock_err6(struct ntx_portmap *pm, int err) {
+    if (pm->fd6 < 0) return;
+    pm->gw6_err = err;
+    pm_close_sock6(pm);
+}
+
+static void pm_on_rw6(int fd, void *ctx) {
+    struct ntx_portmap *pm = (struct ntx_portmap *)ctx;
+    for (int i = 0; i < PM_RX_BUDGET; i++) {
+        uint8_t buf[1200];
+        struct sockaddr_in6 from;
+        socklen_t fl = sizeof from;
+        ssize_t n = recvfrom(fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
+        if (n <= 0) return;
+        pm->rx6_seen++;
+        /* S17b ends here: a datagram that passes the source rule is counted and
+         * dropped, because there is no v6 request outstanding for it to answer and
+         * no v6 parser yet. It must not reach pm_rx, which would read it as an
+         * answer to the v4 sequence's outstanding query. */
+        if (pm_src6_ok(pm, &from)) pm->rx6_ok++;
+    }
+}
+
+static void pm_on_err6(void *ctx) {
+    struct ntx_portmap *pm = (struct ntx_portmap *)ctx;
+    if (pm->fd6 < 0) return;
+    int err = pm_drain_err6(pm);
+    if (err) pm_sock_err6(pm, err);
+}
+
+/* 1 for a link-local address (fe80::/10), which is meaningful only together with
+ * the interface it was learned on and so cannot be connected without a scope. */
+static int pm6_link_local(const uint8_t a[16]) { return a[0] == 0xfe && (a[1] & 0xc0) == 0x80; }
+
+/* Open and connect the v6 half. Called from pm_open once per sequence — like the
+ * v4 socket, a v6 gateway this kernel refused is not asked again until the next
+ * sequence. Nothing here reads or writes a v4 field, and every way out leaves the
+ * v4 socket, its phase, its schedule and its grants exactly as they were.
+ * Returns 1 when the socket is connected, 0 when v6 is off for this sequence. */
+static int pm_open6(struct ntx_portmap *pm) {
+    /* Whoever calls this is starting a sequence, so anything the last one left is
+     * dropped through the one path that unregisters AND closes — a bare `fd6 = -1`
+     * here would orphan a registered fd on the loop. */
+    pm_close_sock6(pm);
+    pm->gw6_scope = 0;
+    pm->gw6_err = 0;
+    /* §5 / §8: never under a proxy or a tunnel, exactly as for v4 — the inbound
+     * traffic a mapping opens would bypass it and the request would name the
+     * address the user is hiding. pm_open is only reached from a tick that already
+     * refuses both, so this is the guard on the socket itself, not a copy of the
+     * caller's. */
+    if (!pm->cfg || pm->cfg->proxy || pm->cfg->tunnel) return 0;
+    if (!pm->gw6_seen) return 0; /* no usable ::/0 in /proc/net/ipv6_route */
+    pm->gw6_tried = 1;
+    if (pm6_link_local(pm->gw6.addr)) {
+        unsigned idx = if_nametoindex(pm->gw6.iface);
+        /* A link-local address with no resolvable interface is not a gateway this
+         * socket can reach: without a scope the kernel has no way to pick a device
+         * (and says EINVAL for the attempt), so v6 is skipped for this sequence
+         * rather than connected to an address that means nothing. */
+        if (idx == 0) return 0;
+        pm->gw6_scope = idx;
+    }
+    int fd = ntx_sock_udp6(); /* AF_INET6, non-blocking, IPV6_V6ONLY=1 */
+    if (fd < 0) return 0;
+    struct sockaddr_in6 sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin6_family = AF_INET6;
+    memcpy(&sa.sin6_addr, pm->gw6.addr, 16);
+    sa.sin6_port = htons(pm_gw6_port());
+    sa.sin6_scope_id = pm->gw6_scope;
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0) {
+        pm->gw6_err = errno;
+        close(fd);
+        return 0;
+    }
+    pm->fd6 = fd;
+    pm->gw6_connected = 1;
+    ntx_cbs cbs;
+    memset(&cbs, 0, sizeof cbs);
+    cbs.r = pm_on_rw6;
+    cbs.cl = pm_on_err6;
+    ntx_netx_add(pm->netx, fd, EPOLLIN, pm, &cbs);
+    return 1;
+}
+
 /* EPOLLERR/EPOLLHUP (R9). The error must be read here, in the callback epoll gives
  * for it: an unread SO_ERROR stays pending, the level-triggered event never goes
  * away and the loop stops blocking. */
@@ -819,20 +1012,24 @@ static int pm_open(struct ntx_portmap *pm) {
     uint32_t gw = 0;
     int have = pm_route4(&gw);
     /* R15 / S17a: the v6 default is read and kept on every sequence, whether or not
-     * the v4 one answered. S17b is what dials it; until then the driver stays on the
-     * v4 socket, so a v6-only host still maps nothing — but the address the next
-     * sub-step needs is parsed, judged and pinned by the test. */
+     * the v4 one answered. */
     struct pm_gw6 g6;
     if (pm_route6(&g6)) {
         pm->gw6 = g6;
         pm->gw6_seen = 1;
     }
+    /* S17b: the v6 half is opened from the v6 route ALONE, before the v4 verdict — a
+     * host whose v4 default is missing still gets its v6 socket, and a host whose v4
+     * gateway refuses still keeps it. The call reads gw6_seen/gw6, writes only the
+     * fd6/gw6_* fields, and cannot move the v4 state: `st`, `phase`, `tries`, `gap`,
+     * `next_try` and the grants stay whatever the v4 path leaves them.
+     * ponytail: the ceiling is that the connected v6 socket is not yet reported
+     * anywhere (`st` is still the v4 sequence's alone, which is why a v6-only host
+     * still reads NONE). Upgrade path: S17d adds port_map6/ext_port6 and aggregates
+     * the two families into the reported `port_map`. */
+    (void)pm_open6(pm);
     /* No v4 route means no v4 gateway to dial: the v6 nexthop cannot be widened into
-     * one (that v4-mapped read is R15), and the socket here is AF_INET. The answer is
-     * NONE today and an AF_INET6 PCP sequence in S17b.
-     * ponytail: the ceiling of S17a — `gw6` is parsed, judged and kept, and nothing
-     * dials it yet. Upgrade path: S17b connects AF_INET6 UDP to gw6.addr:5351 with
-     * sin6_scope_id = if_nametoindex(gw6.iface) and takes this branch instead. */
+     * one (that v4-mapped read is R15), and the socket here is AF_INET. */
     if (!have) {
         pm->st = NTX_PM_NONE;
         pm->gave_up = 1;

@@ -8,6 +8,7 @@
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -218,6 +219,19 @@ static const char V6_ROUTES_REAL[] =
 static const uint8_t V6_NH_FE80_1[16] = {0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
 static const uint8_t V6_NH_FE80_2[16] = {0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2};
 
+/* S17b: the same default with a gateway this box can actually reach. lo holds
+ * ::1/128 here and NO interface has a link-local prefix, so a fe80:: nexthop is
+ * undialable in this sandbox (probed: connect("fe80::1%lo") = ENETUNREACH, and
+ * EINVAL on every interface whose IPv6 is off) while ::1 connects. The scope
+ * rules therefore get pinned on the value the driver hands connect() plus the
+ * kernel's answer, not on a round trip to a router that cannot exist here. */
+#define V6_NH_LO "00000000000000000000000000000001 " /* nexthop ::1 */
+#define V6_DEFAULT_LO V6_DPY V6_NH_LO V6_MET V6_RU "00000003" "   lo\n"
+/* fe80::1 reached through `iface` — for the sin6_scope_id cases. */
+#define V6_LINKLOCAL(iface) V6_DPY V6_NH1 V6_MET V6_RU "00000003" "   " iface "\n"
+/* [::1], the one v6 address this box routes. */
+static const uint8_t V6_LO_ADDR[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+
 /* Default route through the fake gateway. /proc/net/route prints the gateway as
  * a host-byte-order hex u32 (127.0.0.1 → 0100007F, 203.0.113.1 → 017100CB);
  * /proc/net/ipv6_route prints 16 raw bytes in network order. */
@@ -336,6 +350,140 @@ static void gw_to(const uint8_t *b, size_t n, int from_fd) {
 
 static void gw_send(const uint8_t *b, size_t n) { gw_to(b, n, gwd); }
 
+/* ---- S17b: the fake gateway's IPv6 sibling ---------------------------------
+ * The v4 fake above never needed an address: both of its fixtures are 127.0.0.1
+ * and ntx_portmap_test_set_gateway_port carries a port alone. A v6 gateway needs
+ * BOTH — its address is whatever /proc/net/ipv6_route names — so S17b gets a port
+ * hook of its own (pm_gw_port() and pm_gw6_port() stay separate on purpose: a case
+ * must be able to hand v4 a live gateway and v6 a dead one, which is how the two
+ * halves are proven independent).
+ *
+ * A link-local gateway cannot be reached from this box: `cat /proc/net/if_inet6`
+ * holds only ::1/128 on lo, so connect("fe80::1%lo") is ENETUNREACH while the same
+ * connect WITHOUT a scope is EINVAL (both probed here). Those two errnos are what
+ * make the scope rule testable at all — the kernel only reaches a route lookup once
+ * a scope was applied — and getpeername cannot show it: it answers the peer scope
+ * from sk_bound_dev_if, which a connect-time sin6_scope_id does not set (also
+ * probed), so it reads 0 even for a socket connected to [::1] with scope 1. */
+
+static int gw6d = -1;
+static uint16_t gw6_port;
+static struct sockaddr_in6 gw6_from; /* who sent the last v6 request */
+
+static void gw6_mk(struct sockaddr_in6 *sa, const char *ip, uint16_t port) {
+    memset(sa, 0, sizeof *sa);
+    sa->sin6_family = AF_INET6;
+    sa->sin6_port = htons(port);
+    if (inet_pton(AF_INET6, ip, &sa->sin6_addr) != 1) {
+        printf("FAIL gw6 inet_pton %s\n", ip);
+        exit(1);
+    }
+}
+
+/* ::1 on an ephemeral port. Unlike the rest of this file's v6 fixtures the answer
+ * is NOT soft-skipped: this suite is the v6 socket's only proof, and a case that
+ * quietly passed because there was no v6 stack is the failure mode §0.2 warns
+ * about. A box without ::1 therefore reports FAIL here, loudly. */
+static void gw6_start(void) {
+    gw6d = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    struct sockaddr_in6 sa;
+    gw6_mk(&sa, "::1", 0);
+    if (gw6d < 0 || bind(gw6d, (struct sockaddr *)&sa, sizeof sa)) {
+        printf("FAIL gw6 bind ::1 — no IPv6 loopback in this environment\n");
+        exit(1);
+    }
+    socklen_t sl = sizeof sa;
+    getsockname(gw6d, (struct sockaddr *)&sa, &sl);
+    gw6_port = ntohs(sa.sin6_port);
+    ntx_portmap_test_set_gateway6_port(gw6_port);
+}
+
+static ssize_t gw6_get(uint8_t *buf, size_t cap) {
+    struct sockaddr_in6 f;
+    socklen_t fl = sizeof f;
+    ssize_t r = recvfrom(gw6d, buf, cap, MSG_DONTWAIT, (struct sockaddr *)&f, &fl);
+    if (r >= 0) gw6_from = f;
+    return r;
+}
+
+static void gw6_drain(void) {
+    uint8_t buf[2048];
+    while (gw6_get(buf, sizeof buf) >= 0) {
+    }
+}
+
+static int gw6_pending(void) {
+    uint8_t buf[2048];
+    return gw6_get(buf, sizeof buf) >= 0;
+}
+
+/* One datagram from the v6 gateway to a specific peer — the driver's connected
+ * socket, which never sends in S17b, so the gateway cannot learn it by listening.
+ * A peer the driver never connected to is the failure the case is about, so this
+ * reports it and carries on instead of ending the run: the later cases each pin
+ * their own behaviour and must still get their turn. */
+static void gw6_to(const uint8_t *b, size_t n, const struct sockaddr_in6 *to) {
+    if (sendto(gw6d, b, n, 0, (struct sockaddr *)to, sizeof *to) < 0) {
+        printf("FAIL gw6 send: %s\n", strerror(errno));
+        fails++;
+    }
+}
+
+/* An ephemeral v6 port that is bound, learned and released: nothing answers there,
+ * so a datagram sent to it comes back as ICMPv6 port-unreachable — the v6 sibling
+ * of dead_port(), whose ECONNREFUSED the v6 half must judge without a fallback. */
+static uint16_t dead_port6(void) {
+    uint16_t p = 0;
+    int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    struct sockaddr_in6 sa;
+    gw6_mk(&sa, "::1", 0);
+    if (fd < 0 || bind(fd, (struct sockaddr *)&sa, sizeof sa) < 0) {
+        printf("FAIL dead_port6 bind: %s\n", strerror(errno));
+        exit(1);
+    }
+    socklen_t sl = sizeof sa;
+    getsockname(fd, (struct sockaddr *)&sa, &sl);
+    p = ntohs(sa.sin6_port);
+    close(fd);
+    return p;
+}
+
+/* The control for the scope cases: the same connect() pm_open6 makes for a
+ * link-local gateway, with the scope left at 0. The kernel cannot pick a device for
+ * a link-local destination without one and refuses with EINVAL before any route
+ * lookup, so a SCOPED attempt whose errno is not EINVAL is the proof that a scope
+ * was applied. getpeername cannot show the scope: it answers from sk_bound_dev_if,
+ * which a connect()-time sin6_scope_id does not touch. */
+static int v6_probe_scopeless(void) {
+    int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    int one = 1;
+    setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
+    struct sockaddr_in6 sa;
+    gw6_mk(&sa, "fe80::1", 5351);
+    sa.sin6_scope_id = 0;
+    int rc = connect(fd, (struct sockaddr *)&sa, sizeof sa);
+    int err = rc < 0 ? errno : 0;
+    close(fd);
+    return err;
+}
+
+/* The peer the driver's v6 socket is connected to, straight off the kernel. */
+static int pm6_peername(struct ntx_portmap *pm, struct sockaddr_in6 *out) {
+    if (!pm || pm->fd6 < 0) return -1;
+    socklen_t l = sizeof *out;
+    memset(out, 0, sizeof *out);
+    return getpeername(pm->fd6, (struct sockaddr *)out, &l);
+}
+
+/* The driver's own v6 endpoint — the address the gateway answers to. */
+static int pm6_sockname(struct ntx_portmap *pm, struct sockaddr_in6 *out) {
+    if (!pm || pm->fd6 < 0) return -1;
+    socklen_t l = sizeof *out;
+    memset(out, 0, sizeof *out);
+    return getsockname(pm->fd6, (struct sockaddr *)out, &l);
+}
+
 static void pcp_resp(uint8_t out[60], const uint8_t req[60], uint16_t ext_port, const uint8_t ext_ip[16],
                      uint32_t lifetime, uint32_t epoch) {
     gw_reply_at = pm_now(); /* the Epoch on the wire is read from the instant of this answer */
@@ -399,6 +547,13 @@ typedef struct {
     ntx_session *s;
 } sess;
 
+/* Field reads for the cases where mapping is refused outright: §5 keeps the driver
+ * from being allocated at all, so `x->s->pm` is NULL and a bare `pm->fd6` would
+ * read freed memory instead of failing the way it should. */
+static long pm6_fd(const sess *x) { return x->s->pm ? (long)x->s->pm->fd6 : -1; }
+static long pm6_v4fd(const sess *x) { return x->s->pm ? (long)x->s->pm->fd : -1; }
+static long pm6_tried(const sess *x) { return x->s->pm ? (long)x->s->pm->gw6_tried : 0; }
+
 /* `port_map` is handed to ntx_config BEFORE the session is built, which is the
  * production order (parse_args → ntx_netx_init → ntx_session_init) and the whole
  * point of the R16 cases: what a session does at bring-up with --port-map set.
@@ -437,8 +592,10 @@ static void sess_open_pm(sess *x, const char *tag, int port_map, int proxy) {
         exit(1);
     }
     /* The previous case's stop() leaves its lifetime-0 deletes queued on the fake
-     * gateway; a case must never read another case's datagram. */
+     * gateway; a case must never read another case's datagram. Same for the v6
+     * sibling, whose socket outlives every case. */
     gw_drain();
+    gw6_drain();
 }
 
 /* port_map 0 ("automatic with a share", i.e. --no flag given): the state-machine
@@ -937,6 +1094,7 @@ int main(void) {
     }
     write_routes(GW_LO);
     gw_start();
+    gw6_start();
 
     /* ---- A. PCP grants a different external port: state, adv_port, announce, ext `p` ---- */
     {
@@ -2727,6 +2885,471 @@ int main(void) {
         write_routes(GW_LO);
         gw_drain();
     }
+
+    /* ---- S. R15 / S17b: the AF_INET6 PCP socket and its source rule.
+
+     * S17b is the socket and the receive-side validation only: nothing here sends a
+     * v6 PCP MAP request (S17c), so the two rules the sub-step is made of — connect
+     * to the v6 gateway:5351 with a scope for a link-local router, and accept a
+     * datagram only from that gateway address INCLUDING its scope and on 5351 — are
+     * pinned on the socket the kernel holds (getpeername) and on the rx counters
+     * (rx6_seen / rx6_ok) the driver keeps for exactly that purpose. */
+    {
+        /* S1. the socket is opened and connected when the v6 default names a gateway
+         * this box can reach: [::1] on the fake gateway's port, which is why the v6
+         * half needed an address-aware hook of its own (the v4 hook carries a port
+         * alone, and both v4 fixtures are 127.0.0.1). */
+        sess x;
+        sess_open(&x, "s1");
+        x.cfg.port_map = 1;
+        write_routes(GW_LO);
+        write_route6(V6_DEFAULT_LO, v4path);
+        pm_start(&x);
+        pump_ms(x.n, 20);
+        ck(x.s->pm->fd6 >= 0, "S1_v6_socket_opened");
+        ck_eq(x.s->pm->gw6_connected, 1, "S1_v6_connected_flag");
+        ck_eq(x.s->pm->gw6_tried, 1, "S1_v6_attempt_recorded");
+        struct sockaddr_in6 peer;
+        ck(pm6_peername(x.s->pm, &peer) == 0, "S1_v6_getpeername");
+        ck(peer.sin6_family == AF_INET6, "S1_v6_peer_family");
+        ck_eq(ntohs(peer.sin6_port), (long)gw6_port, "S1_v6_peer_is_gateway_port");
+        ck(memcmp(peer.sin6_addr.s6_addr, V6_LO_ADDR, 16) == 0, "S1_v6_peer_is_gateway_addr");
+        ck_eq(x.s->pm->gw6_err, 0, "S1_no_v6_error");
+        /* The v4 sequence is untouched by all of it: same state, same phase, and the
+         * v4 request still goes to the v4 fake — nothing is sent to the v6 one yet. */
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "S1_v4_sequence_untouched");
+        ck_eq(x.s->pm->phase, PM_PH_TCP, "S1_v4_phase_untouched");
+        ck(gw_pending(), "S1_v4_request_still_on_v4_wire");
+        ck(!gw6_pending(), "S1b_no_v6_request_yet"); /* no v6 MAP before S17c */
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+
+        /* S1c. no usable v6 default (only networkd's lo blackhole): no socket and no
+         * attempt, while the v4 half behaves exactly as before. */
+        sess_open(&x, "s1c");
+        x.cfg.port_map = 1;
+        write_route6(V6_LO_BLACKHOLE, v4path);
+        pm_start(&x);
+        pump_ms(x.n, 20);
+        ck_eq(x.s->pm->gw6_seen, 0, "S1c_no_v6_route");
+        ck_eq(x.s->pm->fd6, -1, "S1c_no_v6_socket_without_route");
+        ck_eq(x.s->pm->gw6_tried, 0, "S1c_no_attempt_without_route");
+        ck(x.s->pm->fd >= 0, "S1c_v4_socket_still_open");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "S1c_v4_pending");
+        ck(gw_pending(), "S1c_v4_request_on_wire");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+
+        /* S1d. the v6 half opens from the v6 route ALONE: with no v4 default in the
+         * table the v4 sequence says NONE and the v6 socket is still connected. That
+         * state is the one R15 left unreachable — a v6-only host got nothing. */
+        {
+            char nov4[256];
+            snprintf(nov4, sizeof nov4, "%s/s1d_no_v4", SCRATCH);
+            wr(nov4, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+                     "wlP9s9\t0101A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n");
+            sess y;
+            sess_open(&y, "s1d");
+            y.cfg.port_map = 1;
+            write_route6(V6_DEFAULT_LO, nov4);
+            pm_start(&y);
+            pump_ms(y.n, 20);
+            ck(y.s->pm->fd6 >= 0, "S1d_v6_socket_without_v4_default");
+            ck(y.s->pm->fd < 0, "S1d_no_v4_socket_without_v4_default");
+            ck(ntx_session_portmap_state(y.s) == NTX_PM_NONE, "S1d_v4_state_none");
+            ck(!gw_pending(), "S1d_no_v4_datagram");
+            sess_close(&y);
+        }
+    }
+
+    /* ---- S2. a link-local gateway gets sin6_scope_id = if_nametoindex(iface).
+     *
+     * getpeername cannot witness this: the kernel answers the peer scope from
+     * sk_bound_dev_if, which a connect()-time sin6_scope_id does not set, so it
+     * reads 0 for a socket connected to [::1] with scope 1 (probed while writing
+     * this). What IS observable is the kernel's answer to the connect itself, and
+     * the two halves of that answer separate cleanly: a link-local connect WITHOUT
+     * a scope is EINVAL (no device can be chosen), WITH a scope it is the route
+     * lookup's ENETUNREACH — this box has no link-local prefix on any interface
+     * (`cat /proc/net/if_inet6` holds only ::1/128 on lo), so neither one can
+     * connect, and only the scoped attempt reaches a routing decision at all.
+     * v6_probe_scopeless() is the control: the same connect the driver makes,
+     * without the scope, so the assertion is a differential and not a guess. */
+    {
+        const unsigned lo_idx = if_nametoindex("lo");
+        ck(lo_idx != 0, "S2_precondition_lo_resolves");
+
+        sess x;
+        sess_open(&x, "s2");
+        x.cfg.port_map = 1;
+        write_routes(GW_LO);
+        write_route6(V6_LINKLOCAL("lo"), v4path);
+        pm_start(&x);
+        pump_ms(x.n, 20);
+        ck_eq(x.s->pm->gw6_seen, 1, "S2_link_local_route_seen");
+        ck_eq(x.s->pm->gw6_tried, 1, "S2_link_local_attempted");
+        ck_eq(x.s->pm->gw6_scope, (long)lo_idx, "S2_scope_is_if_nametoindex_iface");
+        /* The differential that proves the scope reached connect(): a SCOPELESS
+         * link-local connect is always EINVAL (the kernel has no device to pick and
+         * says so before any route lookup), so the driver's attempt must NOT report
+         * EINVAL — on this box it reports ENETUNREACH, the routing decision only a
+         * scoped attempt is allowed to reach. Whether it then connects is the box's
+         * business (a router with a link-local prefix answers it), so the pairing is
+         * what is asserted, not one errno. */
+        ck_eq(v6_probe_scopeless(), EINVAL, "S2_control_scopeless_is_EINVAL");
+        ck(x.s->pm->gw6_err != EINVAL, "S2_scoped_connect_reached_the_route_lookup");
+        ck(x.s->pm->gw6_err != 0 || x.s->pm->fd6 >= 0, "S2_v6_connected_only_when_kernel_took_it");
+        ck(x.s->pm->gw6_err == 0 || x.s->pm->fd6 < 0, "S2_v6_socket_dropped_on_refusal");
+        /* The v4 half of the same sequence is untouched. */
+        ck(x.s->pm->fd >= 0, "S2_v4_socket_open");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "S2_v4_pending");
+        ck(gw_pending(), "S2_v4_request_on_wire");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+
+        /* S2b. the same link-local gateway through an interface that does not exist:
+         * the scope is not a number to invent, so v6 is skipped outright — before any
+         * connect() — and the v4 sequence carries on as if v6 had never been mentioned. */
+        sess_open(&x, "s2b");
+        x.cfg.port_map = 1;
+        write_route6(V6_LINKLOCAL("nosuchif9"), v4path);
+        pm_start(&x);
+        pump_ms(x.n, 20);
+        ck_eq(x.s->pm->gw6_seen, 1, "S2b_route_seen");
+        ck_eq(x.s->pm->gw6_tried, 1, "S2b_attempt_marked");
+        ck_eq(x.s->pm->gw6_scope, 0, "S2b_no_scope_invented");
+        ck_eq(x.s->pm->fd6, -1, "S2b_v6_skipped");
+        ck_eq(x.s->pm->gw6_err, 0, "S2b_skipped_not_refused");
+        ck(x.s->pm->fd >= 0, "S2b_v4_unaffected_socket");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "S2b_v4_unaffected_state");
+        ck_eq(x.s->pm->phase, PM_PH_TCP, "S2b_v4_unaffected_phase");
+        ck(gw_pending(), "S2b_v4_request_on_wire");
+        ck_eq(x.s->pm->tries, 1, "S2b_v4_schedule_untouched");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+
+        /* S2c. the name the ROUTE printed is the name that gets resolved — the scope
+         * is not lo's index by hard-coding. A second resolvable interface is the
+         * cleanest witness; where the box has only lo (the case in this sandbox:
+         * if_nametoindex answers for lo and nothing else), a name that differs from
+         * lo's spelling is the witness instead, because a hard-coded index would
+         * still come back non-zero for it. */
+        {
+            char other[IF_NAMESIZE] = "LO"; /* not a name on any Linux box */
+            unsigned oi = 0;
+            for (unsigned i = 2; i < 64 && !oi; i++) {
+                char nm[IF_NAMESIZE];
+                if (if_indextoname(i, nm) && (oi = if_nametoindex(nm)) != 0)
+                    memcpy(other, nm, sizeof other);
+            }
+            char line[512];
+            sess_open(&x, "s2c");
+            x.cfg.port_map = 1;
+            snprintf(line, sizeof line, V6_DPY V6_NH1 V6_MET V6_RU "00000003" "   %s\n", other);
+            write_route6(line, v4path);
+            pm_start(&x);
+            pump_ms(x.n, 20);
+            ck_eq(x.s->pm->gw6_scope, (long)oi, "S2c_scope_follows_the_route_iface");
+            if (oi) ck(x.s->pm->gw6_scope != (long)if_nametoindex("lo"), "S2c_scope_is_not_lo_by_default");
+            ntx_session_portmap_stop(x.s);
+            sess_close(&x);
+        }
+    }
+
+    /* ---- S3. the v6 source rule: gateway address INCLUDING scope, port 5351.
+     *
+     * §8 makes the source test the boundary, not connect(), and this is the one
+     * place ntx accepts unsolicited UDP, so it is pinned both ways.
+     * (a) live: a datagram that the kernel delivers to the connected socket is read
+     *     by the v6 callback and counted, and one the rule rejects is counted as
+     *     seen-but-not-accepted — the drop happens inside pm_on_rw6 with the packet
+     *     already in hand, because the test moves the rule's own expectation
+     *     (pm->gw6.addr / the port hook / the scope) out from under it. That is what
+     *     makes the drop observable instead of merely unfalsifiable.
+     * (b) direct on pm_src6_ok: the two cases the connected socket can never show,
+     *     because the kernel drops them before recvfrom reports anything — a wrong
+     *     source ADDRESS and a wrong SCOPE. Same reasoning as case B2 above. */
+    {
+        sess x;
+        sess_open(&x, "s3");
+        x.cfg.port_map = 1;
+        write_routes(GW_LO);
+        write_route6(V6_DEFAULT_LO, v4path);
+        pm_start(&x);
+        pump_ms(x.n, 20);
+        ck(x.s->pm->fd6 >= 0, "S3_v6_socket_open");
+        struct sockaddr_in6 me;
+        ck(pm6_sockname(x.s->pm, &me) == 0, "S3_v6_getsockname");
+
+        uint8_t junk[16];
+        memset(junk, 0xA7, sizeof junk);
+        const uint32_t v4_phase_before = (uint32_t)x.s->pm->phase;
+        const int v4_state_before = (int)ntx_session_portmap_state(x.s);
+
+        /* (a1) from the gateway address on the gateway port: delivered AND accepted. */
+        gw6_to(junk, sizeof junk, &me);
+        pump_ms(x.n, 40);
+        ck_eq(x.s->pm->rx6_seen, 1, "S3_gateway_datagram_read");
+        ck_eq(x.s->pm->rx6_ok, 1, "S3_gateway_datagram_accepted");
+        /* Nothing is consumed by it: no parser and no request before S17c, so the v4
+         * sequence cannot have moved either. */
+        ck_eq(x.s->pm->phase, (long)v4_phase_before, "S3_v4_phase_not_moved_by_v6_rx");
+        ck_eq((int)ntx_session_portmap_state(x.s), v4_state_before, "S3_v4_state_not_moved_by_v6_rx");
+        ck_eq(x.s->pm->active[PM_PH_TCP], 0, "S3_v6_datagram_grants_nothing");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "S3_v6_datagram_no_adv_port");
+
+        /* (a2) same packet, expectation moved to a DIFFERENT gateway address: the
+         * kernel still delivers (the peer is the one connect() set), so the drop is
+         * provably ours. */
+        uint8_t other[16];
+        memset(other, 0x20, 16);
+        other[0] = 0x20;
+        other[1] = 0x01;
+        uint8_t saved6[16];
+        memcpy(saved6, x.s->pm->gw6.addr, 16);
+        memcpy(x.s->pm->gw6.addr, other, 16);
+        gw6_to(junk, sizeof junk, &me);
+        pump_ms(x.n, 40);
+        ck_eq(x.s->pm->rx6_seen, 2, "S3_wrong_addr_read");
+        ck_eq(x.s->pm->rx6_ok, 1, "S3_wrong_addr_dropped");
+        memcpy(x.s->pm->gw6.addr, saved6, 16);
+
+        /* (a3) right address, expectation on the port moved: also dropped. */
+        const uint16_t keep = gw6_port;
+        ntx_portmap_test_set_gateway6_port((uint16_t)(keep == 5351u ? 5352u : 5351u));
+        gw6_to(junk, sizeof junk, &me);
+        pump_ms(x.n, 40);
+        ck_eq(x.s->pm->rx6_seen, 3, "S3_wrong_port_read");
+        ck_eq(x.s->pm->rx6_ok, 1, "S3_wrong_port_dropped");
+        ntx_portmap_test_set_gateway6_port(keep);
+
+        /* (a4) right address and port, expectation on the SCOPE moved: the scope is
+         * part of the source, not decoration. */
+        const unsigned sc = x.s->pm->gw6_scope;
+        x.s->pm->gw6_scope = sc == 0u ? 3u : 0u;
+        gw6_to(junk, sizeof junk, &me);
+        pump_ms(x.n, 40);
+        ck_eq(x.s->pm->rx6_seen, 4, "S3_wrong_scope_read");
+        ck_eq(x.s->pm->rx6_ok, 1, "S3_wrong_scope_dropped");
+        x.s->pm->gw6_scope = sc;
+
+        /* The budget of PM_RX_BUDGET datagrams per callback does not lose the good
+         * one that follows four bad ones. */
+        gw6_to(junk, sizeof junk, &me);
+        pump_ms(x.n, 40);
+        ck_eq(x.s->pm->rx6_seen, 5, "S3_fifth_datagram_read");
+        ck_eq(x.s->pm->rx6_ok, 2, "S3_good_datagram_after_bad_ones_accepted");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+
+        /* (b) the filter itself, on a probe the way B2 does it: the address, the
+         * scope and the port each have to match, and nothing else may pass. */
+        {
+            struct ntx_portmap probe;
+            memset(&probe, 0, sizeof probe);
+            memcpy(probe.gw6.addr, V6_LO_ADDR, 16);
+            probe.gw6_scope = 2u;
+            struct sockaddr_in6 sa;
+            gw6_mk(&sa, "::1", gw6_port);
+            sa.sin6_scope_id = 2u;
+            ck(pm_src6_ok(&probe, &sa), "S3b_gateway_src_accepted");
+            sa.sin6_port = htons((uint16_t)(gw6_port == 5351u ? 5352u : 5351u));
+            ck(!pm_src6_ok(&probe, &sa), "S3b_wrong_port_rejected");
+            gw6_mk(&sa, "::1", gw6_port);
+            sa.sin6_scope_id = 3u;
+            ck(!pm_src6_ok(&probe, &sa), "S3b_wrong_scope_rejected");
+            gw6_mk(&sa, "::2", gw6_port);
+            sa.sin6_scope_id = 2u;
+            ck(!pm_src6_ok(&probe, &sa), "S3b_wrong_addr_rejected");
+            gw6_mk(&sa, "fe80::1", gw6_port);
+            sa.sin6_scope_id = 2u;
+            ck(!pm_src6_ok(&probe, &sa), "S3b_link_local_addr_rejected_for_global_gw");
+            /* A link-local gateway is only the same source with the same scope. */
+            memcpy(probe.gw6.addr, V6_NH_FE80_1, 16);
+            probe.gw6_scope = 2u;
+            gw6_mk(&sa, "fe80::1", gw6_port);
+            sa.sin6_scope_id = 2u;
+            ck(pm_src6_ok(&probe, &sa), "S3b_link_local_gw_with_scope_accepted");
+            sa.sin6_scope_id = 0u;
+            ck(!pm_src6_ok(&probe, &sa), "S3b_link_local_gw_without_scope_rejected");
+            sa.sin6_scope_id = 2u;
+            sa.sin6_family = AF_INET;
+            ck(!pm_src6_ok(&probe, &sa), "S3b_wrong_family_rejected");
+        }
+    }
+
+    /* ---- S4. EPOLLERR / ECONNREFUSED on the v6 socket: bounded, and it does not
+     * touch the v4 sequence. There is no NAT-PMP fallback to take (RFC 6886 is
+     * IPv4-only), so the v6 half simply ends.
+     *
+     * The v6 gateway port is pointed at a released ephemeral port BEFORE the socket
+     * is opened, so the driver's own socket faces a dead endpoint — the v6 shape of
+     * case N. connect() of a UDP socket takes a dead port happily, so the ICMP is
+     * armed by one send on the driver's fd exactly as pm_arm_icmp does for v4, and
+     * nothing else sends from here. */
+    {
+        sess x;
+        sess_open(&x, "s4");
+        x.cfg.port_map = 1;
+        write_routes(GW_LO);
+        write_route6(V6_DEFAULT_LO, v4path);
+        const uint16_t keep = gw6_port;
+        ntx_portmap_test_set_gateway6_port(dead_port6());
+        pm_start(&x);
+        pump_ms(x.n, 20);
+        ck(x.s->pm->fd6 >= 0, "S4_v6_socket_opened_to_dead_port");
+        struct sockaddr_in6 peer;
+        ck(pm6_peername(x.s->pm, &peer) == 0, "S4_connected_before_the_error");
+        ck_eq(x.s->pm->fam, PM_PCP, "S4_v4_starts_as_pcp");
+        ck_eq(x.s->pm->phase, PM_PH_TCP, "S4_v4_query_outstanding");
+
+        uint8_t one[2] = {0, 0};
+        (void)send(x.s->pm->fd6, one, sizeof one, MSG_DONTWAIT);
+        struct timespec ts = {0, 100 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+        /* One pass of the loop must see the error and judge it: EPOLLIN and EPOLLERR
+         * arrive together and the clock never moves here. */
+        int spins = 0;
+        while (x.s->pm->fd6 >= 0 && spins++ < 50) ntx_netx_run_once(x.n, 2);
+        ck(spins < 50, "S4_v6_error_judged_promptly");
+        ck_eq(x.s->pm->fd6, -1, "S4_v6_half_ended_by_refusal");
+        ck_eq(x.s->pm->gw6_err, ECONNREFUSED, "S4_refusal_recorded");
+        /* It stayed a v6-only verdict: the family is still PCP — no NAT-PMP step —
+         * the v4 query that was outstanding is still the outstanding one, and the v4
+         * socket is open. */
+        ck_eq(x.s->pm->fam, PM_PCP, "S4_no_natpmp_fallback_from_v6");
+        ck_eq(x.s->pm->phase, PM_PH_TCP, "S4_v4_query_still_outstanding");
+        ck_eq(x.s->pm->tries, 1, "S4_v4_schedule_untouched");
+        ck(x.s->pm->fd >= 0, "S4_v4_socket_alive");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "S4_v4_state_alive");
+
+        /* No spin: the callback read SO_ERROR, so half a second of wall time still
+         * buys a bounded number of iterations. */
+        long iters = pm_loop_iters(x.n, 500);
+        if (iters >= 5000) printf("  (v6 spin: %ld loop iterations in 0,5 s)\n", iters);
+        ck(iters < 5000, "S4_bounded_loop_after_v6_icmp");
+
+        /* The v4 sequence still works after the v6 half died: grant it and the state
+         * and adv_port move, which no v6 refusal was allowed to prevent. */
+        uint8_t pub[16];
+        pcp_v4(pub, 200, 0, 2, 1);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "S4_v4_grant_after_v6_refusal");
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "S4_v4_adv_port_after_v6_refusal");
+        ntx_portmap_test_set_gateway6_port(keep);
+        gw_drain();
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- S4b. the other half of the error rule: an error that is NOT a refusal
+     * ends the v6 half without a step to NAT-PMP either.
+     *
+     * S17b never sends on the v6 socket, so the only errno that can reach the v6
+     * error path from outside is the ICMP one case S4 already drives; a hard socket
+     * error (EPIPE, ENOBUFS …) therefore gets the direct probe case B2 uses for
+     * pm_src_ok. What is pinned is the SEPARATION: pm_sock_err6 must not reach
+     * pm_sock_err's family, phase, tries or grants. */
+    {
+        sess x;
+        sess_open(&x, "s4b");
+        x.cfg.port_map = 1;
+        write_routes(GW_LO);
+        write_route6(V6_DEFAULT_LO, v4path);
+        pm_start(&x);
+        pump_ms(x.n, 20);
+        ck(x.s->pm->fd6 >= 0, "S4b_v6_socket_open");
+        const int v4_fd = x.s->pm->fd;
+        const int v4_phase = x.s->pm->phase;
+        const int v4_tries = x.s->pm->tries;
+        pm_sock_err6(x.s->pm, EPIPE);
+        ck_eq(x.s->pm->fd6, -1, "S4b_hard_error_ends_v6_half");
+        ck_eq(x.s->pm->gw6_err, EPIPE, "S4b_hard_error_recorded");
+        ck_eq(x.s->pm->fam, PM_PCP, "S4b_hard_error_takes_no_natpmp_step");
+        ck(x.s->pm->fd >= 0, "S4b_v4_socket_alive");
+        ck_eq(x.s->pm->fd, (long)v4_fd, "S4b_v4_socket_is_the_same_fd");
+        ck_eq(x.s->pm->phase, (long)v4_phase, "S4b_v4_phase_untouched");
+        ck_eq(x.s->pm->tries, (long)v4_tries, "S4b_v4_schedule_untouched");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "S4b_v4_state_alive");
+        long iters = pm_loop_iters(x.n, 300);
+        if (iters >= 5000) printf("  (v6 spin: %ld loop iterations in 0,3 s)\n", iters);
+        ck(iters < 5000, "S4b_bounded_loop_after_v6_hard_error");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* ---- S5. --proxy / --tunnel / --no-port-map: no v6 socket at all, exactly as
+     * for v4 (§5). With mapping refused the driver is never even allocated, so the
+     * probe helpers answer -1/0 for a session that has no pm at all. */
+    {
+        sess x;
+        sess_open_pm(&x, "s5", 1, 1); /* --port-map together with --proxy */
+        write_routes(GW_LO);
+        write_route6(V6_DEFAULT_LO, v4path);
+        pm_start(&x);
+        pump_ms(x.n, 20);
+        ck_eq(pm6_fd(&x), -1, "S5_no_v6_socket_under_proxy");
+        ck_eq(pm6_tried(&x), 0, "S5_no_v6_attempt_under_proxy");
+        ck_eq(pm6_v4fd(&x), -1, "S5_no_v4_socket_under_proxy");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_OFF, "S5_off_under_proxy");
+        ck(!gw6_pending(), "S5_no_v6_datagram_under_proxy");
+        sess_close(&x);
+
+        sess_open(&x, "s5b");
+        x.cfg.port_map = 1;
+        x.cfg.tunnel = 1;
+        x.cfg.tunnel_host = "127.0.0.1";
+        x.cfg.tunnel_port = 4444;
+        pm_start(&x);
+        pump_ms(x.n, 20);
+        ck_eq(pm6_fd(&x), -1, "S5_no_v6_socket_under_tunnel");
+        ck_eq(pm6_tried(&x), 0, "S5_no_v6_attempt_under_tunnel");
+        ck(!gw6_pending(), "S5_no_v6_datagram_under_tunnel");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_OFF, "S5_off_under_tunnel");
+        sess_close(&x);
+
+        sess_open(&x, "s5c");
+        x.cfg.port_map = -1;
+        pm_start(&x);
+        pump_ms(x.n, 20);
+        ck_eq(pm6_fd(&x), -1, "S5_no_v6_socket_with_no_port_map");
+        ck_eq(pm6_v4fd(&x), -1, "S5_no_v4_socket_with_no_port_map");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_OFF, "S5_off_with_no_port_map");
+        sess_close(&x);
+    }
+
+    /* ---- S6. stop() takes the v6 half down with the v4 one, and a fresh sequence
+     * starts from clean counters. */
+    {
+        sess x;
+        sess_open(&x, "s6");
+        x.cfg.port_map = 1;
+        write_routes(GW_LO);
+        write_route6(V6_DEFAULT_LO, v4path);
+        pm_start(&x);
+        pump_ms(x.n, 20);
+        ck(x.s->pm->fd6 >= 0, "S6_opened");
+        struct sockaddr_in6 me;
+        pm6_sockname(x.s->pm, &me);
+        uint8_t junk[8] = {9, 9, 9, 9, 9, 9, 9, 9};
+        gw6_to(junk, sizeof junk, &me);
+        pump_ms(x.n, 40);
+        ck_eq(x.s->pm->rx6_ok, 1, "S6_datagram_accepted");
+        ntx_session_portmap_stop(x.s);
+        ck(!x.s->pm, "S6_stop_frees_the_driver");
+        /* Re-arming starts a clean sequence: fresh counters, both sockets open. */
+        ntx_session_portmap_want(x.s, 1);
+        pm_tick(&x);
+        pump_ms(x.n, 20);
+        ck(x.s->pm && x.s->pm->fd6 >= 0, "S6_socket_reopened");
+        ck_eq(x.s->pm->rx6_seen, 0, "S6_fresh_sequence_resets_counters");
+        ck_eq(x.s->pm->rx6_ok, 0, "S6_fresh_sequence_resets_accepted");
+        sess_close(&x);
+    }
+
+    write_routes(GW_LO);
+    gw_drain();
+    gw6_drain();
 
     close(gwd);
     if (fails) {
