@@ -4512,6 +4512,158 @@ int main(void) {
         gw6_drain();
     }
 
+    /* ---- V. R19: the UDP ask names the port the TCP mapping holds, and a gateway
+     * that hands UDP another one is flagged.
+
+     * One announce carries one port — `ntx_session_adv_port` reads the TCP grant alone
+     * — so a gateway that mapped TCP to port X and UDP to port Y leaves the peer
+     * guessing which of the two it reached. The ask therefore suggests `ext[TCP]`
+     * whenever the TCP mapping is held (RFC 6887 §11.1: the suggested external port is
+     * a preference, not a demand), and a gateway that grants UDP something else anyway
+     * is met by one diagnostic line — the UDP port is advertised nowhere, so the grant
+     * is kept and only the divergence is made visible. Pre-fix the fresh UDP ask always
+     * named the listen port: V1_udp_suggests_the_tcp_grant got=6881 want=40123,
+     * V4_udp_suggests_the_tcp_grant got=6881 want=40123, and V3_divergence_flagged had
+     * no line at all in the verbose log.
+     *
+     * The v6 half is untouched by this: S17c pins a granted v6 external port to the
+     * listen port (pm_grant6 deletes anything else), so there the two rules would be
+     * the same rule, and suggesting the TCP grant could only ask for a port the v6
+     * sequence would then delete. */
+
+    /* V1. PCP, TCP granted a foreign port: the UDP ask suggests THAT port, and keeps
+     * the listen port as its internal port (§11.1: internal port, external preference
+     * — the two fields are not the same thing). */
+    write_routes(GW_LO);
+    ntx_portmap_test_set_client6(NULL);
+    {
+        sess x;
+        sess_open(&x, "v1");
+        x.cfg.utp = 1;
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "V1_tcp_grant_is_advertised");
+        gw_drain();
+        uint8_t ureq[60];
+        ck(pm_next_req(&x, NTX_PCP_PROTO_UDP, ureq), "V1_udp_query_out");
+        ck_eq(req_int_port(ureq), ntx_netx_port(x.n), "V1_udp_internal_port_is_listen_port");
+        ck_eq((ureq[42] << 8) | ureq[43], EXT_PORT, "V1_udp_suggests_the_tcp_grant");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        gw_drain();
+    }
+
+    /* V2. the other arm, so V1 cannot be satisfied by always echoing the TCP field:
+     * the TCP grant is GONE (its renewal budget died in silence, R12) when the UDP ask
+     * goes out, so there is no grant to suggest and the ask names the listen port.
+     * Passes before the fix too — this is the guard on the no-grant path. */
+    {
+        sess x;
+        sess_open(&x, "v2");
+        x.cfg.port_map = 1; /* no --utp yet: nothing asks for UDP while TCP is held */
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        gw_drain();
+        ntx_portmap_test_advance_ms(3601000); /* the renew window opens, nobody answers */
+        pm_tick(&x);
+        uint8_t req[2048];
+        ck_eq(gw_get(req, sizeof req), 60, "V2_tcp_renew_sent");
+        ck(pm_burn_budget(&x, PM_PH_TCP), "V2_tcp_budget_exhausted");
+        ck_eq(x.s->pm->active[PM_PH_TCP], 0, "V2_tcp_grant_dropped");
+        x.cfg.utp = 1; /* --utp comes on only after the TCP grant is gone */
+        uint8_t ureq[60];
+        ck(pm_next_req(&x, NTX_PCP_PROTO_UDP, ureq), "V2_udp_query_without_a_tcp_grant");
+        ck_eq(req_int_port(ureq), ntx_netx_port(x.n), "V2_udp_internal_port_is_listen_port");
+        ck_eq((ureq[42] << 8) | ureq[43], ntx_netx_port(x.n), "V2_udp_falls_back_to_the_listen_port");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        gw_drain();
+    }
+
+    /* V3. the gateway ignores the suggestion: UDP gets a port of its own. The grant is
+     * KEPT (it is never advertised, so it costs the swarm nothing) and the divergence
+     * gets one line in the verbose log. */
+    {
+        char diagpath[256];
+        snprintf(diagpath, sizeof diagpath, "%s/diag_v3.log", SCRATCH);
+        unlink(diagpath);
+        ck_eq(ntx_diag_open(diagpath), 0, "V3_diag_capture");
+        sess x;
+        sess_open(&x, "v3");
+        x.cfg.utp = 1;
+        x.cfg.port_map = 1;
+        uint8_t pub[16], rsp[64], ureq[60];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        gw_drain();
+        ck(pm_next_req(&x, NTX_PCP_PROTO_UDP, ureq), "V3_udp_query_out");
+        const uint16_t uport = (uint16_t)(EXT_PORT + 7);
+        pcp_resp(rsp, ureq, uport, pub, 7200, gw_epoch_live(x.s->pm));
+        gw_send(rsp, 60);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck_eq(x.s->pm->active[PM_PH_UDP], 1, "V3_udp_grant_kept");
+        ck_eq(x.s->pm->ext[PM_PH_UDP], (long)uport, "V3_udp_ext_is_the_gateways_port");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "V3_stays_active");
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "V3_adv_port_still_the_tcp_grant");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        char want[64];
+        snprintf(want, sizeof want, "%u", (unsigned)uport);
+        char *text = read_all(diagpath);
+        ck(text && strstr(text, "differs from the TCP port") && strstr(text, want) &&
+               strstr(text, "40123"),
+           "V3_divergence_flagged");
+        free(text);
+        ntx_diag_close();
+        gw_drain();
+    }
+
+    /* V4. the same rule over NAT-PMP (RFC 6886 §3.3): the request keeps opcode 1 for
+     * UDP and the listen port as its INTERNAL port, and the suggested external port
+     * (octets 6..7) becomes the TCP grant. Renewals and deletes keep the granted port
+     * exactly as they were — F4/O1 pin those shapes. */
+    {
+        sess x;
+        sess_open(&x, "v4");
+        x.cfg.utp = 1;
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t req[2048], rsp[16];
+        uint16_t lp = ntx_netx_port(x.n);
+        ck(gw_to_natpmp_map(&x, req, sizeof req) == 12, "V4_natpmp_tcp_query");
+        ck_eq(req[1], 2, "V4_tcp_opcode");
+        natpmp_map_resp(rsp, 2, lp, EXT_PORT, 3600); /* OP 2 = TCP, mapped to EXT_PORT */
+        gw_send(rsp, 16);
+        pump_ms(x.n, 40);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "V4_tcp_active");
+        /* The UDP ask is the next query out. Whether the pump that read the TCP reply
+         * already ran the tick that sends it depends on the 100 ms session timer, so the
+         * case drives the schedule itself and takes the first datagram off the wire —
+         * nothing is drained first, or the query would be thrown away. */
+        uint8_t ureq[64];
+        ssize_t un = -1;
+        for (int i = 0; i < 40 && un < 0; i++) {
+            pm_tick(&x);
+            un = gw_get(ureq, sizeof ureq);
+            if (un < 0) ntx_portmap_test_advance_ms(50);
+        }
+        ck_eq(un, 12, "V4_udp_query_out");
+        ck_eq(ureq[1], 1, "V4_udp_opcode");
+        ck_eq((ureq[4] << 8) | ureq[5], lp, "V4_udp_internal_port_is_listen_port");
+        ck_eq((ureq[6] << 8) | ureq[7], EXT_PORT, "V4_udp_suggests_the_tcp_grant");
+        ck_eq(rd32(ureq + 8), 7200, "V4_udp_asks_for_the_usual_lifetime");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        gw_drain();
+    }
+
     ntx_portmap_test_set_client6(NULL);
     write_routes(GW_LO);
     gw_drain();

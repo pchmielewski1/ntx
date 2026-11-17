@@ -701,7 +701,12 @@ blocking calls.
   own. If the answer
   reports a version mismatch the driver falls back to NAT-PMP (RFC 6886) — an external-address
   request (2 bytes) plus a mapping request (12 bytes) per protocol, opcode 1 for UDP and 2 for
-  TCP. Both directions are mapped on the listen port.
+  TCP. Both directions are mapped on the listen port as the internal port. The suggested external
+  port of a fresh ask is the listen port for TCP and — while the TCP mapping is held — the port
+  that grant assigned (R19): one announce carries one port, so the UDP ask follows the TCP
+  mapping instead of letting the gateway put uTP on a port no peer was ever told about. It stays
+  a preference; a gateway that grants UDP another port anyway keeps the grant (its port is
+  advertised nowhere) and says so on the verbose log.
 - **Peer and port.** Everything goes to the default gateway on port 5351 (`NTX_PCP_PORT`),
   read from `/proc/net/route` (and `/proc/net/ipv6_route`), and the socket is `connect()`ed to
   it. A datagram is fed to the parsers **only** when it comes from that gateway address — the

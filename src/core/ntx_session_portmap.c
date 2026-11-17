@@ -553,6 +553,22 @@ static int pm_udp_wanted(const struct ntx_portmap *pm) { return pm->cfg && pm->c
 
 static uint8_t pm_op_of(int phase) { return (uint8_t)(phase == PM_PH_UDP ? 1 : 2); }
 
+/* R19: what a FRESH ask (no grant in place, so `pm_start_query` draws a new nonce and
+ * names no external address) suggests as its external port. The listen port for TCP,
+ * and for UDP the port the TCP mapping holds whenever there is one. One announce
+ * carries one port — `ntx_session_adv_port` reads the TCP grant alone, the UDP grant is
+ * advertised nowhere — so a gateway that mapped TCP to X and UDP to Y leaves the peer
+ * guessing which it reached; asking for X too is what keeps the two on the same port.
+ * RFC 6887 §11.1 / RFC 6886 §3.3 both make it a PREFERENCE, and the internal port stays
+ * the listen port either way (`pm_build`). A renewal never comes through here: it
+ * already suggests the port its own grant came with.
+ * v4 only: the v6 half's rule (S17c) is that a granted port must EQUAL the listen port,
+ * so suggesting the TCP grant there could only ask for a port pm_grant6 then deletes. */
+static uint16_t pm_sugg_port(const struct ntx_portmap *pm, int phase) {
+    if (phase == PM_PH_UDP && pm->active[PM_PH_TCP] && pm->ext[PM_PH_TCP]) return pm->ext[PM_PH_TCP];
+    return ntx_netx_port(pm->netx);
+}
+
 static void pm_build(struct ntx_portmap *pm, int phase, uint32_t lifetime, uint16_t sugg_port,
                      const uint8_t sugg_ip16[16]) {
     uint16_t lp = ntx_netx_port(pm->netx);
@@ -766,6 +782,17 @@ static void pm_grant(struct ntx_portmap *pm, int phase, uint16_t ext_port, uint3
     if (ext_ip16) memcpy(pm->grant_ip[phase], ext_ip16, 16);
     else memset(pm->grant_ip[phase], 0, 16);
     pm->ext[phase] = ext_port;
+    /* R19: the ask suggested the TCP grant's port (pm_sugg_port) and the gateway
+     * forwarded some other one. The grant is KEPT — the UDP external port is never
+     * advertised anywhere, so nothing the swarm does depends on it — but the two
+     * mappings are now on different ports and a peer that was told the TCP one cannot
+     * reach uTP: the operator has to be able to see that, which is all this line is
+     * (the plan's "flagować rozbieżność"). Not a refusal, and nothing is sent from the
+     * receive path (R10). */
+    if (phase == PM_PH_UDP && pm->active[PM_PH_TCP] && pm->ext[PM_PH_TCP] &&
+        ext_port != pm->ext[PM_PH_TCP])
+        ntx_diag("ntx: port map: UDP port %u differs from the TCP port %u the swarm is told\n",
+                 (unsigned)ext_port, (unsigned)pm->ext[PM_PH_TCP]);
     pm->renew_at[phase] = pm_now() + (uint64_t)(life / 2) * 1000u;
     /* R12: the instant the gateway itself stops forwarding this grant. A renewal that
      * is still in flight past it cannot be assumed held any more, and
@@ -1771,7 +1798,7 @@ void ntx_session_portmap_tick(struct ntx_session *s) {
     for (int i = PM_PH_TCP; i < PM_NPH; i++)
         if (pm->reacq_at[i] && now >= pm->reacq_at[i]) {
             pm->reacq_at[i] = 0;
-            pm_start_query(pm, i, ntx_netx_port(pm->netx));
+            pm_start_query(pm, i, pm_sugg_port(pm, i));
             return;
         }
     if (pm->fam == PM_NATPMP && !pm->addr_done && !pm->failed[PM_PH_ADDR]) {
@@ -1783,7 +1810,7 @@ void ntx_session_portmap_tick(struct ntx_session *s) {
         return;
     }
     if (pm_udp_wanted(pm) && !pm->active[PM_PH_UDP] && !pm->failed[PM_PH_UDP])
-        pm_start_query(pm, PM_PH_UDP, ntx_netx_port(pm->netx));
+        pm_start_query(pm, PM_PH_UDP, pm_sugg_port(pm, PM_PH_UDP));
 }
 
 void ntx_session_portmap_stop(struct ntx_session *s) {
