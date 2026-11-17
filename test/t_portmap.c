@@ -1535,6 +1535,10 @@ int main(void) {
         pm_tick(&x);
         ck(ntx_session_portmap_state(x.s) == NTX_PM_CGNAT, "F_cgnat");
         ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "F_cgnat_adv_port");
+        /* Nothing was ever granted here (the verdict lands on the FIRST ask), so the
+         * verdict owes the gateway nothing: no lifetime-0 datagram. R18's deletes are
+         * for mappings actually held at the instant of the verdict. */
+        ck(!gw_pending(), "F_cgnat_no_grant_no_delete");
         gw_drain();
         for (int i = 0; i < 4; i++) {
             ntx_portmap_test_advance_ms(60000);
@@ -1567,6 +1571,122 @@ int main(void) {
         ck(text && !strstr(text, "CGNAT"), "F_warning_once");
         free(text);
         ntx_diag_close();
+    }
+
+    /* ---- F3 / F4. R18: the CGNAT verdict deletes what it is giving up on.
+     *
+     * `pm_cgnat` dropped the grant state without ever telling the gateway, so the
+     * firewall entries the client had just been handed stayed armed until their
+     * lifetime ran out — up to 7200 s of inbound hole behind a mapping ntx had
+     * publicly given up on. RFC 6887 §11.1 / RFC 6886 §3.3: lifetime 0 with the
+     * nonce the grant was made with, BEFORE `pm_clear_grants` wipes that state
+     * (after it, `active` is 0 and there is nothing left to build the delete from).
+     * Pre-fix both cases: state CGNAT, grants cleared, ZERO datagrams on the wire. */
+
+    /* F3. PCP: the TCP mapping is HELD and the verdict arrives on the UDP ask —
+     * the MAP reply for the phase that never got a grant names a CGNAT external
+     * address. Only the TCP mapping is held, so exactly one delete goes out, with
+     * the TCP grant's nonce (§11.1). */
+    {
+        sess x;
+        sess_open(&x, "f3");
+        x.cfg.utp = 1;
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t pub[16], cgn[16], req[2048], rsp[64], ureq[60], tdel[12];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pcp_v4(cgn, 100, 64, 1, 1);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "F3_active_before_verdict");
+        uint8_t gn[12];
+        memcpy(gn, granted_nonce[NTX_PCP_PROTO_TCP], 12);
+        gw_drain();
+        ck(pm_next_req(&x, NTX_PCP_PROTO_UDP, ureq), "F3_udp_query_out");
+        memset(tdel, 0, sizeof tdel);
+        pcp_resp(rsp, ureq, EXT_PORT, cgn, 7200, gw_epoch_live(x.s->pm));
+        gw_send(rsp, 60);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_CGNAT, "F3_cgnat");
+        int dels = 0, tcp_dels = 0, udp_dels = 0;
+        for (ssize_t r; (r = gw_get(req, sizeof req)) >= 0;) {
+            if (r != 60 || rd32(req + 4) != 0) continue;
+            dels++;
+            if (req[36] == NTX_PCP_PROTO_TCP) {
+                tcp_dels++;
+                memcpy(tdel, req + 24, 12);
+                ck_eq((req[42] << 8) | req[43], EXT_PORT, "F3_delete_suggests_granted_port");
+                ck(memcmp(req + 44, pub, 16) == 0, "F3_delete_suggests_granted_ip");
+            }
+            if (req[36] == NTX_PCP_PROTO_UDP) udp_dels++;
+        }
+        ck_eq(dels, 1, "F3_one_delete_for_the_held_mapping");
+        ck_eq(tcp_dels, 1, "F3_tcp_delete_sent");
+        ck(memcmp(tdel, gn, 12) == 0, "F3_delete_repeats_grant_nonce");
+        ck_eq(udp_dels, 0, "F3_no_delete_for_the_ungranted_phase");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "F3_adv_port_after_verdict");
+        for (int i = 0; i < 4; i++) {
+            ntx_portmap_test_advance_ms(60000);
+            pm_tick(&x);
+            pump_ms(x.n, 10);
+        }
+        ck(!gw_pending(), "F3_stays_quiet_after_the_deletes");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+    }
+
+    /* F4. NAT-PMP: both mappings are held and the verdict arrives on the
+     * external-address query — the arm of the CGNAT check the ordinary single-pass
+     * flow never reaches with a grant in hand (the ADDR query always comes first;
+     * only a family switch re-arms it, which is the state pm_refused/UNSUPP_VERSION
+     * leaves and what `addr_done = 0` puts the driver back into here). The deletes
+     * are the NAT-PMP shape: 12 B, lifetime 0, one per held mapping. */
+    {
+        sess x;
+        sess_open(&x, "f4");
+        x.cfg.utp = 1;
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t req[2048], rsp[16], aresp[12];
+        uint16_t lp = ntx_netx_port(x.n);
+        ck(gw_to_natpmp_map(&x, req, sizeof req) == 12, "F4_natpmp_map_query");
+        natpmp_map_resp(rsp, 2, lp, EXT_PORT, 3600); /* RFC 6886 §3.3: OP 2 = TCP */
+        gw_send(rsp, 16);
+        pump_ms(x.n, 40);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "F4_tcp_active");
+        ck_eq(gw_wait(req, sizeof req, 300), 12, "F4_udp_map_query");
+        ck(req[1] == 1, "F4_udp_map_opcode");
+        natpmp_map_resp(rsp, 1, lp, EXT_PORT, 3600); /* OP 1 = UDP */
+        gw_send(rsp, 16);
+        pump_ms(x.n, 40);
+        gw_drain();
+        x.s->pm->addr_done = 0; /* the family switch's state: the ADDR ask is owed */
+        pm_tick(&x);
+        ck_eq(gw_wait(req, sizeof req, 300), 2, "F4_addr_query_out");
+        natpmp_addr_resp(aresp, 100, 64, 1, 1);
+        gw_send(aresp, sizeof aresp);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_CGNAT, "F4_cgnat");
+        int dels = 0, tcp_dels = 0, udp_dels = 0;
+        for (ssize_t r; (r = gw_get(req, sizeof req)) >= 0;) {
+            if (r != 12 || rd32(req + 8) != 0) continue;
+            dels++;
+            ck_eq(req_int_port(req), lp, "F4_delete_names_the_internal_port");
+            if (req[1] == 1) tcp_dels++;
+            if (req[1] == 2) udp_dels++;
+        }
+        ck_eq(dels, 2, "F4_two_deletes_for_two_held_mappings");
+        ck_eq(tcp_dels, 1, "F4_tcp_delete_sent");
+        ck_eq(udp_dels, 1, "F4_udp_delete_sent");
+        for (int i = 0; i < 4; i++) {
+            ntx_portmap_test_advance_ms(60000);
+            pm_tick(&x);
+            pump_ms(x.n, 10);
+        }
+        ck(!gw_pending(), "F4_stays_quiet_after_the_deletes");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
     }
 
     /* ---- G. renewal at half the granted lifetime ---- */

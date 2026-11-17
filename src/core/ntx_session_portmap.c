@@ -797,7 +797,19 @@ static void pm_lost(struct ntx_portmap *pm) {
     pm->st = NTX_PM_PENDING;
 }
 
+/* R18: the deletes go out FIRST. `pm_clear_grants` wipes `active`/`ext`, and a
+ * lifetime-0 request is built from exactly those fields plus the grant nonce — cleared
+ * first, there is nothing left to build one from and the gateway keeps forwarding into
+ * a mapping this client has just publicly given up on, for the whole granted lifetime
+ * (up to 7200 s). Fire-and-forget like pm_stop_now's deletes: this runs in the receive
+ * path, and a delete's own failure is not retried (§7.4 — the same rule pm_grant6's
+ * wrong-port delete follows). Only the v4 half: `pm_cgnat` is the v4 sequence's verdict,
+ * the v6 half has no CGNAT to reach (U9) and a live v6 grant outlives this one and
+ * keeps its renewals (U6). The R12 debt is still dropped deliberately — pm_clear_grants
+ * owns that, and it is only right: the sequence is over, so a re-acquisition ask is
+ * never owed. */
 static void pm_cgnat(struct ntx_portmap *pm) {
+    if (pm->fd >= 0 && (pm->active[PM_PH_TCP] || pm->active[PM_PH_UDP])) pm_send_deletes(pm);
     pm_clear_grants(pm);
     pm->phase = -1;
     pm->tries = 0;
