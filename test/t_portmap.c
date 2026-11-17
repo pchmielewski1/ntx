@@ -4669,6 +4669,404 @@ int main(void) {
     gw_drain();
     gw6_drain();
 
+    /* ---- W. R22: a MAP reply that grants port 0, or an external address that names
+     * nothing, is a protocol violation and not a grant — in both families.
+     *
+     * `ext_port == 0` cannot be a forwarded port: RFC 6335 §2.1 keeps port 0 out of the
+     * assignable range, and RFC 6887 §11.1 makes the reply's Assigned External Port
+     * "the assigned external port for the mapping", with no all-zeros meaning — the
+     * all-zeros value belongs to the REQUEST's Suggested External Port (§11.1/§11.2:
+     * "does not know the external port, or does not have a preference"). Same for the
+     * address: §11.1 says the reply's Assigned External IP Address "is the assigned
+     * external IPv4 or IPv6 address for the mapping. An IPv4 address is encoded using
+     * IPv4-mapped IPv6 address", §5 spells the two all-zeros values (:: and
+     * ::ffff:0:0), and the same section warns that "it is not sufficient to check for
+     * ones in bits 81-96" — all 96 leading bits must be zero before an address counts
+     * as the v4-mapped form. So the v4 half (the NAT case) must be handed the mapped
+     * form naming a non-zero IPv4; the v6 half opens a firewall instead of translating
+     * (R15), so there the address is native and only the all-zeros one is refused.
+     *
+     * Accepting either shape left the driver holding a mapping nobody forwards:
+     * `ntx_session_adv_port` could not advertise port 0 — its own `ext[TCP]` guard falls
+     * back to the listen port, which W1_adv_port_never_advertises_port_0 pins — but the
+     * state went ACTIVE, so stats reported `port_map:active` with `ext_port` equal to the
+     * listen port, i.e. an operator told the gateway opened a port when it named none,
+     * and the §11.2 renewals/deletes went out suggesting a non-address back to the
+     * gateway. The v6 half took an all-zero grant into `grant_ip` and reported ACTIVE
+     * for a firewall opening to no address at all.
+     *
+     * The answer is the one every other stated verdict gets (S10/S11/R14): pm_no_mapping
+     * / pm_no_mapping6 — one diag line, the phase cleared, reask 0, and nothing further
+     * on the wire (R10). No lifetime-0 delete is owed: nothing was ever held, which is
+     * the rule F_cgnat_no_grant_no_delete pins.
+     *
+     * NAT-PMP's mapping reply carries no external address at all (RFC 6886 §3.3: the
+     * 16 B response is Vers|OP|Result|SSSE|InternalPort|MappedPort|Lifetime — the 12 B
+     * figure is the REQUEST), so the address rule is a PCP rule and W3 pins NAT-PMP's
+     * port-0 half, where octets 10..11 of that response do express a zero port. */
+
+    /* W1. PCP TCP granted port 0: refused. */
+    {
+        char dp[256];
+        snprintf(dp, sizeof dp, "%s/diag_w1.log", SCRATCH);
+        unlink(dp);
+        ck_eq(ntx_diag_open(dp), 0, "W1_diag_capture");
+        sess x;
+        sess_open(&x, "w1");
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t pub[16], req[2048], rsp[64];
+        pcp_v4(pub, 203, 0, 113, 9);
+        ck_eq(gw_wait(req, sizeof req, 300), 60, "W1_request");
+        pcp_resp(rsp, req, 0, pub, 7200, gw_epoch_live(x.s->pm)); /* Assigned External Port 0 */
+        gw_send(rsp, 60);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "W1_none");
+        ck(ntx_session_portmap_state(x.s) != NTX_PM_ACTIVE, "W1_not_active");
+        ck_eq(x.s->pm->active[PM_PH_TCP], 0, "W1_tcp_not_active");
+        ck_eq(x.s->pm->ext[PM_PH_TCP], 0, "W1_no_ext_port");
+        ck_eq(x.s->pm->phase, -1, "W1_nothing_outstanding");
+        ck_eq(x.s->pm->tries, 0, "W1_no_retries");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "W1_adv_port_never_advertises_port_0");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        char *text = read_all(dp);
+        ck(text && strstr(text, "port map: PCP") && strstr(text, "port 0"), "W1_refusal_on_diag");
+        free(text);
+        ntx_diag_close();
+        /* And it stays refused: a driver that re-requested from the rx path would be
+         * handed the same nonsense answer again, at the pace of the RTT. */
+        sess_open(&x, "w1b");
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        ck_eq(gw_wait(req, sizeof req, 300), 60, "W1b_request");
+        pcp_resp(rsp, req, 0, pub, 7200, gw_epoch_live(x.s->pm));
+        gw_send(rsp, 60);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck_eq(pm_sends_in(&x, 60000, 6), 0, "W1_no_further_resend");
+        ck_eq(pcp_answer_all(&x, NTX_PCP_PROTO_TCP, 0, pub, 7200, PCP_EPOCH_LIVE, "W1b", 1000, 30), 0,
+              "W1_zero_port_no_loop");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "W1_stays_none");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        gw_drain();
+    }
+
+    /* W2. PCP UDP granted port 0 while the TCP mapping is HELD: UDP's verdict is UDP's
+     * (the live TCP grant keeps its state and its advertised port), and no fresh UDP ask
+     * follows the refusal. */
+    {
+        char dp[256];
+        snprintf(dp, sizeof dp, "%s/diag_w2.log", SCRATCH);
+        unlink(dp);
+        ck_eq(ntx_diag_open(dp), 0, "W2_diag_capture");
+        sess x;
+        sess_open(&x, "w2");
+        x.cfg.utp = 1;
+        x.cfg.port_map = 1;
+        uint8_t pub[16], ureq[60], rsp[64];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        pcp_grant(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200);
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "W2_tcp_grant_advertised");
+        gw_drain();
+        ck(pm_next_req(&x, NTX_PCP_PROTO_UDP, ureq), "W2_udp_query_out");
+        pcp_resp(rsp, ureq, 0, pub, 7200, gw_epoch_live(x.s->pm));
+        gw_send(rsp, 60);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck_eq(x.s->pm->active[PM_PH_UDP], 0, "W2_udp_not_active");
+        ck_eq(x.s->pm->ext[PM_PH_UDP], 0, "W2_udp_no_ext_port");
+        ck_eq(x.s->pm->phase, -1, "W2_nothing_outstanding");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "W2_tcp_grant_survives");
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "W2_adv_port_still_the_tcp_grant");
+        ck_eq(pm_sends_in(&x, 60000, 6), 0, "W2_no_further_resend");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        char *text = read_all(dp);
+        ck(text && strstr(text, "port map: PCP") && strstr(text, "port 0"), "W2_refusal_on_diag");
+        free(text);
+        ntx_diag_close();
+        gw_drain();
+    }
+
+    /* W3. NAT-PMP: MappedPort 0 with a lifetime is the same refusal (RFC 6886 §3.3). */
+    {
+        char dp[256];
+        snprintf(dp, sizeof dp, "%s/diag_w3.log", SCRATCH);
+        unlink(dp);
+        ck_eq(ntx_diag_open(dp), 0, "W3_diag_capture");
+        sess x;
+        sess_open(&x, "w3");
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t req[2048], rsp[16];
+        ck_eq(gw_to_natpmp_map(&x, req, sizeof req), 12, "W3_natpmp_map_request");
+        natpmp_map_resp(rsp, 2, (uint16_t)ntx_netx_port(x.n), 0, 3600); /* MappedPort 0 */
+        gw_send(rsp, sizeof rsp);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "W3_none");
+        ck_eq(x.s->pm->active[PM_PH_TCP], 0, "W3_tcp_not_active");
+        ck_eq(x.s->pm->ext[PM_PH_TCP], 0, "W3_no_ext_port");
+        ck_eq(x.s->pm->phase, -1, "W3_nothing_outstanding");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "W3_adv_port_is_listen_port");
+        gw_send(rsp, sizeof rsp); /* the same nonsense again: still nothing goes out */
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck_eq(pm_sends_in(&x, 60000, 6), 0, "W3_no_further_resend");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        char *text = read_all(dp);
+        ck(text && strstr(text, "NAT-PMP") && strstr(text, "port 0"), "W3_refusal_on_diag");
+        free(text);
+        ntx_diag_close();
+        gw_drain();
+    }
+
+    /* W4. PCP over v4 with a NATIVE v6 external address: not the v4-mapped form §11.1
+     * requires, so it is refused as the malformed answer it is — and NOT taken as the
+     * CGNAT diagnosis, which would blame the ISP for a gateway that answered nonsense.
+     * (A ULA there used to reach the CGNAT verdict, which is the other reason the shape
+     * check runs before it.) */
+    {
+        char dp[256];
+        snprintf(dp, sizeof dp, "%s/diag_w4.log", SCRATCH);
+        unlink(dp);
+        ck_eq(ntx_diag_open(dp), 0, "W4_diag_capture");
+        sess x;
+        sess_open(&x, "w4");
+        x.cfg.port_map = 1;
+        uint8_t native6[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+                               0,    0,    0,    0,    0, 0, 0, 0x01}; /* 2001:db8::1 */
+        uint8_t req[2048], rsp[64];
+        pm_start(&x);
+        ck_eq(gw_wait(req, sizeof req, 300), 60, "W4_request");
+        pcp_resp(rsp, req, EXT_PORT, native6, 7200, gw_epoch_live(x.s->pm));
+        gw_send(rsp, 60);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "W4_none");
+        ck(ntx_session_portmap_state(x.s) != NTX_PM_CGNAT, "W4_not_the_cgnat_verdict");
+        ck_eq(x.s->pm->active[PM_PH_TCP], 0, "W4_tcp_not_active");
+        ck_eq(x.s->pm->phase, -1, "W4_nothing_outstanding");
+        ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "W4_adv_port_is_listen_port");
+        ck_eq(pm_sends_in(&x, 60000, 6), 0, "W4_no_further_resend");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        char *text = read_all(dp);
+        ck(text && strstr(text, "port map: PCP") && strstr(text, "IPv4-mapped"), "W4_refusal_on_diag");
+        ck(text && !strstr(text, "CGNAT"), "W4_no_cgnat_warning");
+        free(text);
+        ntx_diag_close();
+        gw_drain();
+    }
+
+    /* W5. PCP over v4 with the all-zeros external address, in either of the spellings
+     * §5 defines. The request's Suggested field may be all zeros (§11.2: no preference);
+     * the reply's Assigned field may not — it would name no address, and the §11.2
+     * renewal would echo that non-address back to the gateway as a preference. */
+    {
+        static const struct {
+            const char *tag;
+            int mapped; /* the ::ffff:0:0 spelling, or plain :: */
+        } cases[] = {{"w5a", 0}, {"w5b", 1}};
+        for (int i = 0; i < 2; i++) {
+            char dp[256];
+            snprintf(dp, sizeof dp, "%s/diag_w5_%d.log", SCRATCH, i);
+            unlink(dp);
+            ck_eq(ntx_diag_open(dp), 0, "W5_diag_capture");
+            sess x;
+            sess_open(&x, cases[i].tag);
+            x.cfg.port_map = 1;
+            uint8_t zero[16];
+            memset(zero, 0, sizeof zero);
+            if (cases[i].mapped) {
+                zero[10] = 0xff;
+                zero[11] = 0xff;
+            }
+            uint8_t req[2048], rsp[64];
+            pm_start(&x);
+            ck_eq(gw_wait(req, sizeof req, 300), 60, "W5_request");
+            pcp_resp(rsp, req, EXT_PORT, zero, 7200, gw_epoch_live(x.s->pm));
+            gw_send(rsp, 60);
+            pump_ms(x.n, 40);
+            pm_tick(&x);
+            ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "W5_none");
+            ck_eq(x.s->pm->active[PM_PH_TCP], 0, "W5_tcp_not_active");
+            ck_eq(x.s->pm->ext[PM_PH_TCP], 0, "W5_no_ext_port");
+            ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "W5_adv_port_is_listen_port");
+            ck_eq(pm_sends_in(&x, 60000, 6), 0, "W5_no_further_resend");
+            ntx_session_portmap_stop(x.s);
+            sess_close(&x);
+            char *text = read_all(dp);
+            ck(text && strstr(text, "port map: PCP") && strstr(text, "all-zero"), "W5_refusal_on_diag");
+            free(text);
+            ntx_diag_close();
+            gw_drain();
+        }
+    }
+
+    /* W6. PCP over v6 granted port 0. S17c's own rule (the granted port must EQUAL the
+     * listen port) already refused this, but as a WRONG PORT: it sent a lifetime-0 delete
+     * for a mapping that cannot exist and printed the mismatch line, so the operator read
+     * "the gateway forwarded another port" where the gateway named none. The named
+     * refusal sends nothing — nothing was ever held — and says port 0. */
+    {
+        char dp[256];
+        snprintf(dp, sizeof dp, "%s/diag_w6.log", SCRATCH);
+        unlink(dp);
+        ck_eq(ntx_diag_open(dp), 0, "W6_diag_capture");
+        sess x;
+        sess_open(&x, "w6");
+        x.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&x);
+        uint8_t req[2048], rsp[64];
+        ck_eq(gw6_wait(req, sizeof req, 400), 60, "W6_request");
+        gw6_reply_at = pm_now();
+        pcp_resp(rsp, req, 0, V6_EXT_GLOBAL, 7200, gw6_epoch_live(x.s->pm));
+        gw6_answer(rsp, 60);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck_eq(pm6_state6(&x), NTX_PM_NONE, "W6_v6_none");
+        ck_eq(x.s->pm->s6.active[PM_PH_TCP], 0, "W6_tcp_not_active");
+        ck_eq(x.s->pm->s6.ext[PM_PH_TCP], 0, "W6_no_ext_port6");
+        ck_eq(pm6_ext6(&x), 0, "W6_ext_port6_zero");
+        ck_eq(x.s->pm->s6.phase, -1, "W6_nothing_outstanding");
+        /* No delete: a port-0 grant was never a mapping, and F pins the same rule for
+         * the CGNAT verdict. This is the assertion the pre-fix delete breaks. */
+        ck(!gw6_pending(), "W6_no_delete_for_a_port_that_cannot_exist");
+        ck_eq(gw6_sends_in(&x, 60000, 6), 0, "W6_no_further_v6_request");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        char *text = read_all(dp);
+        ck(text && strstr(text, "port map6: PCP") && strstr(text, "port 0"), "W6_refusal_on_diag");
+        ck(text && !strstr(text, "not the listen port"), "W6_names_port_0_not_a_mismatch");
+        free(text);
+        ntx_diag_close();
+        ntx_portmap_test_set_client6(NULL);
+        gw_drain();
+        gw6_drain();
+    }
+
+    /* W7. PCP over v6 with the all-zeros external address (both §5 spellings), granted
+     * on the RIGHT port so the mismatch rule cannot be what refuses it. Over v6 the
+     * gateway opens a firewall rather than translating (R15), so a native address is
+     * expected and the v4-mapped requirement is NOT the rule here — what is refused is an
+     * answer that names no address at all: `grant_ip` would then be echoed back as the
+     * §11.2 preference and `port_map6` would claim ACTIVE for an opening to nowhere. */
+    {
+        static const struct {
+            const char *tag;
+            int mapped;
+        } cases[] = {{"w7a", 0}, {"w7b", 1}};
+        for (int i = 0; i < 2; i++) {
+            char dp[256];
+            snprintf(dp, sizeof dp, "%s/diag_w7_%d.log", SCRATCH, i);
+            unlink(dp);
+            ck_eq(ntx_diag_open(dp), 0, "W7_diag_capture");
+            sess x;
+            sess_open(&x, cases[i].tag);
+            x.cfg.port_map = 1;
+            write_route6(V6_DEFAULT_LO, v4path);
+            ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+            pm_start(&x);
+            uint16_t lp = ntx_netx_port(x.n);
+            uint8_t zero[16], req[2048], rsp[64];
+            memset(zero, 0, sizeof zero);
+            if (cases[i].mapped) {
+                zero[10] = 0xff;
+                zero[11] = 0xff;
+            }
+            ck_eq(gw6_wait(req, sizeof req, 400), 60, "W7_request");
+            gw6_reply_at = pm_now();
+            pcp_resp(rsp, req, lp, zero, 7200, gw6_epoch_live(x.s->pm)); /* the port IS right */
+            gw6_answer(rsp, 60);
+            pump_ms(x.n, 40);
+            pm_tick(&x);
+            ck_eq(pm6_state6(&x), NTX_PM_NONE, "W7_v6_none");
+            ck_eq(x.s->pm->s6.active[PM_PH_TCP], 0, "W7_tcp_not_active");
+            ck_eq(pm6_ext6(&x), 0, "W7_ext_port6_zero");
+            ck_eq(x.s->pm->s6.phase, -1, "W7_nothing_outstanding");
+            ck(!gw6_pending(), "W7_no_delete_without_a_grant");
+            ck_eq(gw6_sends_in(&x, 60000, 6), 0, "W7_no_further_v6_request");
+            ntx_session_portmap_stop(x.s);
+            sess_close(&x);
+            char *text = read_all(dp);
+            ck(text && strstr(text, "port map6: PCP") && strstr(text, "all-zero"), "W7_refusal_on_diag");
+            free(text);
+            ntx_diag_close();
+            gw_drain();
+            gw6_drain();
+        }
+        ntx_portmap_test_set_client6(NULL);
+    }
+
+    /* W8/W9. the guards, so W1–W7 cannot be satisfied by refusing everything: a good v4
+     * grant (::ffff:203.0.113.9, a foreign port, which v4 MAY be given) and a good v6
+     * grant (the listen port) still work, still renew on schedule with the grant's own
+     * nonce, and still send their delete at stop — with no extra datagram anywhere in the
+     * window. */
+    {
+        sess x;
+        sess_open(&x, "w8");
+        x.cfg.utp = 1;
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        both_active(&x, EXT_PORT, pub);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "W8_active");
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "W8_adv_port");
+        uint8_t gn[12];
+        memcpy(gn, granted_nonce[NTX_PCP_PROTO_TCP], 12);
+        /* 45 × 100 s, and every query that goes out is answered. The grant is held, so
+         * the only thing owed in that window is the renewal at half the lifetime — and a
+         * renewal repeats the grant's nonce (R13/O1), so it is not a FRESH query. A driver
+         * that refused this grant and re-asked would draw a new nonce and be counted, and
+         * one that re-asked from the rx path would be counted too. */
+        ck_eq(pcp_answer_all(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200, PCP_EPOCH_LIVE, "W8", 100000, 45), 1,
+              "W8_one_fresh_query_in_75_min");
+        gw_drain();
+        ntx_session_portmap_stop(x.s);
+        uint8_t req[2048];
+        int dels = 0;
+        while (gw_get(req, sizeof req) >= 0) {
+            if (rd32(req + 4) != 0 || req[36] != NTX_PCP_PROTO_TCP) continue;
+            dels++;
+            ck(memcmp(req + 24, gn, 12) == 0, "W8_delete_repeats_grant_nonce");
+            ck(memcmp(req + 44, pub, 16) == 0, "W8_delete_echoes_granted_ip");
+        }
+        ck_eq(dels, 1, "W8_one_delete_at_stop");
+        sess_close(&x);
+        gw_drain();
+
+        sess y;
+        sess_open(&y, "w9");
+        y.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&y);
+        uint16_t lp = ntx_netx_port(y.n);
+        pcp_grant6(&y, NTX_PCP_PROTO_TCP, lp, V6_EXT_GLOBAL, 7200);
+        ck_eq(pm6_state6(&y), NTX_PM_ACTIVE, "W9_v6_active");
+        ck_eq(pm6_ext6(&y), (long)lp, "W9_ext_port6_is_listen_port");
+        ck_eq(gw6_sends_in(&y, 60000, 30), 0, "W9_good_grant_quiet_for_30_min");
+        ntx_session_portmap_stop(y.s);
+        sess_close(&y);
+        ntx_portmap_test_set_client6(NULL);
+        gw_drain();
+        gw6_drain();
+    }
+
+    write_routes(GW_LO);
+    gw_drain();
+    gw6_drain();
+
     close(gwd);
     if (fails) {
         printf("t_portmap: %d FAILURES\n", fails);

@@ -767,7 +767,11 @@ static void test_silent_gateway_settles(void) {
     rsp[41] = req[41];
     rsp[42] = (uint8_t)(R11_EXT >> 8);
     rsp[43] = (uint8_t)R11_EXT;
-    rsp[44] = 0xff; rsp[45] = 0xff;                       /* IPv4-mapped … */
+    /* The Assigned External IP Address of §11.1 is octets 44..59, and the IPv4-mapped
+     * prefix lives in octets 10..11 of THAT field — 54/55 of the message, not 44/45.
+     * The fixture used to write them at 44/45, i.e. `ffff::c700:7109`, which is no one's
+     * address; the driver accepted it only because it judged no shape at all (R22). */
+    rsp[54] = 0xff; rsp[55] = 0xff;                       /* IPv4-mapped … */
     rsp[56] = 203; rsp[57] = 0; rsp[58] = 113; rsp[59] = 9;
     if (sendto(gwd, rsp, sizeof rsp, 0, (struct sockaddr *)&from, fl) < 0) fail("r11_gw_send");
     for (int i = 0; i < 40; i++) ntx_netx_run_once(x.n, 2);
@@ -927,7 +931,9 @@ static int r12_answer_map(int gwd, sess *x, uint16_t ext, const uint8_t skip_non
             rsp[41] = req[41];
             rsp[42] = (uint8_t)(ext >> 8);
             rsp[43] = (uint8_t)ext;
-            rsp[44] = 0xff; rsp[45] = 0xff;
+            /* The 16 B Assigned External IP Address starts at octet 44, so its
+             * IPv4-mapped prefix is octets 54/55 (see r11_gw_send for R22's rule). */
+            rsp[54] = 0xff; rsp[55] = 0xff;
             rsp[56] = 203; rsp[57] = 0; rsp[58] = 113; rsp[59] = 9;
             r12_epoch = ep;
             r12_epoch_at = pm_now();

@@ -913,6 +913,63 @@ static void pm_zero_lifetime(struct ntx_portmap *pm, int ph) {
     pm_no_mapping(pm, ph, "granted lifetime 0");
 }
 
+/* R22: does a SUCCESS MAP reply name a mapping at all? Two of its fields can say
+ * "nothing" while the Result Code still reads SUCCESS, and both used to be taken as a
+ * grant — the driver then held a mapping nothing forwards, reported ACTIVE, and renewed
+ * or deleted it (§11.2 echoes the grant's own address and port back as a preference).
+ *
+ *   Port 0 is not a forwarded port. §11.1 makes the reply's Assigned External Port "the
+ *   assigned external port for the mapping"; the all-zeros value belongs to the REQUEST's
+ *   Suggested External Port ("does not know the external port, or does not have a
+ *   preference, it MUST use 0"), and RFC 6335 §2.1 keeps 0 out of the assignable range.
+ *
+ *   The address must be one. §11.1: the reply's Assigned External IP Address "is the
+ *   assigned external IPv4 or IPv6 address for the mapping. An IPv4 address is encoded
+ *   using IPv4-mapped IPv6 address", and §5 — which defines the two all-zeros spellings
+ *   (:: and ::ffff:0:0) that the request's Suggested field may carry — warns that "it is
+ *   not sufficient to check for ones in bits 81-96", so all 96 leading bits must be
+ *   zero before an address counts as the mapped form. What the reply may not carry is
+ *   either all-zeros spelling: it would name no address, which is what `ext_port == 0`
+ *   is for the port. ntx's v4 sequence only ever asks a private gateway for a NAT
+ *   (pm_open refuses a public next hop and CGNAT is its own verdict), so the address must
+ *   be named there in the form §11.1 gives it.
+ *
+ * `v6` is the firewall-opening half (R15: over IPv6 PCP opens, it does not translate), so
+ * there the address is native: the all-zeros answer is refused for the same reason, and
+ * so is the v4-mapped one — the rule pm6_is_global already applies to the client field of
+ * the same request, and a v6 grant pointing at an address that is not a v6 destination is
+ * the R15 confusion arriving from the other direction. `ip == NULL` is NAT-PMP, whose
+ * mapping reply carries no address at all (RFC 6886 §3.3), so only the port is judged.
+ *
+ * The verdict is the one every other stated nonsense gets (S10/S11/R14): one diag line
+ * and `pm_give_up_phase` with reask 0 — no delete, because nothing was ever held (the
+ * rule F pins for the CGNAT verdict), and no re-request out of the receive path (R10). */
+static int pm_grantable(uint16_t ext_port, const uint8_t ip[16], int v6, const char **why) {
+    static const uint8_t zeros10[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    if (ext_port == 0) {
+        *why = "gateway granted port 0, which cannot be forwarded";
+        return 0;
+    }
+    if (!ip) return 1; /* NAT-PMP: no address in the reply to judge */
+    int mapped = !memcmp(ip, zeros10, 10) && ip[10] == 0xff && ip[11] == 0xff;
+    int zero = 1;
+    for (int i = 0; i < 16; i++)
+        if (ip[i]) zero = 0;
+    if (zero || (mapped && !ip[12] && !ip[13] && !ip[14] && !ip[15])) {
+        *why = "gateway named an all-zero external address";
+        return 0;
+    }
+    if (v6 && mapped) {
+        *why = "external address is IPv4-mapped in a v6 grant";
+        return 0;
+    }
+    if (!v6 && !mapped) {
+        *why = "external address is not the IPv4-mapped form";
+        return 0;
+    }
+    return 1;
+}
+
 static void pm_rx(struct ntx_portmap *pm, const uint8_t *b, size_t n) {
     int ph = pm->phase;
     if (ph < 0) return; /* nothing outstanding: nothing to match an answer against */
@@ -956,6 +1013,15 @@ static void pm_rx(struct ntx_portmap *pm, const uint8_t *b, size_t n) {
             pm_zero_lifetime(pm, ph);
             return;
         }
+        /* R22 before the CGNAT test: the shape is judged on what the reply says, and a
+         * nonsense address is not the ISP's fault. A native v6 address here (or a ULA,
+         * which the CGNAT helper would otherwise turn into that diagnosis) is a gateway
+         * that answered the wrong question, not a carrier-grade NAT. */
+        const char *why = NULL;
+        if (!pm_grantable(r.ext_port, r.ext_ip16, 0, &why)) {
+            pm_no_mapping(pm, ph, why);
+            return;
+        }
         if (pcp_ip_is_cgnat_or_private(r.ext_ip16)) {
             pm_cgnat(pm);
             return;
@@ -993,6 +1059,14 @@ static void pm_rx(struct ntx_portmap *pm, const uint8_t *b, size_t n) {
     life = pm_cap_life(life);
     if (life == 0) {
         pm_zero_lifetime(pm, ph);
+        return;
+    }
+    /* R22: RFC 6886 §3.3 has no external address in the mapping reply at all, so this is
+     * the port half of the rule — MappedPort 0 with a live lifetime is the same nonsense
+     * as PCP's Assigned External Port 0. */
+    const char *why = NULL;
+    if (!pm_grantable(ext, NULL, 0, &why)) {
+        pm_no_mapping(pm, ph, why);
         return;
     }
     pm_grant(pm, ph, ext, life, NULL);
@@ -1279,6 +1353,15 @@ static void pm_rx6(struct ntx_portmap *pm, const uint8_t *b, size_t n) {
     uint32_t life = pm_cap_life(r.lifetime);
     if (life == 0) {
         pm_zero_lifetime6(pm, ph);
+        return;
+    }
+    /* R22 ahead of pm_grant6, so a reply that names no port is refused as the nonsense
+     * it is instead of being answered with a lifetime-0 delete for a mapping that cannot
+     * exist (the delete rule is pm_grant6's own wrong-port case, where a real mapping IS
+     * in the gateway). Nothing is held here, so nothing is owed a delete (F). */
+    const char *why = NULL;
+    if (!pm_grantable(r.ext_port, r.ext_ip16, 1, &why)) {
+        pm_no_mapping6(pm, ph, why);
         return;
     }
     pm_grant6(pm, ph, r.ext_port, life, r.ext_ip16);
