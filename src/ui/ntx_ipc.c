@@ -109,7 +109,10 @@ int ntx_ipc_share_event_json(char *out, size_t cap, const ntx_share_event *ev) {
     if (!ev->ok) {
         const char *code = ntx_share_err_code ? ntx_share_err_code(ev->err) : "bad_arg";
         w = snprintf(out, cap, "{\"type\":\"share\",\"i\":%d,\"ok\":0,\"code\":\"%s\"}", ev->i, code);
-        return (w < 0 || (size_t)w >= cap) ? -1 : w;
+        if (w >= 0 && (size_t)w < cap) return w;
+        goto fallback; /* R29: even the failure line is too long for cap (a code
+                          from a foreign table) — ok:0 stays true, only the
+                          wording degrades, and the client is not left waiting. */
     }
     char ih[41], ih2[65], name[512 * 6 + 1], magnet[NTX_SHARE_MAGNET_MAX * 6 + 1],
          tor[NTX_SHARE_PATH_MAX * 6 + 1];
@@ -117,15 +120,30 @@ int ntx_ipc_share_event_json(char *out, size_t cap, const ntx_share_event *ev) {
     static const char hx[] = "0123456789abcdef";
     for (int k = 0; k < 32; k++) { ih2[2 * k] = hx[ev->ih2[k] >> 4]; ih2[2 * k + 1] = hx[ev->ih2[k] & 15u]; }
     ih2[64] = 0;
+    /* R29: a ready line we cannot build still owes the client a verdict. The
+     * caller has already DEQUEUED the event and ntx_session_share_tick has
+     * already spent the slot's ev_ready flag (share_evq_push), so returning -1
+     * here loses the event twice over: nothing is emitted and nothing is
+     * requeued, and the client waits forever for a verdict on that `i` (§11:
+     * every queued event is answered exactly once). The answer is the §11
+     * failure line for the same slot — small, fixed-shape, pairable by `i`, and
+     * honest: the client is told this share produced nothing usable instead of
+     * being left guessing. "io" is the code for our own reporting failure; a
+     * share that really failed carries its own code through the branch above. */
     if (ntx_json_escape(name, sizeof name, ev->name) < 0 ||
         ntx_json_escape(magnet, sizeof magnet, ev->magnet) < 0 ||
         ntx_json_escape(tor, sizeof tor, ev->torrent_path) < 0)
-        return -1; /* §11.1: never a torn escape -> no line at all */
+        goto fallback; /* §11.1: never a torn escape */
     w = snprintf(out, cap,
                  "{\"type\":\"share\",\"i\":%d,\"ok\":1,\"ih\":\"%s\",\"ih2\":\"%s\","
                  "\"name\":\"%s\",\"magnet\":\"%s\",\"torrent\":\"%s\"}",
                  ev->i, ih, ih2, name, magnet, tor);
-    return (w < 0 || (size_t)w >= cap) ? -1 : w;
+    if (w >= 0 && (size_t)w < cap) return w;
+fallback:
+    w = snprintf(out, cap, "{\"type\":\"share\",\"i\":%d,\"ok\":0,\"code\":\"io\"}", ev->i);
+    if (w >= 0 && (size_t)w < cap) return w;
+    if (cap) out[0] = 0; /* the fallback itself does not fit: clean refusal, no torn line */
+    return -1;
 }
 
 /* ── parser ─────────────────────────────────────────────────────────── */

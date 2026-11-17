@@ -1272,5 +1272,210 @@ int main(void) {
         }
     }
 
+    { /* ── R29 · S25: a share event the emitter cannot build must still reach the
+         client as {"ok":0,"code":"io"} ─────────────────────────────────────────
+         The bug: ntx_ipc_share_event_json returned -1 when the ready line would
+         not fit the caller's buffer, and its caller (ipc_share_events in
+         ntx_main.c) emitted nothing — but ntx_session_share_poll_event had
+         ALREADY dequeued the event and share_evq_push had ALREADY spent the
+         slot's ev_ready flag, so nothing was requeued either. The client saw no
+         verdict for that `i`, ever, and waited forever (§11: every queued event
+         owes the client exactly one line). The floor is now the §11 failure
+         line, which is small, fixed-shape and always pairable by `i`. ── */
+        ntx_share_event ev;
+        char line[70000];
+        char want[64], want4[64];
+        static const char IO_FMT[] = "{\"type\":\"share\",\"i\":%d,\"ok\":0,\"code\":\"io\"}";
+
+        /* the worst case the §11.1 escape can produce: every field at its maximum
+           length and every byte a control byte (6 output bytes per input byte).
+           The consumer's buffer (g_share_evt in ntx_main.c) is sized for exactly
+           this, so today the emitter never fails in production — the pin below
+           says so, and the cases below say what happens if it ever does. */
+        memset(&ev, 0, sizeof ev);
+        ev.i = 11; ev.ok = 1;
+        for (int k = 0; k < 20; k++) ev.ih[k] = (uint8_t)0xff;
+        for (int k = 0; k < 32; k++) ev.ih2[k] = (uint8_t)0xff;
+        memset(ev.name, (char)0x1f, sizeof ev.name - 1);
+        memset(ev.magnet, (char)0x1f, sizeof ev.magnet - 1);
+        memset(ev.torrent_path, (char)0x1f, sizeof ev.torrent_path - 1);
+        if (ntx_ipc_share_event_json(line, sizeof line, &ev) <= 0) return fail("r29_worst_len");
+        if (!ipc_ok_local(line)) return fail("r29_worst_shape");
+        if ((int)strlen(line) >= (int)sizeof g_share_evt) {
+            printf("R29 worst-case line %zu B vs g_share_evt %zu B\n", strlen(line),
+                   sizeof g_share_evt);
+            return fail("r29_consumer_buffer_too_small");
+        }
+
+        /* THE RED CASE: the line does not fit the cap → the client still gets the
+           verdict, the §11 failure shape for that same `i`, and nothing else.
+           Pre-fix this call returned -1 and ipc_share_events stayed silent. */
+        snprintf(want, sizeof want, IO_FMT, 11);
+        line[0] = 'Z'; line[1] = 0;
+        if (ntx_ipc_share_event_json(line, 64, &ev) <= 0) return fail("r29_ready_fallback_len");
+        if (strcmp(line, want) != 0) { printf("R29 fallback: %s\n", line); return fail("r29_ready_fallback_body"); }
+        if (r8_line("share fallback", line)) return fail("r29_ready_fallback_valid");
+
+        /* the same verdict when the overflow is the magnet alone, and when it is
+           the name alone (each field on its own can push the line past a small cap) */
+        memset(&ev, 0, sizeof ev);
+        ev.i = 0; ev.ok = 1;
+        snprintf(ev.name, sizeof ev.name, "photo.jpg");
+        snprintf(ev.magnet, sizeof ev.magnet, "magnet:?xt=urn:btih:%040x", 3);
+        snprintf(ev.torrent_path, sizeof ev.torrent_path, "/tmp/r29.torrent");
+        snprintf(want, sizeof want, IO_FMT, 0);
+        if (ntx_ipc_share_event_json(line, 48, &ev) <= 0 || strcmp(line, want) != 0) {
+            printf("R29 small-cap magnet: %s\n", line);
+            return fail("r29_magnet_overflow");
+        }
+        memset(ev.name, (char)0x01, sizeof ev.name - 1); /* 511 control bytes: the escaping blow-up */
+        if (ntx_ipc_share_event_json(line, 512, &ev) <= 0 || strcmp(line, want) != 0) {
+            printf("R29 name-overflow fallback: %s\n", line);
+            return fail("r29_name_overflow");
+        }
+
+        /* floor of the floor: even the fallback has to fit. Below that the honest
+           answer is still a clean refusal — out[0] == 0, never a torn line. */
+        line[0] = 'Z'; line[1] = 0;
+        if (ntx_ipc_share_event_json(line, 32, &ev) != -1) return fail("r29_fallback_tiny_cap");
+        if (line[0] != 0) return fail("r29_fallback_torn");
+
+        /* guards: the normal paths are untouched by the fallback. */
+        if (ntx_ipc_share_event_json(line, 64, NULL) != -1) return fail("r29_null_ev");
+        snprintf(want4, sizeof want4, IO_FMT, 4);
+        memset(&ev, 0, sizeof ev);
+        ev.i = 4; ev.ok = 1;
+        snprintf(ev.name, sizeof ev.name, "photo.jpg");
+        snprintf(ev.magnet, sizeof ev.magnet, "magnet:?xt=urn:btih:%040x", 4);
+        snprintf(ev.torrent_path, sizeof ev.torrent_path, "/tmp/r29.torrent");
+        if (ntx_ipc_share_event_json(line, sizeof line, &ev) <= 0) return fail("r29_ok_len");
+        if (!ipc_ok_local(line)) return fail("r29_ok_shape");
+        if (!strstr(line, "\"ok\":1") || strstr(line, "\"code\"")) return fail("r29_ok_got_fallback");
+        ev.ok = 0; ev.err = NTX_SHARE_E_CHANGED; /* its own code wins, never "io" */
+        if (ntx_ipc_share_event_json(line, sizeof line, &ev) <= 0 ||
+            strcmp(line, "{\"type\":\"share\",\"i\":4,\"ok\":0,\"code\":\"changed\"}") != 0)
+            return fail("r29_err_code_kept");
+        /* the error path is never silent either: below the width of its own code
+           the verdict degrades to the "io" line (ok:0 stays true — the client is
+           told the share is dead, only the reason is lost), and below the width
+           of THAT line the answer is a clean refusal, out[0] == 0. */
+        if (ntx_ipc_share_event_json(line, 44, &ev) <= 0 || strcmp(line, want4) != 0) {
+            printf("R29 err-cap 44: %s\n", line);
+            return fail("r29_err_fallback");
+        }
+        line[0] = 'Z'; line[1] = 0;
+        if (ntx_ipc_share_event_json(line, 32, &ev) != -1) return fail("r29_err_tiny_cap");
+        if (line[0] != 0) return fail("r29_err_torn");
+        if (ok("r29_share_event_fallback")) return 1;
+
+        /* The shipped consumer (ipc_share_events in ntx_main.c) over a real queue:
+           one ready event → exactly one ok:1 line, the event retired ONCE, and a
+           later push attempt must not resurrect it (S07's retry machinery may
+           delay an event, never spin on one). */
+        {
+            ntx_config cfg;
+            ntx_netx *nx;
+            memset(&cfg, 0, sizeof cfg);
+            cfg.store_dir = "/tmp/ntx-ipc-r29";
+            if (mkdir("/tmp/ntx-ipc-r29", 0755) != 0 && errno != EEXIST) return fail("r29_dir");
+            ntx_session *s = mk(&nx, &cfg);
+            FILE *wf = fopen("/tmp/ntx-ipc-r29/r29.bin", "wb");
+            if (!wf) { drop(s, nx); return fail("r29_file"); }
+            fputs("0123456789", wf);
+            fclose(wf);
+            ntx_share_err se = NTX_SHARE_OK;
+            int ti = ntx_session_share_add(s, "/tmp/ntx-ipc-r29/r29.bin", NULL, &se);
+            if (ti < 0) { drop(s, nx); printf("R29 share_add err=%d\n", (int)se); return fail("r29_add"); }
+            struct ntx_share_slot *sl = s->share[ti];
+            sl->st = NTX_SHARE_READY;
+            snprintf(sl->name, sizeof sl->name, "r29.bin");
+            snprintf(sl->magnet, sizeof sl->magnet, "magnet:?xt=urn:btih:%040x", 5);
+            snprintf(sl->torrent_path, sizeof sl->torrent_path, "/tmp/ntx-ipc-r29/r29.bin.torrent");
+            share_evq_push(sl);
+
+            int save_out = dup(1);
+            fflush(stdout);
+            unlink("/tmp/ntx-ipc-r29.ndjson");
+            int capfd = open("/tmp/ntx-ipc-r29.ndjson", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            if (capfd < 0) { dup2(save_out, 1); close(save_out); drop(s, nx); return fail("r29_cap_file"); }
+            dup2(capfd, 1);
+            close(capfd);
+            ipc_share_events(s);  /* the consumer, as main() calls it per tick */
+            ipc_share_events(s);  /* the queue is empty now — must print nothing */
+            share_evq_push(sl);   /* R4: ev_ready is spent — a re-push is a no-op */
+            ipc_share_events(s);
+            fflush(stdout);
+            dup2(save_out, 1);
+            close(save_out);
+            ntx_share_event pev;
+            int polled = ntx_session_share_poll_event(s, &pev);
+            drop(s, nx);
+            if (polled != 0) return fail("r29_event_republished");
+            FILE *rf = fopen("/tmp/ntx-ipc-r29.ndjson", "rb");
+            if (!rf) return fail("r29_cap_read");
+            char bl[40960];
+            int nshare = 0;
+            while (fgets(bl, sizeof bl, rf)) {
+                if (!strstr(bl, "\"type\":\"share\"")) continue;
+                nshare++;
+                if (!strstr(bl, "\"ok\":1") || strstr(bl, "\"code\":\"io\"")) {
+                    fclose(rf); printf("R29 pump line: %s\n", bl);
+                    return fail("r29_pump_normal_line");
+                }
+            }
+            fclose(rf);
+            if (nshare != 1) { printf("R29 share lines: %d\n", nshare); return fail("r29_pump_line_count"); }
+            if (ok("r29_consumer_single_event")) return 1;
+        }
+
+        /* The CLI --share consumer (share_drain_events) reads the event struct, not
+           the JSON line, so an emitter failure cannot silence it. Pinned here: a
+           ready event delivers the magnet and keeps the run alive; a failure event
+           returns fatal, which is what makes main() leave the loop with exit 1
+           (the alternative is waiting for a share that will never be ready). */
+        {
+            ntx_config cfg;
+            ntx_netx *nx;
+            memset(&cfg, 0, sizeof cfg);
+            cfg.store_dir = "/tmp/ntx-ipc-r29";
+            ntx_session *s = mk(&nx, &cfg);
+            ntx_share_err se = NTX_SHARE_OK;
+            int ti = ntx_session_share_add(s, "/tmp/ntx-ipc-r29/r29.bin", NULL, &se);
+            if (ti < 0) { drop(s, nx); return fail("r29_cli_add"); }
+            struct ntx_share_slot *sl = s->share[ti];
+            sl->st = NTX_SHARE_FAILED;
+            sl->err = NTX_SHARE_E_CHANGED;
+            share_evq_push(sl);
+            int save_out = dup(1), save_err = dup(2);
+            fflush(stdout);
+            fflush(stderr);
+            unlink("/tmp/ntx-ipc-r29-cli.out");
+            int capfd = open("/tmp/ntx-ipc-r29-cli.out", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            if (capfd < 0) { dup2(save_out, 1); close(save_out); dup2(save_err, 2); close(save_err);
+                             drop(s, nx); return fail("r29_cli_file"); }
+            dup2(capfd, 1);
+            dup2(capfd, 2);
+            close(capfd);
+            int fatal = 0;
+            int drained = share_drain_events(s, &fatal);
+            fflush(stdout);
+            fflush(stderr);
+            dup2(save_out, 1);
+            dup2(save_err, 2);
+            close(save_out);
+            close(save_err);
+            drop(s, nx);
+            if (!drained || !fatal) return fail("r29_cli_fatal_exit");
+            FILE *rf = fopen("/tmp/ntx-ipc-r29-cli.out", "rb");
+            if (!rf) return fail("r29_cli_read");
+            char bl[512];
+            int saw_fail_msg = 0;
+            while (fgets(bl, sizeof bl, rf)) if (strstr(bl, "ntx: share failed:")) saw_fail_msg = 1;
+            fclose(rf);
+            if (!saw_fail_msg) return fail("r29_cli_msg");
+            if (ok("r29_cli_share_failure_exits")) return 1;
+        }
+    }
+
     return 0; /* tasks append here; keep the final line intact */
 }

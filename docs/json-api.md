@@ -54,6 +54,10 @@ line, in that order; a share that fails before `ready` gets only the failure lin
 asynchronous: the `ack` for the command is already out. Per event-loop tick the order is
 always `ack` first, then `share`, then the `stats` snapshot.
 
+Every queued event is answered exactly once: if the ready line could not be built (a field
+that does not fit the escape buffer), the slot gets the failure line with `"code":"io"`
+instead of silence, so a client never waits for a verdict that will not come.
+
 ```json
 {"type":"share","i":0,"ok":1,"ih":"0123456789abcdef0123456789abcdef01234567","ih2":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123","name":"photo.jpg","magnet":"magnet:?xt=urn:btih:0123...&xt=urn:btmh:...&dn=photo.jpg&tr=https%3A%2F%2F...","torrent":"downloads/photo.jpg-01234567.torrent"}
 {"type":"share","i":1,"ok":0,"code":"changed"}

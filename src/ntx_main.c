@@ -38,6 +38,17 @@ static char g_ipc_stash[1280]; /* §3.8: one 1024 B chunk, re-framed with \n */
 static int g_ipc_stash_len;
 #define NTX_IPC_TICK_LINES 64  /* §3.8: at most 64 lines per tick */
 
+/* The two share-event consumers (share_drain_events, ipc_share_events) live
+   outside the NTX_NO_MAIN guard below, for the same reason ipc_pump_tick does:
+   test/t_ipc_ctrl.c drives the SHIPPED consumers instead of reimplementing
+   them. The helper they need therefore lives outside the guard too. The weak
+   reference is explained on ntx_share_available below. */
+__attribute__((weak)) const char *ntx_share_err_msg(ntx_share_err e);
+static const char *main_share_err_msg(ntx_share_err e) {
+    return ntx_share_err_msg ? ntx_share_err_msg(e) : "sharing is not available in this build";
+}
+static int g_cli_needs_nl;
+
 #ifndef NTX_NO_MAIN
 /* ntx_share_available/ntx_share_err_msg live in ntx_share_trackers.c / ntx_share.c
    and every shipped binary links them. test/t_cli_https.c includes this file
@@ -48,16 +59,11 @@ static int g_ipc_stash_len;
    gate. Upgrade path: drop the attributes once t_cli_https.c stubs these two
    the way it stubs the session externs. */
 __attribute__((weak)) int ntx_share_available(void);
-__attribute__((weak)) const char *ntx_share_err_msg(ntx_share_err e);
 static int main_share_available(void) { return ntx_share_available ? ntx_share_available() : 0; }
-static const char *main_share_err_msg(ntx_share_err e) {
-    return ntx_share_err_msg ? ntx_share_err_msg(e) : "sharing is not available in this build";
-}
 static int g_stats_json;
 static volatile sig_atomic_t g_quit;
 static char g_magnet_buf[4096];
 static ntx_session *g_sess;
-static int g_cli_needs_nl;
 /* §9: --share/--share-from are main()'s business (ntx_config carries only
    port_map); file scope so parse_args keeps the arity t_cli_https.c calls it with. */
 static const char *g_share_path, *g_share_from;
@@ -154,6 +160,7 @@ static void doh_ui_kick(void) {
     ntx_session_snapshot(g_sess, &st);
     ntx_cli_status_update(&st, stderr, &g_cli_needs_nl);
 }
+#endif
 
 /* §5.4/§9: share results in the CLI loop. The magnet is the deliverable — one
    line on stdout, so `ntx --share=f > link.txt` is a file ntx accepts as input —
@@ -198,13 +205,20 @@ __attribute__((weak)) int ntx_session_share_poll_event(ntx_session *s, ntx_share
 __attribute__((weak)) int ntx_ipc_share_event_json(char *out, size_t cap, const ntx_share_event *ev);
 
 static void ipc_share_events(ntx_session *s) {
-    if (!ntx_session_share_poll_event || !ntx_ipc_share_event_json) return;
+    /* The two entry points are reached through locals: production leaves them
+       NULL in a build that lost the share objects (§6.4), while the test TU that
+       drives this function defines both strongly — testing a defined function's
+       own address is not a verdict (-Waddress). */
+    int (*poll_ev)(ntx_session *, ntx_share_event *) = ntx_session_share_poll_event;
+    int (*emit)(char *, size_t, const ntx_share_event *) = ntx_ipc_share_event_json;
+    if (!poll_ev || !emit) return;
     ntx_share_event ev;
-    while (ntx_session_share_poll_event(s, &ev))
-        if (ntx_ipc_share_event_json(g_share_evt, sizeof g_share_evt, &ev) > 0)
+    while (poll_ev(s, &ev))
+        if (emit(g_share_evt, sizeof g_share_evt, &ev) > 0)
             ipc_emit(g_share_evt);
 }
 
+#ifndef NTX_NO_MAIN
 static const char *load_magnet_file(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
