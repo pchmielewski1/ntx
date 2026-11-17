@@ -121,6 +121,11 @@ struct pm_seq6 {
     uint64_t epoch_at;
     int restarts;
     int lost;                 /* §8.5 rollback: the tick owes this half one fresh query */
+    /* R25 witness of the delete pump: how many lifetime-0 datagrams this half attempted
+     * and how many the kernel took. One delete failing must not cancel the next, so
+     * `tried` says every held mapping was asked about and `sent` says how many went. */
+    int del_tried;
+    int del_sent;
 };
 
 struct ntx_portmap {
@@ -212,6 +217,14 @@ struct ntx_portmap {
     int retried;          /* the one deferred retry of this sequence is spent (R14) */
     int lost;             /* §8.5 rollback: the tick owes the sequence one fresh query (R10) */
     int restarts;         /* consecutive §8.5 restart detections; a grant resets them */
+    /* R25 witness of the delete pump, the v6 half's counters mirrored for v4: the
+     * deletes go out from stop()/pm_cgnat, which free or rewrite the driver as they
+     * go, so the only way a test can see that a second held mapping was still ASKED
+     * about is a count the pump leaves behind. Cumulative over the driver's life —
+     * nothing in production reads them, and a sequence boundary that wiped them would
+     * hide a pump that broke out early on its first pass. */
+    int del_tried;
+    int del_sent;
 };
 
 /* Process globals because the test hooks take no session. Production never sets
@@ -232,6 +245,12 @@ static uint16_t pm_gw6_port_cfg;
  * "ask the kernel", which is the path the wire-level cases pin byte for byte. */
 static uint8_t pm_client6_cfg[16];
 static int pm_client6_set;
+/* R24: the test's stand-in for getsockname() on the v4 gateway socket failing. The
+ * sandbox cannot arrange it on a freshly connect()ed loopback socket (every way of
+ * breaking a connected UDP socket breaks send()/recvfrom() with it, which is the N2
+ * pattern and a different verdict), and production never sets it — the call below is
+ * exactly the kernel's answer whenever the flag is 0. */
+static int pm_getsockname_fail;
 static int pm_cgnat_warned;
 
 void ntx_portmap_test_set_route_files(const char *v4, const char *v6) {
@@ -260,6 +279,12 @@ void ntx_portmap_test_set_client6(const uint8_t *addr16) {
     }
 }
 
+/* R24: make the v4 sequence's getsockname() fail. With the flag set the driver must
+ * abort the family instead of building a MAP request out of a client address it never
+ * learned — RFC 6887 §7.1 makes that field the address the request came from, and a
+ * zero or left-over one is a request for a mapping to somebody else's host. */
+void ntx_portmap_test_set_getsockname_fail(int on) { pm_getsockname_fail = on ? 1 : 0; }
+
 void ntx_portmap_test_advance_ms(uint64_t ms) { pm_voff += ms; }
 
 static uint16_t pm_gw_port(void) { return pm_gw_port_cfg ? pm_gw_port_cfg : NTX_PCP_PORT; }
@@ -287,23 +312,51 @@ static int pm_nib(char c) {
     return -1;
 }
 
+/* The three Flags bits of /proc/net/route this reader judges (the uapi values live in
+ * <linux/route.h>), named beside the v6 twins the parser below already applies to
+ * /proc/net/ipv6_route, so both tables are read on one rule. */
+#define PM_RTF4_UP 0x00000001u      /* RTF_UP: the route is installed and usable */
+#define PM_RTF4_GATEWAY 0x00000002u /* RTF_GATEWAY: the nexthop is a gateway */
+#define PM_RTF4_REJECT 0x00000200u  /* RTF_REJECT: this destination is refused */
+
 /* /proc/net/route: "Iface Destination Gateway Flags RefCnt Use Metric Mask …",
- * the addresses as host-byte-order hex. Lowest-metric 0.0.0.0/0 via a gateway. */
+ * the addresses as host-byte-order hex. Lowest-metric 0.0.0.0/0 via a gateway.
+ *
+ * R24 — the Flags column, which this reader parsed and then ignored, is what separates
+ * a default route from a line that merely LOOKS like one: a 0.0.0.0/0 with a non-zero
+ * gateway and a zero mask is also how a route the kernel is holding DOWN prints, a
+ * directly-connected one, or a blackhole. So the three tests S17a built for the v6
+ * table apply here (the `#define`s above are their v4 spellings): RTF_UP set (a route
+ * that is not usable is not a way out), RTF_GATEWAY set (a default with no gateway to
+ * ask has no PCP responder — dialling its nexthop puts a datagram at an on-link host),
+ * and RTF_REJECT clear (a blackhole is a route the kernel answers "no" with).
+ *
+ * Flags is hex — the kernel prints it %08X while the four columns after it are decimal
+ * — so it goes through pm_hex32 and not through `%u`: "00000200" read as decimal is
+ * 200, which has no bit in common with RTF_REJECT.
+ *
+ * TIE: the lowest metric wins, and on an equal metric the FIRST usable line wins —
+ * `metric < best`, never `<=`. Ties are not hypothetical (two RA- or DHCP-learned
+ * defaults with the same metric is a dual-homed host), and the table order is what the
+ * kernel's FIB walk gives, so first-wins makes the gateway the driver dials a function
+ * of the table rather than of which line the walk happened to emit last. Pinned from
+ * both ends by X3 in t_portmap.c. */
 static int pm_route4(uint32_t *gw_net) {
     FILE *f = fopen(pm_route4_path ? pm_route4_path : "/proc/net/route", "r");
     if (!f) return 0;
-    char line[512], iface[64], dst[32], gw[32], mask[32];
+    char line[512], iface[64], dst[32], gw[32], mask[32], flags[16];
     int found = 0;
     unsigned best = 0;
     uint32_t best_gw = 0;
     while (fgets(line, sizeof line, f)) {
-        unsigned flags, refcnt, use, metric;
-        if (sscanf(line, "%63s %31s %31s %u %u %u %u %31s", iface, dst, gw, &flags, &refcnt, &use, &metric,
+        unsigned refcnt, use, metric;
+        if (sscanf(line, "%63s %31s %31s %15s %u %u %u %31s", iface, dst, gw, flags, &refcnt, &use, &metric,
                    mask) != 8)
             continue;
-        uint32_t d, g, m;
-        if (!pm_hex32(dst, &d) || !pm_hex32(gw, &g) || !pm_hex32(mask, &m)) continue;
+        uint32_t d, g, m, fl;
+        if (!pm_hex32(dst, &d) || !pm_hex32(gw, &g) || !pm_hex32(mask, &m) || !pm_hex32(flags, &fl)) continue;
         if (d != 0 || m != 0 || g == 0) continue;
+        if (!(fl & PM_RTF4_UP) || !(fl & PM_RTF4_GATEWAY) || (fl & PM_RTF4_REJECT)) continue;
         if (!found || metric < best) {
             found = 1;
             best = metric;
@@ -744,7 +797,24 @@ static void pm_start_query(struct ntx_portmap *pm, int phase, uint16_t sugg_port
 
 /* RFC 6887 §11.1: a mapping is deleted with the same nonce and lifetime 0. One
  * datagram per live mapping, no waiting: stop() runs inside the 3 s close budget,
- * so deletes are fire-and-forget like the stopped announce. */
+ * so deletes are fire-and-forget like the stopped announce.
+ *
+ * R25: a send() that fails skips THIS delete and the loop carries on (`continue`, not
+ * `break`) — the delete of the other mapping is a separate request the gateway was
+ * never told about, and cancelling it because its neighbour's datagram was refused left
+ * the gateway forwarding into a mapping the client had already given up on, for the rest
+ * of its granted lifetime (up to 7200 s). Nothing retries a delete: this is the
+ * fire-and-forget of §11.1, bounded by the mappings held, so neither a dead socket nor a
+ * live one buys more than PM_NPH-1 sends.
+ *
+ * R9's judgement is deliberately NOT applied per attempt here. pm_send routes a failed
+ * send() through pm_sock_err once, because an outstanding QUERY is what that verdict is
+ * about (ECONNREFUSED = "no responder here" → the fallback / give-up). A delete answers
+ * no query, so pm_sock_err would either be reached with `phase` already -1 — where it
+ * returns without judging, the "stale error" rule of that function — or, worse, convict
+ * a query the sequence has since started. The one judgement the pump does keep is
+ * pm_drain_err per attempt: a pending ICMP must not be left asserted on the level-
+ * triggered fd after the socket is the loop's no more (R9's spin). */
 static void pm_send_deletes(struct ntx_portmap *pm) {
     if (pm->fd < 0) return;
     uint16_t lp = ntx_netx_port(pm->netx);
@@ -760,7 +830,9 @@ static void pm_send_deletes(struct ntx_portmap *pm) {
             n = natpmp_build_map(buf, pm_op_of(ph), lp, pm->ext[ph], 0);
         }
         (void)pm_drain_err(pm); /* an ICMP for the last live query must not skip this delete (R9) */
-        if (send(pm->fd, buf, n, 0) < 0) break;
+        pm->del_tried++;
+        if (send(pm->fd, buf, n, 0) < 0) continue;
+        pm->del_sent++;
     }
 }
 
@@ -1296,7 +1368,9 @@ static void pm_start_query6(struct ntx_portmap *pm, int phase, uint16_t sugg_por
 
 /* §11.1 at exit: one lifetime-0 datagram per live v6 mapping, with the nonce that
  * grant was made with. Fire-and-forget like the v4 deletes — stop() runs inside the
- * close budget. */
+ * close budget — and, exactly as there (R25), a send() that fails skips this delete and
+ * the loop carries on: the second held mapping is owed its own request and must not be
+ * cancelled by the first one's failure. */
 static void pm_send_deletes6(struct ntx_portmap *pm) {
     struct pm_seq6 *s6 = &pm->s6;
     if (pm->fd6 < 0) return;
@@ -1308,7 +1382,9 @@ static void pm_send_deletes6(struct ntx_portmap *pm) {
         size_t n = pcp_build_map(buf, s6->client_ip, s6->grant_nonce[ph], proto, lp, s6->ext[ph], 0,
                                  s6->grant_ip[ph]);
         (void)pm_drain_err6(pm);
-        if (send(pm->fd6, buf, n, 0) < 0) break;
+        s6->del_tried++;
+        if (send(pm->fd6, buf, n, 0) < 0) continue;
+        s6->del_sent++;
     }
 }
 
@@ -1668,17 +1744,34 @@ static int pm_open(struct ntx_portmap *pm) {
         pm->gave_up = 1;
         return 0;
     }
+    /* The client address of every MAP request, straight from the kernel: RFC 6887 §7.1
+     * makes that field the address the request came from, so it is the LOCAL address
+     * this connect()ed socket sends with — not an address guessed from the route (the
+     * v6 half's pm_open6 reads it the same way, and is what this block was written
+     * against). R24: the call's failure used to be ignored, and the sequence went on
+     * with whatever `client_ip` happened to hold — all zeros on a fresh driver, or the
+     * PREVIOUS sequence's address after a reset, since pm_reset does not touch the
+     * field. A request naming a zero client asks the gateway to forward to no host; one
+     * naming a stale address asks it to forward to another host. Both are worse than not
+     * asking, so the family is aborted here: the socket is closed, the state says none,
+     * and no datagram goes out. */
     struct sockaddr_in me;
     socklen_t ml = sizeof me;
     memset(&me, 0, sizeof me);
-    if (getsockname(fd, (struct sockaddr *)&me, &ml) == 0 && me.sin_family == AF_INET) {
-        pm_widen4(pm->client_ip, me.sin_addr.s_addr);
-        if (pm_is_global(me.sin_addr.s_addr)) { /* §8: a public address means no NAT */
-            close(fd);
-            pm->st = NTX_PM_OFF;
-            pm->gave_up = 1;
-            return 0;
-        }
+    memset(pm->client_ip, 0, sizeof pm->client_ip); /* nothing is named until it is learned */
+    if (pm_getsockname_fail || getsockname(fd, (struct sockaddr *)&me, &ml) != 0 ||
+        me.sin_family != AF_INET) {
+        close(fd);
+        pm->st = NTX_PM_NONE;
+        pm->gave_up = 1;
+        return 0;
+    }
+    pm_widen4(pm->client_ip, me.sin_addr.s_addr);
+    if (pm_is_global(me.sin_addr.s_addr)) { /* §8: a public address means no NAT */
+        close(fd);
+        pm->st = NTX_PM_OFF;
+        pm->gave_up = 1;
+        return 0;
     }
     /* A connected UDP socket reports the gateway's ICMP port-unreachable as a
      * pending SO_ERROR, and epoll then holds EPOLLERR asserted until somebody reads

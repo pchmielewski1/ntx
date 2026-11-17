@@ -5063,6 +5063,333 @@ int main(void) {
         gw6_drain();
     }
 
+    /* ---- X. R24: the Flags column of /proc/net/route, the metric tie, and the
+     * source address of the v4 sequence.
+     *
+     * The v4 reader read Flags and then ignored it, so any line printing a 0.0.0.0/0
+     * with a non-zero gateway and a zero mask was taken for a default route: a route
+     * the kernel is holding DOWN (no RTF_UP), a directly-connected one with no gateway
+     * to ask (no RTF_GATEWAY — its nexthop is an on-link host, and dialling it at 5351
+     * is a datagram at somebody's laptop), or a blackhole (RTF_REJECT). S17a built the
+     * same three tests for /proc/net/ipv6_route; this is the v4 table, read on the same
+     * rule. Flags is hex (the kernel prints it %08X, the columns after it decimal), so
+     * it goes through pm_hex32 and never through `%u`: "00000200" read as decimal is
+     * 200, which shares no bit with RTF_REJECT.
+     *
+     * The tie: the lowest metric wins, and on an equal metric the FIRST usable line
+     * wins (X3 pins both orders). Ties are not hypothetical — two RA-learned or two
+     * DHCP defaults with the same metric is the state a dual-homed host sits in, and
+     * first-wins is what makes the gateway the driver dials a function of the table
+     * rather than of the FIB walk that produced it.
+     *
+     * The client address: pm_open read getsockname() and threw the answer away when the
+     * call failed, so the sequence went on with whatever `client_ip` happened to hold —
+     * zeros on a fresh driver, or the previous sequence's address after a reset, which
+     * is the stale client RFC 6887 §7.1 forbids in a MAP request (the client field MUST
+     * be the address of the request's origin). The family is aborted instead, the way
+     * S17c's pm_open6 already aborts on the v6 side.
+     *
+     * Pre-fix, run with the two test hooks present but no behaviour change: X1_* (all
+     * five refused routes) got a socket, PENDING and six datagrams; X3 picked the
+     * second gateway on the reversed table; X8 sent a 60 B request naming 192.0.2.7. */
+    {
+        /* A /proc/net/route fixture of the caller's own lines beside the real v6 table
+         * of write_routes — the v6 half stays unreachable here (fe80::1 has no route in
+         * this sandbox), so every assertion below is about the v4 sequence alone. */
+        static const struct {
+            const char *flags;
+            const char *tag;
+            const char *what;
+        } bad[] = {
+            {"00000002", "x1a_down", "X1a_down_route_refused"},
+            {"00000001", "x1b_nogw", "X1b_nongateway_nexthop_refused"},
+            {"00000203", "x1c_reject", "X1c_reject_route_refused"},
+            {"00000000", "x1d_noflags", "X1d_flags_zero_refused"},
+            {"00000202", "x1e_reject_down", "X1e_reject_and_down_refused"},
+        };
+        for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+            char path[256], body[256];
+            snprintf(path, sizeof path, "%s/r24_%s", SCRATCH, bad[i].tag);
+            snprintf(body, sizeof body,
+                     "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+                     "lo\t00000000\t0100007F\t%s\t0\t0\t100\t00000000\t0\t0\t0\n",
+                     bad[i].flags);
+            wr(path, body);
+            ntx_portmap_test_set_route_files(path, v6path);
+            sess x;
+            sess_open(&x, bad[i].tag);
+            x.cfg.port_map = 1;
+            pm_start(&x);
+            ck(x.s->pm->fd < 0, bad[i].what);
+            ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, bad[i].what);
+            ck_eq(x.s->pm->gave_up, 1, bad[i].what);
+            ck(!gw_pending(), bad[i].what);
+            ck_eq(pm_sends_in(&x, 60000, 6), 0, bad[i].what);
+            ntx_session_portmap_stop(x.s);
+            sess_close(&x);
+            gw_drain();
+        }
+
+        /* X2. the guard: the same line with RTF_UP|RTF_GATEWAY is a route, so X1 cannot
+         * be satisfied by a reader that refuses every table. */
+        {
+            char path[256];
+            snprintf(path, sizeof path, "%s/r24_good", SCRATCH);
+            char body[256];
+            snprintf(body, sizeof body,
+                     "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+                     "lo\t00000000\t0100007F\t00000003\t0\t0\t100\t00000000\t0\t0\t0\n"
+                     "lo\t0100007F\t00000000\t00000001\t0\t0\t100\t000000FF\t0\t0\t0\n");
+            wr(path, body);
+            ntx_portmap_test_set_route_files(path, v6path);
+            sess x;
+            sess_open(&x, "x2_good");
+            x.cfg.port_map = 1;
+            pm_start(&x);
+            ck(x.s->pm->fd >= 0, "X2_good_route_opens_the_socket");
+            ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "X2_good_route_pending");
+            ck_eq(x.s->pm->gw, 0x0100007F, "X2_good_route_gateway");
+            uint8_t req[2048];
+            ck_eq(gw_wait(req, sizeof req, 300), 60, "X2_good_route_request_on_wire");
+            ntx_session_portmap_stop(x.s);
+            sess_close(&x);
+            gw_drain();
+        }
+
+        /* X3. the tie. Two 0.0.0.0/0 defaults, the SAME metric, gateways differing in
+         * the last octet only (127.0.0.1 / 127.0.0.2 — both on the private side, so
+         * pm_is_global judges neither of them, and only the first is the fake gateway).
+         * The rule is FIRST-LINE-WINS: both orders have to end up dialling 127.0.0.1,
+         * which is the order the two lines swap, and it is observable twice over — on
+         * the field the driver dials and on the socket that receives the datagram.
+         * (The fake gateway is 127.0.0.1, so a last-wins reader shows up here as
+         * pm->gw == 0x0200007F and an empty gateway socket.) */
+        {
+            static const struct {
+                const char *first;
+                const char *tag;
+                uint32_t want;
+            } tie[] = {{"0100007F", "x3_ab", 0x0100007F}, {"0200007F", "x3_ba", 0x0200007F}};
+            for (size_t i = 0; i < 2; i++) {
+                const char *second = i == 0 ? "0200007F" : "0100007F";
+                char path[256], body[512];
+                snprintf(path, sizeof path, "%s/r24_%s", SCRATCH, tie[i].tag);
+                snprintf(body, sizeof body,
+                         "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+                         "lo\t00000000\t%s\t00000003\t0\t0\t100\t00000000\t0\t0\t0\n"
+                         "lo\t00000000\t%s\t00000003\t0\t0\t100\t00000000\t0\t0\t0\n",
+                         tie[i].first, second);
+                wr(path, body);
+                ntx_portmap_test_set_route_files(path, v6path);
+                sess x;
+                sess_open(&x, tie[i].tag);
+                x.cfg.port_map = 1;
+                pm_start(&x);
+                ck_eq(x.s->pm->gw, (long)tie[i].want, "X3_equal_metric_first_line_wins");
+                ck(x.s->pm->fd >= 0, "X3_equal_metric_socket");
+                if (i == 0) { /* only 127.0.0.1 is the fake gateway's own address */
+                    uint8_t req[2048];
+                    ck_eq(gw_wait(req, sizeof req, 300), 60, "X3_equal_metric_dials_the_first_gateway");
+                }
+                ntx_session_portmap_stop(x.s);
+                sess_close(&x);
+                gw_drain();
+            }
+
+            /* X3b. the tie rule must not cost the metric its ordering: the lower metric
+             * wins from either end of the table (500 against 600). */
+            static const struct {
+                const char *first;
+                const char *first_met;
+                const char *second;
+                const char *second_met;
+                uint32_t want;
+                const char *tag;
+            } met[] = {
+                {"0200007F", "500", "0100007F", "600", 0x0200007F, "x3b_low_first"},
+                {"0100007F", "600", "0200007F", "500", 0x0200007F, "x3b_low_second"},
+            };
+            for (size_t i = 0; i < 2; i++) {
+                char path[256], body[512];
+                snprintf(path, sizeof path, "%s/r24_%s", SCRATCH, met[i].tag);
+                snprintf(body, sizeof body,
+                         "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+                         "lo\t00000000\t%s\t00000003\t0\t0\t%s\t00000000\t0\t0\t0\n"
+                         "lo\t00000000\t%s\t00000003\t0\t0\t%s\t00000000\t0\t0\t0\n",
+                         met[i].first, met[i].first_met, met[i].second, met[i].second_met);
+                wr(path, body);
+                ntx_portmap_test_set_route_files(path, v6path);
+                sess x;
+                sess_open(&x, met[i].tag);
+                x.cfg.port_map = 1;
+                pm_start(&x);
+                ck_eq(x.s->pm->gw, (long)met[i].want, "X3b_lowest_metric_wins_either_order");
+                ntx_session_portmap_stop(x.s);
+                sess_close(&x);
+                gw_drain();
+            }
+        }
+
+        /* X8. getsockname() fails: the family is aborted. The hook is the S17c pattern
+         * (`ntx_portmap_test_set_client6` stands in for the address the kernel picks);
+         * this one stands in for the call itself failing, which the sandbox cannot
+         * arrange on a freshly connect()ed loopback socket. The sequence is over, the
+         * socket is gone, and the client field holds nothing a request could name —
+         * the poison below is what a reset used to carry across. */
+        {
+            write_routes(GW_LO);
+            sess x;
+            sess_open(&x, "x8_src");
+            x.cfg.port_map = 1;
+            pm_start(&x); /* the honest path first: the kernel's own address on the route */
+            ck(x.s->pm->fd >= 0, "X8_socket_opens_with_the_hook_off");
+            ck_eq(x.s->pm->client_ip[12], 127, "X8_client_ip_is_the_socket_address");
+            gw_drain();
+            /* 192.0.2.7 in the client field: no path in this file can produce it, so
+             * finding it after the abort can only mean the stale value was reused. */
+            x.s->pm->client_ip[10] = 0xff;
+            x.s->pm->client_ip[11] = 0xff;
+            x.s->pm->client_ip[12] = 192;
+            x.s->pm->client_ip[13] = 0;
+            x.s->pm->client_ip[14] = 2;
+            x.s->pm->client_ip[15] = 7;
+            ntx_portmap_test_set_getsockname_fail(1);
+            x.cfg.proxy = 1;
+            pm_tick(&x); /* the tick's own reset: the sequence starts over on the next one */
+            x.cfg.proxy = 0;
+            pm_tick(&x);
+            ck(x.s->pm->fd < 0, "X8_no_socket_when_getsockname_fails");
+            ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "X8_none_when_getsockname_fails");
+            ck_eq(x.s->pm->phase, -1, "X8_nothing_outstanding");
+            ck_eq(x.s->pm->gave_up, 1, "X8_gave_up");
+            ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "X8_adv_port_is_listen_port");
+            static const uint8_t zero16[16];
+            ck(memcmp(x.s->pm->client_ip, zero16, 16) == 0, "X8_no_stale_client_address_kept");
+            /* The wire is the whole point: pre-fix the request went out anyway, and its
+             * client field (octets 8..23 of a MAP request) carried the address the socket
+             * was never asked for. Both spellings of "no client" are refused: the zeros a
+             * fresh driver would have named, and the stale one a reset leaves behind. */
+            uint8_t req[2048];
+            int out = 0, bad_src = 0;
+            while (gw_get(req, sizeof req) >= 0) {
+                out++;
+                if (req[1] == 1) bad_src++; /* opcode MAP: whatever its client field says */
+            }
+            ck_eq(out, 0, "X8_no_request_with_an_unlearned_source");
+            ck_eq(bad_src, 0, "X8_no_map_request_names_an_unlearned_client");
+            ck_eq(pm_sends_in(&x, 60000, 6), 0, "X8_aborted_family_stays_quiet");
+            ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "X8_stays_none");
+            ntx_portmap_test_set_getsockname_fail(0);
+            ntx_session_portmap_stop(x.s);
+            sess_close(&x);
+            gw_drain();
+        }
+        write_routes(GW_LO);
+        gw_drain();
+    }
+
+    /* ---- Y. R25: every held mapping is owed its lifetime-0 delete.
+     *
+     * `pm_send_deletes` walked the phases and `break`ed on the first send() that
+     * failed, so one datagram the kernel refused cancelled the delete of the OTHER
+     * mapping: the gateway kept forwarding into a mapping ntx had given up on, for the
+     * rest of its granted lifetime (up to 7200 s), and the client that stopped() had
+     * already forgotten it. RFC 6887 §11.1 / RFC 6886 §3.3 make the delete per mapping,
+     * so one failure must not speak for the other — `continue`, the same rule pm_cgnat
+     * follows when it hands both mappings back.
+     *
+     * The pump runs inside `ntx_session_portmap_stop`, which frees the driver in the
+     * same breath, so the witness of an ATTEMPT lives on the driver and the cases call
+     * the pump directly — the very function pm_stop_now calls, whose only precondition
+     * is a live fd and a held mapping. Both counters matter: `del_tried` is the pin
+     * (the second delete was attempted), `del_sent` is the guard that the pump still
+     * puts good datagrams on the wire.
+     *
+     * A connected UDP socket fails every send or none — the kernel has no way to refuse
+     * the first 60-byte datagram to a peer and accept the second — so the mixed
+     * "first fails, second succeeds" shape cannot be arranged on one socket. The pair
+     * below pins the equivalent: with a socket that works, both deletes go out; with one
+     * that cannot send at all (SHUT_WR, the N2 pattern), both are still ATTEMPTED and
+     * neither is skipped for the other's failure. Pre-fix the dead-socket case counted
+     * one attempt, not two (Y1_delete_pump_does_not_break_early got=1 want=2, and the
+     * v6 twin), which is exactly the mapping that used to lose its delete. */
+    {
+        sess x;
+        sess_open(&x, "y1");
+        x.cfg.utp = 1;
+        x.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&x);
+        both_active(&x, EXT_PORT, pub);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "Y1_both_mappings_held");
+        gw_drain();
+        pm_send_deletes(x.s->pm); /* the healthy pump: one datagram per held mapping */
+        ck_eq(x.s->pm->del_tried, 2, "Y1_two_deletes_attempted");
+        ck_eq(x.s->pm->del_sent, 2, "Y1_two_deletes_sent");
+        int dels = 0, tcp_dels = 0, udp_dels = 0;
+        uint8_t req[2048];
+        while (gw_get(req, sizeof req) >= 0) {
+            if (rd32(req + 4) != 0) continue;
+            dels++;
+            if (req[36] == NTX_PCP_PROTO_TCP) tcp_dels++;
+            if (req[36] == NTX_PCP_PROTO_UDP) udp_dels++;
+        }
+        ck_eq(dels, 2, "Y1_two_deletes_on_the_wire");
+        ck_eq(tcp_dels, 1, "Y1_tcp_delete_on_the_wire");
+        ck_eq(udp_dels, 1, "Y1_udp_delete_on_the_wire");
+
+        /* The dead socket: every send fails with EPIPE, and the SECOND delete must still
+         * be attempted. No spin either — the pump is bounded by the mappings it holds. */
+        shutdown(x.s->pm->fd, SHUT_WR);
+        pm_send_deletes(x.s->pm);
+        ck_eq(x.s->pm->del_tried, 4, "Y1_delete_pump_does_not_break_early");
+        ck_eq(x.s->pm->del_sent, 2, "Y1_dead_socket_sends_nothing_more");
+        long iters = pm_loop_iters(x.n, 200);
+        if (iters >= 5000) printf("  (spin: %ld loop iterations in 0,2 s)\n", iters);
+        ck(iters < 5000, "Y1_dead_delete_socket_does_not_spin");
+        /* stop() on the same dead socket: fire-and-forget, bounded, and it returns. */
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        gw_drain();
+
+        /* The v6 twin (the step says: apply it to both families). */
+        sess y;
+        sess_open(&y, "y2");
+        y.cfg.utp = 1;
+        y.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&y);
+        uint16_t lp = ntx_netx_port(y.n);
+        pcp_grant6(&y, NTX_PCP_PROTO_TCP, lp, V6_EXT_GLOBAL, 7200);
+        pcp_grant6(&y, NTX_PCP_PROTO_UDP, lp, V6_EXT_GLOBAL, 7200);
+        ck_eq(pm6_state6(&y), NTX_PM_ACTIVE, "Y2_both_v6_mappings_held");
+        gw6_drain();
+        pm_send_deletes6(y.s->pm);
+        ck_eq(y.s->pm->s6.del_tried, 2, "Y2_two_v6_deletes_attempted");
+        ck_eq(y.s->pm->s6.del_sent, 2, "Y2_two_v6_deletes_sent");
+        int v6_dels = 0, v6_tcp = 0, v6_udp = 0;
+        while (gw6_get(req, sizeof req) >= 0) {
+            if (rd32(req + 4) != 0) continue;
+            v6_dels++;
+            if (req[36] == NTX_PCP_PROTO_TCP) v6_tcp++;
+            if (req[36] == NTX_PCP_PROTO_UDP) v6_udp++;
+        }
+        ck_eq(v6_dels, 2, "Y2_two_v6_deletes_on_the_wire");
+        ck_eq(v6_tcp, 1, "Y2_v6_tcp_delete_on_the_wire");
+        ck_eq(v6_udp, 1, "Y2_v6_udp_delete_on_the_wire");
+        shutdown(y.s->pm->fd6, SHUT_WR);
+        pm_send_deletes6(y.s->pm);
+        ck_eq(y.s->pm->s6.del_tried, 4, "Y2_v6_delete_pump_does_not_break_early");
+        ck_eq(y.s->pm->s6.del_sent, 2, "Y2_v6_dead_socket_sends_nothing_more");
+        ntx_session_portmap_stop(y.s);
+        sess_close(&y);
+        ntx_portmap_test_set_client6(NULL);
+        gw_drain();
+        gw6_drain();
+    }
+
     write_routes(GW_LO);
     gw_drain();
     gw6_drain();
