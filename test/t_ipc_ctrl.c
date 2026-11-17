@@ -225,6 +225,32 @@ static int r30_cap_cb(void *ud, const char *line) {
     return 0;
 }
 
+/* R31: framer capture for the magnet round trip — the generated line goes through
+   the SHIPPED framer, so an over-long frame surfaces as on_bad (the pre-fix
+   symptom) instead of being quietly shortened by the test. */
+static char r31_line[4608];
+static int r31_nline, r31_nbad;
+static int r31_cap_cb(void *ud, const char *line) {
+    (void)ud;
+    snprintf(r31_line, sizeof r31_line, "%s", line);
+    r31_nline++;
+    return 0;
+}
+static void r31_bad_cb(void *ud) { (void)ud; r31_nbad++; }
+
+/* R31 oracle: the RFC 3986 length a magnet field has after the generator's
+   percent-encoding (unreserved raw, everything else %XX). Deliberately a second,
+   independent implementation — the same role utf8_strict plays for R8 — so the
+   worst-case length is CHECKED, not read back off the code under test. */
+static size_t r31_pct_len(const char *s) {
+    static const char UN[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                             "0123456789-._~";
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        n += memchr(UN, *p, sizeof UN - 1) ? 1 : 3;
+    return n;
+}
+
 int main(void) {
     char out[512];
 
@@ -1646,6 +1672,210 @@ int main(void) {
             }
         drop(s, nx);
         if (ok("r36_ipc_one_name_gate")) return 1;
+    }
+
+    { /* ── R31: every magnet ntx emits must fit what `add` accepts (spec §11) ──
+         The generator capped a magnet at NTX_SHARE_MAGNET_MAX (4095 usable B) while
+         the add path capped it at NTX_IPC_MAGNET_MAX (2048 B). Two limits, so they
+         could drift — and one share produced a link ntx itself refused to re-add.
+         They are ONE constant now; this block is the invariant. The parity itself is
+         a _Static_assert in ntx_ipc.h, next to the two macros it constrains. */
+
+        /* Widest magnet the gates can actually produce. The name field is char[512]
+           in the slot and in the event, so the generator sees at most 511 B, and the
+           S26 gate (valid UTF-8, no control bytes, no '/') plus S15 (cut on a
+           character boundary) leave 255 × U+0142 + one '!' as the worst encodable
+           name: 2 input bytes → 6 output bytes each. Trackers: the built-in pinned
+           list is the only list a share ever gets (share_trk_list), so its encoded
+           total is the real tracker term. */
+        char nm[512];
+        for (int k = 0; k < 255; k++) { nm[2 * k] = (char)0xC5; nm[2 * k + 1] = (char)0x82; }
+        nm[510] = '!';
+        nm[511] = 0; /* 511 B = the full field: 255 × U+0142 + one unreserved byte */
+        int nb2 = ntx_share_tracker_count();
+        const char *tl[NTX_SESSION_MAX_TRK];
+        if (nb2 < 2 || nb2 > NTX_SESSION_MAX_TRK) return fail("r31_trk_setup");
+        for (int k = 0; k < nb2; k++) tl[k] = ntx_share_tracker_get(k)->url;
+        uint8_t mih[20], mih2[32];
+        for (int k = 0; k < 20; k++) mih[k] = (uint8_t)(0x10 + k);
+        for (int k = 0; k < 32; k++) mih2[k] = (uint8_t)(0x40 + k);
+
+        char mag[NTX_SHARE_MAGNET_MAX];
+        if (ntx_share_magnet(mag, sizeof mag, mih, mih2, nm, tl, nb2) != 0)
+            return fail("r31_gen_worst_case");
+        {
+            size_t want = (sizeof("magnet:?xt=urn:btih:") - 1) + 40 +
+                          (sizeof("&xt=urn:btmh:1220") - 1) + 64 +
+                          (sizeof("&dn=") - 1) + r31_pct_len(nm);
+            for (int k = 0; k < nb2; k++) want += (sizeof("&tr=") - 1) + r31_pct_len(tl[k]);
+            if (strlen(mag) != want) {
+                printf("R31 worst-case magnet %zu B, oracle says %zu B\n", strlen(mag), want);
+                return fail("r31_len_oracle");
+            }
+            printf("R31 worst-case share magnet = %zu B (magnet cap %d, frame %d, %d trackers)\n",
+                   strlen(mag), NTX_IPC_MAGNET_MAX, NTX_IPC_LINE_MAX, nb2);
+            if ((size_t)sizeof mag - 1 < (size_t)NTX_IPC_MAGNET_MAX)
+                return fail("r31_gen_cap_below_add_cap");
+            if (want > (size_t)NTX_IPC_MAGNET_MAX) {
+                printf("R31 note: the gates now allow a %zu B magnet — %d B past the add cap\n",
+                       want, (int)(want - (size_t)NTX_IPC_MAGNET_MAX));
+                return fail("r31_gates_exceed_add_cap");
+            }
+            /* one length, measured on the buffers, not only on the macros */
+            if (sizeof(((ntx_ipc_req *)0)->magnet) != sizeof(((ntx_share_event *)0)->magnet))
+                return fail("r31_buffers_drifted");
+            if (strlen(mag) + (sizeof("{\"cmd\":\"add\",\"magnet\":\"") - 1) +
+                    (sizeof("\"}") - 1) >= (size_t)NTX_IPC_LINE_MAX)
+                return fail("r31_frame_headroom");
+        }
+
+        /* The round trip over the SHIPPED framer: feed the JSON line, require the
+           framer to accept the frame (§3.7), then require add to take it whole. */
+        {
+            char line[4608];
+            snprintf(line, sizeof line, "{\"cmd\":\"add\",\"magnet\":\"%s\"}", mag);
+            ntx_ipc_sink snk = { 0, r31_cap_cb, r31_bad_cb };
+            r31_nline = r31_nbad = 0;
+            ntx_ipc_reader_init(&ipc_t_rd);
+            ntx_ipc_feed(&ipc_t_rd, line, strlen(line), &snk);
+            if (r31_nline || r31_nbad) return fail("r31_frame_partial"); /* no \n yet */
+            ntx_ipc_feed(&ipc_t_rd, "\n", 1, &snk);
+            if (r31_nbad || r31_nline != 1) {
+                printf("R31 frame: %zu B line → %d lines, %d bad (§3.7 dropped it)\n",
+                       strlen(line), r31_nline, r31_nbad);
+                return fail("r31_frame_dropped");
+            }
+            ntx_ipc_req r;
+            ntx_ipc_parse(r31_line, &r);
+            if (r.pre != NTX_IPC_OK || !r.has_magnet || strcmp(r.magnet, mag) != 0) {
+                printf("R31 add verdict %d on a %zu B generated magnet (cap %d)\n",
+                       (int)r.pre, strlen(mag), NTX_IPC_MAGNET_MAX);
+                return fail("r31_gen_within_add_cap");
+            }
+            ntx_config cfg;
+            ntx_netx *nx;
+            memset(&cfg, 0, sizeof cfg);
+            cfg.store_dir = "/tmp/ntx-ipc-r31";
+            ntx_session *s = mk(&nx, &cfg);
+            char out2[1024];
+            if (ntx_ipc_dispatch(s, r31_line, out2, sizeof out2) != 0 || !strstr(out2, "\"ok\":1")) {
+                printf("R31 add reply: %s\n", out2);
+                drop(s, nx);
+                return fail("r31_add_rejects_own_magnet");
+            }
+            int ntrk = s->trk_n[0], nurl = 0;
+            for (int k = 0; k < nb2; k++)
+                if (s->trk_urls[0][k][0]) nurl++;
+            int name_ok = strcmp(s->tts[0].name, nm) == 0;
+            drop(s, nx);
+            if (ntrk != nb2 || nurl != nb2) {
+                printf("R31 add kept %d urls for trk_n=%d, expected %d\n", nurl, ntrk, nb2);
+                return fail("r31_add_trackers");
+            }
+            if (!name_ok) return fail("r31_add_name"); /* the dn= reached the slot */
+        }
+        /* the magnet the generator produced is still a magnet, by the parser's eye */
+        {
+            ntx_magnet mg;
+            if (ntx_magnet_parse(mag, &mg) != 0) return fail("r31_parse_back");
+            if (mg.n_trackers != nb2) return fail("r31_parse_back_trackers");
+            if (!mg.has_name || strlen(mg.name) != 511 || memcmp(mg.name, nm, 511) != 0)
+                return fail("r31_parse_back_name");
+            if (memcmp(mg.info_hash, mih, 20) != 0 || !mg.has_v2 ||
+                memcmp(mg.ih_v2, mih2, 32) != 0)
+                return fail("r31_parse_back_hashes");
+        }
+
+        /* Guards: an ordinary share magnet is untouched by the shared cap, and the
+           store file's stem is a NAME_MAX basename, not a magnet field (its cut
+           rules live in t_share_out.c's path cases). */
+        {
+            int nb2 = ntx_share_tracker_count();
+            const char *list[32];
+            for (int k = 0; k < nb2; k++) list[k] = ntx_share_tracker_get(k)->url;
+            char m2[NTX_SHARE_MAGNET_MAX];
+            if (ntx_share_magnet(m2, sizeof m2, mih, mih2, "photo.jpg", list, nb2) != 0)
+                return fail("r31_guard_ordinary_build");
+            if (strstr(m2, "dn=photo.jpg") == NULL || strlen(m2) > 1024) {
+                printf("R31 ordinary magnet: %zu B: %s\n", strlen(m2), m2);
+                return fail("r31_guard_ordinary_shape");
+            }
+            char nm2[256], p2[NTX_SHARE_PATH_MAX];
+            memset(nm2, 'a', 250);
+            nm2[250] = 0;
+            if (ntx_share_torrent_path(p2, sizeof p2, "test/.scratch", nm2, mih) != 0)
+                return fail("r31_guard_stem_build");
+            const char *bn = strrchr(p2, '/');
+            if (!bn || strlen(bn + 1) != 255 || strstr(bn, ".torrent") == NULL) {
+                printf("R31 stem basename: %s\n", bn ? bn : "(none)");
+                return fail("r31_guard_stem_shape");
+            }
+        }
+
+        /* NON-VACUITY PROBE. The gates above already bound a real share magnet at
+           1946 B, INSIDE the 2048 B add cap — so the round trip alone would still
+           pass if the two limits drifted apart again. Two probes say otherwise.
+           (a) the add bound is real and reachable: a 2049 B magnet is `io` (the exact
+               pre-fix refusal a generated over-long link got), while one byte less is
+               accepted — so the case below is not vacuous;
+           (b) drive the generator one name byte past that same boundary — what any
+               future gate relaxation is — and require an honest refusal. Pre-fix the
+               generator happily emitted those 2049 B (its own cap was 4095) and add
+               answered `io`: the self-incompatibility of R31. */
+        {
+            static char pn[1024], p0[704], p1[704];
+            const char *pl[2] = { p0, p1 };
+            memset(p0, 'z', 700); p0[700] = 0; /* unreserved: 1 output byte each */
+            memset(p1, 'z', 700); p1[700] = 0;
+            size_t head = (sizeof("magnet:?xt=urn:btih:") - 1) + 40 +
+                          (sizeof("&xt=urn:btmh:1220") - 1) + 64 + (sizeof("&dn=") - 1) +
+                          2 * ((sizeof("&tr=") - 1) + 700);
+            size_t fit = (size_t)NTX_IPC_MAGNET_MAX - head; /* name bytes landing ON the cap */
+            if (fit == 0 || fit >= sizeof pn) return fail("r31_probe_setup");
+            char big[NTX_SHARE_MAGNET_MAX];
+            memset(pn, 'a', fit + 2);
+            pn[fit] = 0; /* → exactly the cap: built, and add takes it */
+            if (ntx_share_magnet(big, sizeof big, mih, mih2, pn, pl, 2) != 0)
+                return fail("r31_probe_boundary_ok");
+            if (strlen(big) != (size_t)NTX_IPC_MAGNET_MAX) {
+                printf("R31 probe: name %zu B → %zu B, cap %d\n", fit, strlen(big),
+                       NTX_IPC_MAGNET_MAX);
+                return fail("r31_probe_boundary_len");
+            }
+            { /* (a) the add bound is real and reachable: hand the reader the same
+                   magnet with one byte appended (a magnet the generator is now
+                   refusing to build) and the verdict must be `io` — the exact
+                   pre-fix refusal — while one byte less is accepted whole. */
+                char line[4608], over[NTX_SHARE_MAGNET_MAX + 2];
+                ntx_ipc_req rr;
+                memcpy(over, big, strlen(big));
+                over[strlen(big)] = 'a';
+                over[strlen(big) + 1] = 0;
+                snprintf(line, sizeof line, "{\"cmd\":\"add\",\"magnet\":\"%s\"}", over);
+                ntx_ipc_parse(line, &rr);
+                if (rr.pre != NTX_IPC_E_IO) {
+                    printf("R31 probe: a %zu B magnet got verdict %d, expected io(%d)\n",
+                           strlen(over), (int)rr.pre, (int)NTX_IPC_E_IO);
+                    return fail("r31_probe_add_bound_real");
+                }
+                snprintf(line, sizeof line, "{\"cmd\":\"add\",\"magnet\":\"%s\"}", big);
+                ntx_ipc_parse(line, &rr);
+                if (rr.pre != NTX_IPC_OK || strlen(rr.magnet) != (size_t)NTX_IPC_MAGNET_MAX)
+                    return fail("r31_probe_add_bound_off_by_one");
+            }
+            /* (b) the generator must refuse the one-byte overspill, not emit it */
+            pn[fit] = 'a';
+            pn[fit + 1] = 0; /* strlen = fit + 1 → the magnet would be 2049 B */
+            big[0] = 'Z';
+            if (ntx_share_magnet(big, sizeof big, mih, mih2, pn, pl, 2) == 0) {
+                printf("R31 probe: emitted a %zu B magnet, %d B past the add cap — the "
+                       "pre-fix behaviour (add answers io for it)\n",
+                       strlen(big), (int)(strlen(big) - (size_t)NTX_IPC_MAGNET_MAX));
+                return fail("r31_probe_refuses_overspill");
+            }
+            if (big[0]) return fail("r31_probe_no_torn_magnet");
+        }
+        if (ok("r31_one_magnet_limit")) return 1;
     }
 
     return 0; /* tasks append here; keep the final line intact */

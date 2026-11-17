@@ -267,8 +267,10 @@ int main(void) {
         }
         /* The real share list must fit the contract buffer NTX_SHARE_MAGNET_MAX
          * even in the worst case: every built-in tracker plus a 511 B name whose
-         * bytes are all percent-encoded. (The JSON event caps a magnet lower —
-         * 2048 B, plan C3 — which that task's own test pins.) */
+         * bytes are all percent-encoded. The buffer is NTX_MAGNET_MAX + 1 (the NUL),
+         * so this is also the exact length the IPC `add` path accepts — one limit on
+         * both sides, pinned by _Static_assert in ntx_ipc.h and driven round-trip in
+         * test/t_ipc_ctrl.c (r31_one_magnet_limit). */
         {
             int nb2 = ntx_share_tracker_count();
             const char *list[32];

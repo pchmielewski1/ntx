@@ -7,7 +7,21 @@
 
 /* Public contract for `ntx --share` (design §5). Bodies: ntx_share.c. */
 
-#define NTX_SHARE_MAGNET_MAX 4096
+/* ONE magnet length for the whole program (R31, design §11): ntx_share_magnet()
+ * emits no magnet longer than this and IPC `add` accepts no magnet longer than it
+ * either, so every link ntx hands out is a link ntx can take back. 2048 B stays
+ * the hard input bound of §11 — it is not a limit a share can hit: the widest
+ * magnet these gates produce is 511 name bytes × 3 (every byte percent-encoded)
+ * + 140 B of xt= + 4 B per tracker, which with the built-in pinned list measures
+ * 1946 B, so no share loses its link to the cap. The margin is what a future
+ * `make pins-update` has to stay inside; test/t_ipc_ctrl.c (r31) recomputes the
+ * worst case against the table in the build and fails if it reaches the cap.
+ * NTX_SHARE_MAGNET_MAX is the BUFFER that holds one magnet: the length plus its
+ * NUL, so the generator's usable length is exactly NTX_MAGNET_MAX (sout_append
+ * refuses the byte at cap). The two buffers carrying a magnet are pinned equal by
+ * the _Static_assert in ntx_ipc.h. */
+#define NTX_MAGNET_MAX 2048
+#define NTX_SHARE_MAGNET_MAX (NTX_MAGNET_MAX + 1)
 #define NTX_SHARE_PATH_MAX 1024
 
 typedef enum {

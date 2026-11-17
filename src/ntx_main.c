@@ -194,8 +194,9 @@ static int share_drain_events(ntx_session *s, int *fatal) {
 /* §11: JSON counterpart of share_drain_events (which is CLI-only). Drained after
    the dispatch and before the snapshot, so the per-tick order is ack → share
    event → stats. Own buffer, never g_js/g_ack (§11: "osobny bufor ≥ 8 KiB"), sized
-   for the §11.1 escape blow-up over the ntx_share_event fields (magnet 4096×6 +
-   name 512×6 + path 1024×6 + the two hashes); a line that would not fit is
+   for the §11.1 escape blow-up over the ntx_share_event fields (magnet 2048×6 +
+   name 512×6 + path 1024×6 + the two hashes ≈ 22 KiB worst case, R31 shrank the
+   magnet half of that); a line that would not fit is
    dropped whole, never torn. A failed share is reported as {"ok":0,"code":…} and
    the session keeps serving — unlike CLI mode, where share_drain_events leaves
    the loop with exit 1. Weak refs so test/t_cli_https.c keeps linking (same

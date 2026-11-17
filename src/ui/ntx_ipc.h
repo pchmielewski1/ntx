@@ -20,7 +20,7 @@ int ntx_hex40(char out[41], const uint8_t h[20]);
 /* ── Commands (§6) — pure parse + validation, no session calls (§6.4) ── */
 #define NTX_IPC_LINE_MAX 4096 /* §3.7 frame limit */
 #define NTX_IPC_ARGS_MAX 512  /* path/torrent value cap (§6.4, §11: ≤ 511 + NUL) */
-#define NTX_IPC_MAGNET_MAX 2048 /* §11: magnet in add grew from 511 B (relaxation, back-compat) */
+#define NTX_IPC_MAGNET_MAX NTX_MAGNET_MAX /* §11: the ONE magnet length, defined in ntx_share.h (R31) */
 #define NTX_IPC_CMD_ECHO 64   /* unknown-cmd echo cap (§8 err.cmd) */
 
 typedef enum {
@@ -46,12 +46,20 @@ typedef struct ntx_ipc_req {
     long long i_raw; /* untruncated "i" token; the dispatcher bounds-checks THIS
                         (parser truncates to int for the hot path; a huge literal
                         can wrap past the int guard — see the bounds check in ntx_ipc_dispatch.c). */
-    char magnet[NTX_IPC_MAGNET_MAX + 1]; /* §11: add accepts a magnet of up to 2048 B */
+    char magnet[NTX_IPC_MAGNET_MAX + 1]; /* §11/R31: the one magnet length + NUL */
     char path[NTX_IPC_ARGS_MAX];
     char torrent[NTX_IPC_ARGS_MAX]; /* share: the optional --share-from .torrent (§11) */
     int has_magnet, has_path, has_torrent; /* key presence, even for empty values (§6.4) */
     char cmd_echo[NTX_IPC_CMD_ECHO]; /* verbatim cmd token for ack/err */
 } ntx_ipc_req;
+
+/* R31: the invariant that makes spec §11 true — a magnet ntx emits is a magnet
+   `add` accepts. Both sides read the same NTX_MAGNET_MAX (ntx_share.h), so raising
+   one cap without the other is a compile error, not a share whose own link comes
+   back `io`. A magnet of NTX_IPC_MAGNET_MAX bytes still fits the §3.7 frame with
+   room for the {"cmd":"add","magnet":"…"} wrapper (test r31_frame_headroom). */
+_Static_assert(sizeof(((ntx_ipc_req *)0)->magnet) == sizeof(((ntx_share_event *)0)->magnet),
+               "R31: add and the share event must carry one magnet length");
 
 /* Parse one framed line into a request and validate it (§6.1, §6.4).
    Pure: never touches the session. Unknown keys are skipped (§6.1).
