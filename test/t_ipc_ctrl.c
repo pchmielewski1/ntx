@@ -1475,6 +1475,92 @@ int main(void) {
             if (!saw_fail_msg) return fail("r29_cli_msg");
             if (ok("r29_cli_share_failure_exits")) return 1;
         }
+
+        /* The consumer over an EMITTER FAILURE: the shipped ipc_share_events must
+           print the fallback for the event it could not build, print it exactly
+           ONCE (the event leaves the queue either way — S07's retry covers the
+           UNPLACED case, never this one), and leave the queue usable: the same
+           slot's later error event and another slot's ready line still come out.
+           The hook stands in for the one path that reaches the fallback (a ready
+           line that will not fit the escape buffer), which the 40 KiB consumer
+           buffer above pins as unreachable in production. */
+        {
+            ntx_config cfg;
+            ntx_netx *nx;
+            memset(&cfg, 0, sizeof cfg);
+            cfg.store_dir = "/tmp/ntx-ipc-r29";
+            ntx_session *s = mk(&nx, &cfg);
+            FILE *fa = fopen("/tmp/ntx-ipc-r29/qa.bin", "wb");
+            FILE *fb = fopen("/tmp/ntx-ipc-r29/qb.bin", "wb");
+            if (!fa || !fb) { if (fa) fclose(fa); if (fb) fclose(fb); drop(s, nx); return fail("r29_q_file_setup"); }
+            fputs("0123456789", fa); fclose(fa);
+            fputs("9876543210", fb); fclose(fb);
+            ntx_share_err se = NTX_SHARE_OK;
+            int ta = ntx_session_share_add(s, "/tmp/ntx-ipc-r29/qa.bin", NULL, &se);
+            int tb = ntx_session_share_add(s, "/tmp/ntx-ipc-r29/qb.bin", NULL, &se);
+            if (ta < 0 || tb < 0 || ta == tb) { drop(s, nx); return fail("r29_q_add"); }
+            struct ntx_share_slot *sla = s->share[ta], *slb = s->share[tb];
+            sla->st = NTX_SHARE_READY;
+            snprintf(sla->name, sizeof sla->name, "a.bin");
+            snprintf(sla->magnet, sizeof sla->magnet, "magnet:?xt=urn:btih:%040x", 21);
+            snprintf(sla->torrent_path, sizeof sla->torrent_path, "/tmp/a.torrent");
+            slb->st = NTX_SHARE_READY;
+            snprintf(slb->name, sizeof slb->name, "b.bin");
+            snprintf(slb->magnet, sizeof slb->magnet, "magnet:?xt=urn:btih:%040x", 22);
+            snprintf(slb->torrent_path, sizeof slb->torrent_path, "/tmp/b.torrent");
+            share_evq_push(sla); /* only A is queued while the emitter is armed */
+            ntx_ipc_test_set_share_emit_fail(1);
+            int save_out = dup(1);
+            fflush(stdout);
+            unlink("/tmp/ntx-ipc-r29-q.ndjson");
+            int capfd = open("/tmp/ntx-ipc-r29-q.ndjson", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            if (capfd < 0) { dup2(save_out, 1); close(save_out); ntx_ipc_test_set_share_emit_fail(0);
+                             drop(s, nx); return fail("r29_q_file"); }
+            dup2(capfd, 1);
+            close(capfd);
+            ipc_share_events(s);       /* A's ready event: one io fallback ... */
+            ipc_share_events(s);       /* ... and nothing more — the event left the queue */
+            ntx_ipc_test_set_share_emit_fail(0);
+            share_evq_push(slb);       /* B's ready line: the queue still works */
+            sla->st = NTX_SHARE_FAILED; /* A's own error event: real code wins */
+            sla->err = NTX_SHARE_E_CHANGED;
+            share_evq_push(sla);
+            ipc_share_events(s);       /* ok:1 for B, ok:0/changed for A */
+            ipc_share_events(s);
+            fflush(stdout);
+            dup2(save_out, 1);
+            close(save_out);
+            ntx_share_event pev;
+            int polled = ntx_session_share_poll_event(s, &pev);
+            drop(s, nx);
+            if (polled != 0) return fail("r29_q_event_left");
+            FILE *rf = fopen("/tmp/ntx-ipc-r29-q.ndjson", "rb");
+            if (!rf) return fail("r29_q_read");
+            char bl[40960];
+            char want_a[64], want_b[64];
+            snprintf(want_a, sizeof want_a, "{\"type\":\"share\",\"i\":%d,\"ok\":0,\"code\":\"io\"}", ta);
+            snprintf(want_b, sizeof want_b, "{\"type\":\"share\",\"i\":%d,\"ok\":0,\"code\":\"changed\"}", ta);
+            int n_io_a = 0, n_io_b = 0, n_chg = 0, n_other = 0;
+            while (fgets(bl, sizeof bl, rf)) {
+                size_t len = strlen(bl);
+                while (len && (bl[len - 1] == '\n' || bl[len - 1] == '\r')) bl[--len] = 0;
+                if (!strstr(bl, "\"type\":\"share\"")) continue;
+                if (!ipc_ok_local(bl) || !utf8_strict(bl, NULL)) {
+                    fclose(rf); printf("R29 queue line malformed: %s\n", bl);
+                    return fail("r29_q_line_valid");
+                }
+                if (!strcmp(bl, want_a)) n_io_a++;
+                else if (!strcmp(bl, want_b)) n_chg++;
+                else if (strstr(bl, "\"ok\":1")) n_io_b++; /* B's ready line, still flowing */
+                else n_other++;
+            }
+            fclose(rf);
+            if (n_io_a != 1) { printf("R29 io fallbacks for i=%d: %d\n", ta, n_io_a); return fail("r29_q_fallback_count"); }
+            if (n_io_b != 1) { printf("R29 ok:1 lines: %d\n", n_io_b); return fail("r29_q_next_event"); }
+            if (n_chg != 1) { printf("R29 changed lines: %d\n", n_chg); return fail("r29_q_after_fallback"); }
+            if (n_other) return fail("r29_q_extra_line");
+            if (ok("r29_consumer_fallback_once")) return 1;
+        }
     }
 
     return 0; /* tasks append here; keep the final line intact */

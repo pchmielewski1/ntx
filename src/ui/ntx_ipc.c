@@ -103,9 +103,17 @@ int ntx_ipc_hello_json(char *out, size_t cap, const char *build_id) {
     return (w < 0 || (size_t)w >= cap) ? -1 : w;
 }
 
+/* R29 test hook (same pattern as ntx_portmap_test_set_getsockname_fail): arm it
+ * and the next ready line is treated as un-buildable, so the consumer path —
+ * not just the emitter — is testable against the fallback. Production never
+ * arms it; the buffer in ntx_main.c is sized so the escape can never overflow. */
+static int g_ipc_test_emit_fail;
+void ntx_ipc_test_set_share_emit_fail(int on) { g_ipc_test_emit_fail = on ? 1 : 0; }
+
 int ntx_ipc_share_event_json(char *out, size_t cap, const ntx_share_event *ev) {
     if (!ev) return -1;
     int w;
+    if (g_ipc_test_emit_fail && ev->ok) goto fallback; /* armed: pretend the build failed */
     if (!ev->ok) {
         const char *code = ntx_share_err_code ? ntx_share_err_code(ev->err) : "bad_arg";
         w = snprintf(out, cap, "{\"type\":\"share\",\"i\":%d,\"ok\":0,\"code\":\"%s\"}", ev->i, code);
