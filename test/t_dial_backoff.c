@@ -180,6 +180,61 @@ int main(void) {
     if (!ntx_session_add_peer_dial(s, 0, &x, 6881)) return fail("redial_of_good_peer");
     printf("PASS dial_backoff_good_peer\n");
 
+    /* --- R37: the BEP55 holepunch dial against the redial back-off ------------
+     * A peer's connect message is fresh evidence that the endpoint is worth
+     * another try, so the attempt must go out now; the message is peer-
+     * controlled, so it must NOT erase the failure history either — the penalty
+     * keeps growing for every path that is not forced. */
+    {
+        ntx_addr z = v4(8, 8, 1, 1);
+        uint16_t zport = 6890;
+        uint32_t dok0 = s->hp_dial_ok, dfl0 = s->hp_dial_fail;
+        for (int i = 0; i < 3; i++) { /* three failed attempts at z:6890 */
+            if (!ntx_session_add_peer_dial_ex(s, 0, &z, zport, 1)) return fail("hp_poison_dial");
+            sp_drop(s, pi_of(s, &z, zport), "conn_timeout");
+        }
+        ntx_dial_bo_ent *e = ntx_dial_bo_find(&s->dial_bo, &z, zport);
+        if (!e || e->fails != 3) return fail("hp_poison_recorded");
+        uint64_t until0 = e->until;
+
+        /* the peer's connect message names z: the dial must not be held back */
+        ntx_session_holepunch_dial(s, 0, &z, zport);
+        int hpi = pi_of(s, &z, zport);
+        if (hpi < 0) return fail("hp_dial_suppressed_by_backoff");
+        if (s->hp_dial_ok != dok0 + 1 || s->hp_dial_fail != dfl0) return fail("hp_dial_counters");
+        if (s->peer_src[hpi] != NTX_PSRC_HOLEPUNCH) return fail("hp_dial_src_tag");
+
+        /* the message must leave the failure history of the endpoint alone */
+        e = ntx_dial_bo_find(&s->dial_bo, &z, zport);
+        if (!e || e->fails != 3) return fail("hp_dial_wipes_backoff_history");
+        if (e->until != until0) return fail("hp_dial_moves_backoff");
+
+        /* while the punch is in flight a repeat message adds no second connect */
+        ntx_session_holepunch_dial(s, 0, &z, zport);
+        if (s->hp_dial_fail != dfl0 + 1 || s->hp_dial_ok != dok0 + 1) return fail("hp_repeat_not_deduped");
+
+        /* ... and a normal dial of the same address stays held back */
+        if (ntx_session_add_peer_dial(s, 0, &z, zport)) return fail("normal_dial_ignores_backoff");
+
+        /* the forced attempt failed: the back-off applies again, with the penalty
+         * still growing 3 -> 4 (a wiped entry would restart at 1). */
+        sp_drop(s, hpi, "conn_timeout");
+        e = ntx_dial_bo_find(&s->dial_bo, &z, zport);
+        if (!e || e->fails != 4) return fail("hp_failure_rearms_from_history");
+        if (!ntx_dial_bo_blocked(&s->dial_bo, &z, zport, ntx_mono_ms())) return fail("hp_failure_not_blocked");
+        if (ntx_session_add_peer_dial(s, 0, &z, zport)) return fail("normal_dial_after_hp_failure");
+
+        /* only the success path forgets: a punch that reaches OK clears it */
+        if (!ntx_session_add_peer_dial_ex(s, 0, &z, zport, 1)) return fail("hp_recovery_dial");
+        hpi = pi_of(s, &z, zport);
+        s->peer_phase[hpi] = PH_OK;
+        sp_drop(s, hpi, "eof");
+        if (ntx_dial_bo_find(&s->dial_bo, &z, zport)) return fail("hp_ok_leaves_backoff");
+        if (!ntx_session_add_peer_dial(s, 0, &z, zport)) return fail("hp_ok_redial_allowed");
+        sp_drop(s, pi_of(s, &z, zport), "eof");
+        printf("PASS dial_backoff_holepunch\n");
+    }
+
     ntx_session_free(s);
     ntx_netx_free(n);
     close(lfd);

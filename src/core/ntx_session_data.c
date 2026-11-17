@@ -929,14 +929,18 @@ void ntx_session_holepunch_dial(struct ntx_session *s, int tts_idx, const ntx_ad
      * punched endpoint; punch_fail = dial refused before launch (dedup,
      * caps, alloc, dead route). This is the single
      * aggregation site for the counters. */
-    /* A punch is never held back by the redial back-off and is tagged by its
-     * real origin, so a private slot refuses it (BEP27 §4.4) instead of being
-     * dialled through the tracker tag.
-     * ponytail: clears the endpoint's back-off instead of a force+src dial
-     * variant, because ntx_session.c has none. Upgrade: add
-     * ntx_session_add_peer_dial_ex_src(s,…,force,src) there. */
-    ntx_dial_bo_ok(&s->dial_bo, addr, port);
-    if (ntx_session_add_peer_src(s, tts_idx, addr, port, NTX_PSRC_HOLEPUNCH))
+    /* R37: a punch is a force+src dial. force: the peer's connect message is
+     * fresh evidence that the endpoint is worth another try, so the attempt is
+     * never held back by the back-off left by our own earlier failures. src: the
+     * address is peer-supplied, so it is tagged by its real origin (a private
+     * slot refuses it — BEP27 §4.4 — instead of being dialled through the
+     * tracker tag) and the failure history is NOT erased here: only a
+     * connection that reaches OK forgets it (sp_drop), so a peer cannot use the
+     * message to launder the penalty away or to earn a connect per message.
+     * ponytail: src is recorded on the slot but the back-off policy is still
+     * uniform per (addr,port). Upgrade: weigh peer-sourced failures separately
+     * in ntx_dial_bo_fail. */
+    if (ntx_session_add_peer_dial_ex_src(s, tts_idx, addr, port, 1, NTX_PSRC_HOLEPUNCH))
         s->hp_dial_ok++;
     else
         s->hp_dial_fail++;

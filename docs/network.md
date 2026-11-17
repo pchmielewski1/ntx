@@ -625,7 +625,8 @@ tested without sockets. Test: `t_holepunch.c`.
 ### What the session does
 
 - It **receives `connect`** from a relay peer and dials the given endpoint over uTP
-  (`ntx_session_holepunch_on_rx` -> `ntx_session_add_peer_dial_ex` with back-off bypassed).
+  (`ntx_session_holepunch_on_rx` -> `ntx_session_add_peer_dial_ex_src`, a `force + src` dial:
+  the redial back-off is skipped but not cleared, and the slot keeps the `NTX_PSRC_HOLEPUNCH` tag).
 - It ignores a `connect` when uTP is off or when it already has a connection to that endpoint,
   and does not send an error to the relay in that case.
 - It counts `error` and `rendezvous` messages and otherwise ignores them.

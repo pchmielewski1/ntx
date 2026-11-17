@@ -208,7 +208,9 @@ most advertised addresses are dead.
   10 min (`NTX_DIAL_BO_MAX_MS`). The table holds 512 entries (`NTX_DIAL_BO_N`). A connection
   that reaches the established state clears the entry. Dials caused by a BEP 55 `connect`
   message bypass the back-off, because the remote side is dialling us at the same time
-  (`ntx_session_add_peer_dial_ex` with `force = 1`).
+  (`ntx_session_add_peer_dial_ex_src` with `force = 1` and `src = NTX_PSRC_HOLEPUNCH`). The
+  message is peer-supplied, so it is only allowed to skip the block, never to erase the
+  entry: a forced attempt that fails re-arms it and the penalty keeps growing.
 - **Pipelining.** See the request pipeline above: 32 requests in flight at first, growing
   with measured throughput.
 - **Endgame.** When at most `NTX_ENDGAME_MAX_PIECES` (32) pieces are missing and every missing

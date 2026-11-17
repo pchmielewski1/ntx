@@ -609,6 +609,15 @@ int ntx_session_add_peer_dial_ex(struct ntx_session *s, int tts_idx, const ntx_a
     return dial_impl(s, tts_idx, addr, port, force, 0, NTX_PSRC_TRACKER);
 }
 
+/* force+src dial variant (R37, the BEP55 holepunch dial): force skips the redial
+ * back-off left by our own earlier failures, src records the real origin so the
+ * BEP27 gate and the stats see a peer-supplied address. Nothing here clears the
+ * endpoint's back-off — only a connection that reaches OK forgets it. */
+int ntx_session_add_peer_dial_ex_src(struct ntx_session *s, int tts_idx, const ntx_addr *addr, uint16_t port,
+                                     int force, uint8_t src) {
+    return dial_impl(s, tts_idx, addr, port, force, 0, src);
+}
+
 /* TCP retry of an address whose uTP dial got no answer (never held back by the redial back-off).
  * The retry keeps the origin of the slot it replaces — an address only earns a
  * retry because it was allowed to be dialled in the first place. */

@@ -593,6 +593,66 @@ static void test_loopback(void) {
         check(sa.punch_fail == 1, "st_punch_fail_copy");
     }
 
+    /* ---- R37: a connect for an address we have backed off must still dial ----
+     * The redial back-off remembers endpoints whose last outbound attempt died.
+     * A peer's connect message is fresh, peer-supplied evidence that the
+     * endpoint is worth another try, so it is dialled now (force) and stays
+     * tagged as peer-sourced (src) — while the failure history itself survives,
+     * so the peer cannot use the message to launder the penalty away. */
+    {
+        ntx_addr off;
+        ntx_addr_set_v4(&off, htonl(0x7f000001u));
+        uint16_t offport = (uint16_t)(bport + 7);
+        for (int i = 0; i < 3; i++) ntx_dial_bo_fail(&a->dial_bo, &off, offport, ntx_mono_ms());
+        ntx_dial_bo_ent *e = ntx_dial_bo_find(&a->dial_bo, &off, offport);
+        check(e && e->fails == 3, "r37_backoff_poisoned");
+        check(ntx_dial_bo_blocked(&a->dial_bo, &off, offport, ntx_mono_ms()), "r37_blocked_now");
+
+        ntx_holepunch_msg to_off;
+        memset(&to_off, 0, sizeof to_off);
+        to_off.msg_type = NTX_HP_MSG_CONNECT;
+        to_off.addr_type = NTX_HP_AF_V4;
+        ntx_addr_set_v4(&to_off.addr, htonl(0x7f000001u));
+        to_off.port = offport;
+        uint8_t pay[NTX_HP_WIRE_MAX];
+        size_t pn = ntx_holepunch_build(pay, sizeof pay, &to_off);
+        check(pn == NTX_HP_WIRE_V4, "r37_payload_built");
+
+        uint32_t dok0 = a->hp_dial_ok, dfl0 = a->hp_dial_fail;
+        sess_g_s = a; sp_g_s = a;
+        ntx_session_data_on_ext(a, relay_a, NTX_EXT_LOCAL_HOLEPUNCH, pay, pn);
+        int dialed = 0, src_ok = 0;
+        for (int pi = 0; pi < NTX_SESSION_MAX_PEERS; pi++) {
+            if (a->peers[pi].fd == -1 || !a->peer_outbound[pi] || a->peers[pi].port != offport) continue;
+            dialed = 1;
+            src_ok = a->peer_src[pi] == NTX_PSRC_HOLEPUNCH;
+        }
+        check(dialed, "r37_backed_off_addr_still_dialled");
+        check(src_ok, "r37_dial_tagged_peer_sourced");
+        check(a->hp_dial_ok == dok0 + 1 && a->hp_dial_fail == dfl0, "r37_punch_ok_bumped");
+        e = ntx_dial_bo_find(&a->dial_bo, &off, offport);
+        check(e && e->fails == 3, "r37_history_not_wiped");
+        /* the in-flight punch stops any hammering: while a live connection to
+         * that endpoint exists the target policy IGNORES the connect, so a
+         * repeat message launches no second dial and does not even reach the
+         * dial path (the RX counter still counts the message itself). */
+        uint32_t rxc0 = a->hp_rx_connect;
+        sess_g_s = a; sp_g_s = a;
+        ntx_session_data_on_ext(a, relay_a, NTX_EXT_LOCAL_HOLEPUNCH, pay, pn);
+        check(a->hp_rx_connect == rxc0 + 1, "r37_repeat_message_counted");
+        check(a->hp_dial_fail == dfl0 && a->hp_dial_ok == dok0 + 1, "r37_repeat_message_no_second_connect");
+        /* the forced attempt died: the back-off arms again and the penalty kept
+         * growing from the history (3 -> 4); a wiped entry would restart at 1. */
+        for (int round = 0; round < 4; round++) {
+            int any = 0;
+            for (int pi = 0; pi < NTX_SESSION_MAX_PEERS; pi++)
+                if (a->peers[pi].fd != -1 && a->peers[pi].port == offport) { sp_drop(a, pi, "conn_timeout"); any = 1; }
+            if (!any) break;
+        }
+        e = ntx_dial_bo_find(&a->dial_bo, &off, offport);
+        check(e && e->fails == 4, "r37_penalty_still_grows");
+    }
+
     close(fdsA[1]);
     close(fdsB[1]);
     ntx_session_free(a);

@@ -195,10 +195,10 @@ All files are in `test/`.
 | `t_session_trk_stop.c` | `event=stopped` announces: one torrent, all torrents, paused torrents skipped |
 | `t_session_trk_udp.c` | UDP tracker replies: random transaction IDs, replies from the wrong address ignored, UDP trackers disabled behind a proxy or tunnel |
 | `t_session_utp_fallback.c` | `--utp` dials that do not connect within `NTX_UTP_DIAL_MS` are redone over TCP; uTP is abandoned after repeated misses without success |
-| `t_dial_backoff.c` | Redial back-off (`ntx_dial_bo`): table behaviour (30 s base, doubling, 10 min cap, replacement when full), blocked redial, expiry, a peer that reached OK is not penalised |
+| `t_dial_backoff.c` | Redial back-off (`ntx_dial_bo`): table behaviour (30 s base, doubling, 10 min cap, replacement when full), blocked redial, expiry, a peer that reached OK is not penalised, BEP55 punch dials force (not clear) the back-off and keep growing the penalty [R37] |
 | `t_pex_flood.c` | PEX flood resistance: per-list caps, string size bound, truncation, session import limits, dropped entries not imported |
 | `t_pex_outbound.c` | Outbound PEX through the session: added/dropped lists, elision, rate limit, drop cap |
-| `t_holepunch.c` | BEP55 `ut_holepunch`: codec, relay and target policy, race handling, two-sided loopback punch |
+| `t_holepunch.c` | BEP55 `ut_holepunch`: codec, relay and target policy, race handling, two-sided loopback punch, connect for a backed-off address still dials (force+src) [R37] |
 | `t_ipc_ctrl.c` | JSON control channel: command parsing and dispatch, input framing, JSON string escaping, vectors in `test/vectors/ipc/` |
 | `t_cli.c` | Status line and JSON output: line length budget, valid JSON structure, header fields, truncation flag, BEP52 and uTP tags |
 | `t_cli_https.c` | Command-line parsing of `--no-https-tofu`, `--https-pin-file`, `--utp`, `--port-lo` (compiles `ntx_main.c` with `main` renamed) |
