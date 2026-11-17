@@ -17,6 +17,9 @@
 #include "../src/ui/ntx_diag.c"
 #include "../src/core/ntx_config.h"
 #include "../src/core/ntx_share_meta.c"
+/* S26/R36: ntx_share_build_info now calls the one name gate, which lives in
+ * ntx_share_out.c — the same TU the other share suites link. */
+#include "../src/core/ntx_share_out.c"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -402,6 +405,29 @@ static void test_fixture(const char *fx) {
         check(ntx_share_build_info(h, m.name, badsalt, &bad, &badn) == -1 && bad == NULL, nm);
         snprintf(nm, sizeof nm, "%s: build-info-empty-name", fx);
         check(ntx_share_build_info(h, "", m.salt, &bad, &badn) == -1, nm);
+        /* R36: the builder's name check is the ONE gate every other share path
+         * uses (ntx_share_name_ok), so it rejects what that gate rejects. Pre-fix
+         * smeta_name_ok knew the control characters but nothing about UTF-8, so a
+         * name like "\xc3\x28.bin" built a metainfo here that the slot gate had
+         * already refused to accept — two definitions of "valid name". */
+        static const char *badnames[] = { "\x01" "x", "\x7f", "a\tb", "a\nb", "\xc3\x28.bin",
+                                          "\x80", "\xed\xa0\x80", "a/b" };
+        for (size_t bi = 0; bi < sizeof badnames / sizeof badnames[0]; bi++) {
+            snprintf(nm, sizeof nm, "%s: build-info-name-rejected-%zu", fx, bi);
+            check(ntx_share_build_info(h, badnames[bi], m.salt, &bad, &badn) == -1 && bad == NULL &&
+                      badn == 0,
+                  nm);
+        }
+        /* and what the gate accepts must build: a multi-byte UTF-8 name is a
+         * legal name, not a rejection (S15 keeps the CUT for byte limits, never
+         * a rejection, and the name inside the torrent is never cut at all) */
+        snprintf(nm, sizeof nm, "%s: build-info-name-utf8-ok", fx);
+        check(ntx_share_build_info(h, "\xc5\xbc\xE2\x82\xAC.bin", m.salt, &bad, &badn) == 0 && bad != NULL &&
+                  badn > 0,
+              nm);
+        free(bad);
+        bad = 0;
+        badn = 0;
         snprintf(nm, sizeof nm, "%s: build-torrent-no-trackers", fx);
         check(ntx_share_build_torrent(info, info_cn, h, trkptr, 0, m.creation_date, &bad, &badn) == -1, nm);
         snprintf(nm, sizeof nm, "%s: hasher-new-bad-ps", fx);

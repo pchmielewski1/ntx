@@ -676,7 +676,26 @@ static ntx_share_err share_from_read(const char *path, uint64_t fsize, ntx_torre
 
     ntx_be top;
     size_t consumed = 0;
-    if (ntx_be_parse(buf, rd, &top, &consumed, 32, (size_t)1 << 20) != 0) { free(buf); return e; }
+    /* S26/R35: the file must be ONE exact bencode document, with nothing after
+     * it. ntx_be_parse is already exact — it fails when it stops short of the
+     * end (p.pos != n) — so the comparison below is normally redundant. It is
+     * written out anyway because this is the one place where a prefix parse
+     * would be silent and costly: the share would be published under the link of
+     * the prefix while the operator believes the file is that .torrent. The
+     * parser's strict end-of-input is also what makes the raw info subtree that
+     * gets hashed unambiguous, so the requirement belongs here and not only
+     * inside the parser. Trailing garbage is every byte that is not part of the
+     * document — bencode has no insignificant whitespace, so a closing brace, a
+     * second document, a NUL, a space, a tab and a CRLF all are garbage. (The
+     * announce-response parser is the opposite on purpose: S31/R41 taught it to
+     * skip a trailing CRLF. A .torrent is the access key, an HTTP response is
+     * not.) Verdict: the established NTX_SHARE_E_BAD_ARG of every other
+     * rejected --share-from, spelled `bad_arg` on the wire and
+     * "invalid share argument" on stderr. */
+    if (ntx_be_parse(buf, rd, &top, &consumed, 32, (size_t)1 << 20) != 0 || consumed != rd) {
+        free(buf);
+        return e;
+    }
     const ntx_be *info = ntx_be_dict_get(&top, "info");
     const ntx_be *layers = ntx_be_dict_get(&top, "piece layers");
     if (!info || info->t != NTX_BE_DICT || info->end <= info->start) {

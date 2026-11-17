@@ -30,7 +30,16 @@ int ntx_share_torrent_path(char *out, size_t cap, const char *dir, const char *n
  * leaves the file untouched. */
 ntx_share_err ntx_share_write_torrent(const char *path, const uint8_t *buf, size_t n, const uint8_t ih[20]);
 
-/* valid UTF-8, no byte < 0x20, no 0x7f, no '/', non-empty. */
+/* THE one share-name gate (S26/R36): non-empty, valid UTF-8 (ntx_utf8_valid),
+ * no byte 0x01-0x1f, no 0x7f, no '/'. A name is one field of the status line,
+ * one magnet dn= and one basename, so every ASCII control character is refused
+ * — tab and newline included — even though the JSON emitter could escape them.
+ * A byte 0x00 cannot appear at all: the API is NUL-terminated. Used by every
+ * path that accepts a share name — the basename in ntx_session_share_add, the
+ * name inside a --share-from .torrent, ntx_share_build_info and
+ * ntx_share_torrent_path — so there is exactly one definition of "usable name".
+ * An over-long name is NOT rejected here: the byte limits cut it on a character
+ * boundary (ntx_utf8_cut / ntx_utf8_copy), which is the S15 rule. */
 int ntx_share_name_ok(const char *name);
 
 #endif

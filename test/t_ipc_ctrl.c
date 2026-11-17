@@ -1563,5 +1563,90 @@ int main(void) {
         }
     }
 
+    { /* ── S26 · R36: every accept path shares ONE name gate ──────────────────
+         The JSON `share` command takes the basename of `path` as the torrent
+         name, so it is gated by ntx_share_name_ok — the same function the CLI
+         and the --share-from metainfo name go through. Pre-fix the JSON path was
+         already gated, but ntx_share_build_info carried a SECOND rule that knew
+         the control characters and nothing about UTF-8, so the two could disagree
+         (pinned for the builder in t_share_meta.c). What the §11.1 escaping could
+         smuggle in is exactly what the gate must refuse: an escaped control byte
+         decodes into the name, and a name is one field of the status line and one
+         magnet dn=. The verdict is the pinned "bad_arg" of a rejected name. ── */
+        ntx_config cfg;
+        ntx_netx *nx;
+        char dir[96], line[512], out[2048];
+
+        memset(&cfg, 0, sizeof cfg);
+        snprintf(dir, sizeof dir, "test/.scratch/ntx-ipc-r36");
+        cfg.store_dir = dir;
+        if (mkdir("test/.scratch", 0755) != 0 && errno != EEXIST) return fail("r36_scratch");
+        if (mkdir(dir, 0755) != 0 && errno != EEXIST) return fail("r36_dir");
+        {
+            char real[192];
+            snprintf(real, sizeof real, "%s/good.bin", dir);
+            FILE *wf = fopen(real, "wb");
+            if (!wf) return fail("r36_file");
+            fputs("0123456789", wf);
+            fclose(wf);
+        }
+        ntx_session *s = mk(&nx, &cfg);
+
+        /* The name gate runs AFTER the open (docs/json-api.md: open, S_ISREG,
+           size, name), so every hostile name must really exist on disk —
+           otherwise the verdict would be "io" from ENOENT and the case would
+           prove nothing about the name. */
+        static const struct { const char *tag, *name, *disk; } bad[] = {
+            { "ctl", "\\u0001bad", "\x01" "bad" },     { "tab", "a\\tb", "a\tb" },
+            { "del", "a\\u007fb", "a\x7f" "b" },       { "newline", "a\\nb", "a\nb" },
+            { "cr", "a\\rb", "a\rb" },                 { "bad_utf8", "\xc3\x28", "\xc3\x28" },
+            { "lone_cont", "\x80", "\x80" },
+        };
+        for (size_t k = 0; k < sizeof bad / sizeof bad[0]; k++) {
+            char real[192];
+            snprintf(real, sizeof real, "%s/%s", dir, bad[k].disk);
+            FILE *wf = fopen(real, "wb");
+            if (!wf) {
+                printf("R36 %s: cannot create the fixture\n", bad[k].tag);
+                drop(s, nx);
+                return fail("r36_fixture");
+            }
+            fputs("0123456789", wf);
+            fclose(wf);
+            snprintf(line, sizeof line, "{\"cmd\":\"share\",\"seq\":6%zu,\"path\":\"%s/%s\"}", k, dir,
+                     bad[k].name);
+            ntx_ipc_dispatch(s, line, out, sizeof out);
+            if (!strstr(out, "\"code\":\"bad_arg\"") || !strstr(out, "\"cmd\":\"share\"")) {
+                printf("R36 %s reply: %s\n", bad[k].tag, out);
+                drop(s, nx);
+                return fail("r36_name_rejected");
+            }
+        }
+        /* a legal multi-byte name is accepted, not refused (S15: an over-long name
+           is CUT on a character boundary, never rejected) */
+        snprintf(line, sizeof line, "{\"cmd\":\"share\",\"seq\":70,\"path\":\"%s/\xc5\xbc\xc3\xb3.bin\"}", dir);
+        {
+            char real[192];
+            snprintf(real, sizeof real, "%s/\xc5\xbc\xc3\xb3.bin", dir);
+            FILE *wf = fopen(real, "wb");
+            if (!wf) { drop(s, nx); return fail("r36_u8_file"); }
+            fputs("0123456789", wf);
+            fclose(wf);
+        }
+        ntx_ipc_dispatch(s, line, out, sizeof out);
+        if (!strstr(out, "\"ok\":1")) {
+            printf("R36 utf8 name reply: %s\n", out);
+            drop(s, nx);
+            return fail("r36_utf8_accepted");
+        }
+        for (int ti = 0; ti < NTX_SESSION_MAX_TTS; ti++)
+            if (ti != 0 && ntx_session_share_state(s, ti) != NTX_SHARE_NONE) {
+                drop(s, nx);
+                return fail("r36_only_good_slot");
+            }
+        drop(s, nx);
+        if (ok("r36_ipc_one_name_gate")) return 1;
+    }
+
     return 0; /* tasks append here; keep the final line intact */
 }

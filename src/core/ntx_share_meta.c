@@ -1,6 +1,7 @@
 #include "ntx_share_meta.h"
 #include "ntx_config.h"
 #include "ntx_merkle.h"
+#include "ntx_share_out.h"
 #include "../crypto/ntx_sha1.h"
 #include "../crypto/ntx_sha256.h"
 #include "../proto/ntx_bencode.h"
@@ -192,14 +193,11 @@ const uint8_t *ntx_share_hasher_layer(const ntx_share_hasher *h, size_t *n) {
 
 /* --- metainfo (§5.2) --- */
 
-static int smeta_name_ok(const char *name) {
-    if (!name || !name[0]) return 0;
-    for (size_t i = 0; name[i]; i++) {
-        unsigned char c = (unsigned char)name[i];
-        if (c < 0x20 || c == 0x7f || c == '/') return 0;
-    }
-    return 1;
-}
+/* S26/R36: there is ONE name rule in ntx and it is ntx_share_name_ok
+ * (ntx_share_out.c): non-empty, no byte 0x01-0x1f, no 0x7f, no '/', and valid
+ * UTF-8 (ntx_utf8_valid). This file used to carry its own copy, which knew the
+ * control characters but nothing about UTF-8, so a name the slot gate had
+ * already refused could still be baked into a metainfo from here. */
 
 static int smeta_salt_ok(const char *salt_hex) {
     if (!salt_hex) return 0;
@@ -237,7 +235,7 @@ int ntx_share_build_info(const ntx_share_hasher *h, const char *name, const char
     if (info) *info = NULL;
     if (info_n) *info_n = 0;
     if (!h || !info || !info_n || !ntx_share_hasher_done(h)) return -1;
-    if (!smeta_name_ok(name) || !smeta_salt_ok(salt_hex)) return -1;
+    if (!ntx_share_name_ok(name) || !smeta_salt_ok(salt_hex)) return -1;
 
     size_t name_n = strlen(name);
     uint8_t empty_key = 0; /* the "" key of the file's property dict */

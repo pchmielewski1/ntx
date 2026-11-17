@@ -111,6 +111,44 @@ expect share-dir        1 'cannot share'  -- --share="$TMP"
 expect share-empty      1 'cannot share'  -- --share="$TMP/empty.torrent"
 expect share-missing    1 'cannot share'  -- --share="$TMP/nonexistent"
 expect share-ctrl-name  1 'cannot share'  -- --share="$TMP/$(printf 'a\001b')"
+# S26/R36: the basename is a share name, so the ONE gate (ntx_share_name_ok)
+# refuses every ASCII control character — tab and DEL included, not just \x01 —
+# and a name that is not valid UTF-8. The files really exist: an ENOENT would
+# also say "cannot share" (with "cannot read the file"), so creating them is
+# what makes these cases test the NAME and not the open.
+printf 'x' > "$TMP/$(printf 'a\tb')"
+printf 'x' > "$TMP/$(printf 'a\177b')"
+printf 'x' > "$TMP/$(printf 'a\nb')"
+printf 'x' > "$TMP/$(printf 'a\303\050b')"
+expect share-tab-name    1 'cannot share' -- --share="$TMP/$(printf 'a\tb')"
+expect share-del-name    1 'cannot share' -- --share="$TMP/$(printf 'a\177b')"
+expect share-nl-name     1 'cannot share' -- --share="$TMP/$(printf 'a\nb')"
+expect share-badutf8-name 1 'cannot share' -- --share="$TMP/$(printf 'a\303\050b')"
+# and the reason on stderr is the name module's text, not a read error
+if timeout -k 1 3 ./ntx --store-dir="$TMP/store" --share="$TMP/$(printf 'a\tb')" \
+     >"$TMP/out" 2>"$TMP/err" </dev/null; then :; fi
+if ! grep -Fq 'invalid file name' "$TMP/err"; then
+  echo "FAIL share-tab-name-reason: stderr lacks 'invalid file name'" >&2
+  sed 's/^/    | /' "$TMP/err" | head -3 >&2
+  fails=$((fails + 1))
+else
+  echo "PASS share-tab-name-reason"
+fi
+# Positive control: the same gate must NOT refuse a legal multi-byte name — an
+# over-long name is cut on a character boundary, never rejected (the S15 rule).
+# A share that passes the name gate goes on to hash, so the verdict here is only
+# that the run never said "invalid file name".
+printf 'x' > "$TMP/$(printf 'za\305\274\303\263\305\202.txt')"
+timeout -k 1 3 ./ntx --store-dir="$TMP/store" --no-port-map --port-lo=0 --port-hi=0 \
+  --proxy=socks5:127.0.0.1:9 --share="$TMP/$(printf 'za\305\274\303\263\305\202.txt')" \
+  >"$TMP/out" 2>"$TMP/err" </dev/null
+if grep -Fq 'invalid file name' "$TMP/err"; then
+  echo "FAIL share-utf8-name: a legal multi-byte name was refused" >&2
+  sed 's/^/    | /' "$TMP/err" | head -3 >&2
+  fails=$((fails + 1))
+else
+  echo "PASS share-utf8-name"
+fi
 expect share-from-junk  1 'cannot share'  -- --share="$TMP/plain.bin" --share-from="$TMP/junk.torrent"
 
 # ── the store directory of a share (design §5.4, docs/cli.md "Created on demand") ──

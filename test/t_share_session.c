@@ -165,7 +165,7 @@ static void scratch(void) {
     if (mkdir(scratch_root, 0755) != 0 && errno != EEXIST) fail("scratch");
     static const char *const tags[] = {"gates","hash","started","rmhash","pin","revive","ratio","a4","ceil","fdheld",
                                        "from","fromchg","fromerr","fromdup","fromio","fromserve",
-                                       "frompread","store","during","durtrunc",
+                                       "frompread","fromexact","fromname","store","during","durtrunc",
                                        "r7dead","r7hash","r7pend",
                                        "r5chg","r5io","r4evt","r4qa","r11","r11b","r12"};
     for (size_t k = 0; k < sizeof tags / sizeof tags[0]; k++) {
@@ -318,7 +318,13 @@ static void bint(bstr *w, long long v) {
  * "private" key. `size` is what the metainfo DECLARES and what `data` holds, so
  * a length mismatch is produced by handing in a buffer one byte longer than the
  * file on disk (the metainfo stays internally valid: only §5.6.1 can reject it). */
-static uint8_t *mk_torrent(const uint8_t *data, size_t size, uint32_t ps, int pub, size_t *out_n) {
+/* `name` is BOTH the v1 "name" and the single BEP 52 file-tree key, exactly as
+ * ntx_share_build_info writes them (one string, two places), so a forged
+ * metainfo with a hostile name is the same shape a real share would produce. */
+static uint8_t *mk_torrent_named(const uint8_t *data, size_t size, uint32_t ps, int pub, const char *name,
+                                 size_t *out_n) {
+    size_t name_n = strlen(name);
+    if (name_n == 0 || name_n > 200) return NULL;
     uint32_t np = (uint32_t)((size + ps - 1) / ps);
     uint8_t *pieces = malloc((size_t)np * 20);
     uint8_t *layer = np > 1 ? malloc((size_t)np * 32) : NULL;
@@ -385,7 +391,7 @@ static uint8_t *mk_torrent(const uint8_t *data, size_t size, uint32_t ps, int pu
     bputs(&info, "d");
     bkey(&info, "file tree");
     bputs(&info, "d"); /* name key ("" = single file) -> {"" : props} */
-    bstrn(&info, "f.bin", 5);
+    bstrn(&info, name, name_n);
     bputs(&info, "d");
     bstrn(&info, "", 0);
     bputs(&info, "d");
@@ -400,7 +406,7 @@ static uint8_t *mk_torrent(const uint8_t *data, size_t size, uint32_t ps, int pu
     bkey(&info, "meta version");
     bint(&info, 2);
     bkey(&info, "name");
-    bstrn(&info, "f.bin", 5);
+    bstrn(&info, name, name_n);
     bkey(&info, "ntx salt");
     bstrn(&info, "000102030405060708090a0b0c0d0e0f", 32);
     bkey(&info, "piece length");
@@ -440,6 +446,12 @@ static uint8_t *mk_torrent(const uint8_t *data, size_t size, uint32_t ps, int pu
     if (!top.b) return NULL;
     *out_n = top.n;
     return top.b;
+}
+
+/* The fixed name is the CLI/JSON basename in every other case, so the plain
+ * builder is the named builder with its own default. */
+static uint8_t *mk_torrent(const uint8_t *data, size_t size, uint32_t ps, int pub, size_t *out_n) {
+    return mk_torrent_named(data, size, ps, pub, "f.bin", out_n);
 }
 
 /* --- forked local HTTP tracker: answers every announce with a valid empty
@@ -1296,6 +1308,43 @@ static void test_add_gates(void) {
         close(fd);
     }
     if (ntx_session_share_add(x.s, p, NULL, &e) != -1 || e != NTX_SHARE_E_BAD_NAME) fail("add_ctl_bad_name");
+    /* R36: the basename is the name of a share, so the ONE gate
+     * (ntx_share_name_ok: no byte 0x01-0x1f, no 0x7f, no '/', valid UTF-8) is
+     * what decides it here — a tab and a DEL are as unusable as a \x01, and a
+     * name that is not UTF-8 is unusable even though every byte of it is
+     * printable. A multi-byte name is a legal name, not a rejection. */
+    snprintf(p, sizeof p, "%s/gates/tab\there", scratch_root);
+    {
+        int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) fail("tab_open");
+        if (write(fd, "x", 1) != 1) fail("tab_write");
+        close(fd);
+    }
+    if (ntx_session_share_add(x.s, p, NULL, &e) != -1 || e != NTX_SHARE_E_BAD_NAME) fail("add_tab_bad_name");
+    snprintf(p, sizeof p, "%s/gates/del\177file", scratch_root);
+    {
+        int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) fail("del_open");
+        if (write(fd, "x", 1) != 1) fail("del_write");
+        close(fd);
+    }
+    if (ntx_session_share_add(x.s, p, NULL, &e) != -1 || e != NTX_SHARE_E_BAD_NAME) fail("add_del_bad_name");
+    snprintf(p, sizeof p, "%s/gates/bad%scoding", scratch_root, "\xc3\x28");
+    {
+        int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) fail("butf8_open");
+        if (write(fd, "x", 1) != 1) fail("butf8_write");
+        close(fd);
+    }
+    if (ntx_session_share_add(x.s, p, NULL, &e) != -1 || e != NTX_SHARE_E_BAD_NAME) fail("add_badutf8_bad_name");
+    snprintf(p, sizeof p, "%s/gates/\xc5\xbc\xc3\xb3\xc5\x82\xe2\x82\xac.txt", scratch_root);
+    {
+        int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) fail("u8_open");
+        if (write(fd, "x", 1) != 1) fail("u8_write");
+        close(fd);
+    }
+    if (ntx_session_share_add(x.s, p, NULL, &e) < 0 || e != NTX_SHARE_OK) fail("add_utf8_name_ok");
     snprintf(p, sizeof p, "%s/gates/small.bin", scratch_root);
     mk_file(p, 200000, 1);
     if (ntx_session_share_add(x.s, p, NULL, &e) < 0 || e != NTX_SHARE_OK) fail("add_two_trackers");
@@ -2201,6 +2250,164 @@ static void test_from_bad_arg(void) {
     ok("from_bad_arg");
 }
 
+/* ---- S26/R35: the .torrent must be ONE exact document, no bytes after it ---
+ * share_from_read hands the whole file to ntx_be_parse. A prefix parser would
+ * accept `<valid document><anything>` and the share would then be published
+ * under the link of the prefix while the operator believes the file is that
+ * .torrent — so the reader requires that the parser consumed EVERY byte it
+ * read.
+ *
+ * What counts as trailing garbage here is every byte ntx_be_parse does not take
+ * as part of the document: bencode has no insignificant whitespace, so a
+ * closing brace, a second document, a NUL, a newline, a space and a CRLF are all
+ * garbage. That is stricter than the announce-response parser (which S31/R41
+ * taught to skip a trailing CRLF) and the difference is deliberate: the strict
+ * end-of-input of ntx_be_parse is what makes the raw info subtree that gets
+ * hashed unambiguous, so a .torrent file — the thing whose hash IS the link —
+ * must be byte-exact. */
+static void test_from_exact_document(void) {
+    scratch();
+    tracker tr;
+    memset(&tr, 0, sizeof tr);
+    tracker_start(&tr);
+    set_test_trackers(&tr, 2);
+    sess x;
+    sess_open(&x, "fromexact");
+    char p[256];
+    snprintf(p, sizeof p, "%s/fromexact/s.bin", scratch_root);
+    mk_file(p, 300000, 61);
+    size_t dn = 0;
+    uint8_t *data = slurp(p, &dn);
+    if (!data) fail("fromexact_slurp");
+    size_t tn = 0;
+    uint8_t *tb = mk_torrent(data, dn, 16384, 0, &tn);
+    free(data);
+    if (!tb) fail("fromexact_mktorrent");
+    ntx_share_err e = NTX_SHARE_OK;
+    pm_park(&x, NTX_PM_OFF);
+
+    static const struct { const char *tag; const char *tail; size_t n; } tails[] = {
+        { "brace", "}", 1 },            { "second", "e", 1 },
+        { "nul", "\x00", 1 },           { "ctrl", "\x00\x01junk", 6 },
+        { "space", " ", 1 },            { "newline", "\n", 1 },
+        { "crlf", "\r\n", 2 },          { "tab", "\t", 1 },
+    };
+    for (size_t k = 0; k < sizeof tails / sizeof tails[0]; k++) {
+        size_t tln = tn + tails[k].n;
+        uint8_t *garbage = malloc(tln);
+        if (!garbage) fail("fromexact_alloc");
+        memcpy(garbage, tb, tn);
+        memcpy(garbage + tn, tails[k].tail, tails[k].n);
+        char tp[NTX_SHARE_PATH_MAX];
+        snprintf(tp, sizeof tp, "%s/fromexact/%s.torrent", scratch_root, tails[k].tag);
+        if (write_all(tp, garbage, tln) != 0) fail("fromexact_write");
+        free(garbage);
+        int ti = ntx_session_share_add(x.s, p, tp, &e);
+        if (ti != -1 || e != NTX_SHARE_E_BAD_ARG) {
+            printf("TAIL %s -> rc=%d err=%d\n", tails[k].tag, ti, (int)e);
+            fail("fromexact_trailing_garbage");
+        }
+        if (ntx_session_share_state(x.s, 0) != NTX_SHARE_NONE) fail("fromexact_slot_used");
+    }
+
+    /* The same bytes without a tail are accepted — the gate above must not turn
+     * a good document into a rejection. */
+    char tp[NTX_SHARE_PATH_MAX];
+    snprintf(tp, sizeof tp, "%s/fromexact/exact.torrent", scratch_root);
+    if (write_all(tp, tb, tn) != 0) fail("fromexact_write_good");
+    int ti = share_add_parked(&x, p, tp, &e);
+    if (ti < 0 || e != NTX_SHARE_OK) fail("fromexact_good_rejected");
+    ntx_session_remove(x.s, ti);
+    free(tb);
+    ntx_session_share_free(x.s);
+    sess_close(&x);
+    tracker_stop(&tr);
+    ok("from_exact_document");
+}
+
+/* ---- S26/R36: the name INSIDE a --share-from .torrent uses the same gate ---
+ * The name of a from-share is the metainfo's name, and it is the string that
+ * goes into the magnet's dn=, the store file's stem and the status line, so it
+ * must pass the one gate the basename passes: no control character (0x01-0x1f,
+ * 0x7f), no '/', valid UTF-8. A multi-byte name is legal.
+ *
+ * The code is the one docs/json-api.md pins for a `torrent` that does not pass
+ * the re-share gate — `bad_arg` (the basename gate's NTX_SHARE_E_BAD_NAME is the
+ * `path` path, and both spell "bad_arg" on the wire). */
+static void test_from_name_gate(void) {
+    scratch();
+    tracker tr;
+    memset(&tr, 0, sizeof tr);
+    tracker_start(&tr);
+    set_test_trackers(&tr, 2);
+    sess x;
+    sess_open(&x, "fromname");
+    char p[256];
+    snprintf(p, sizeof p, "%s/fromname/s.bin", scratch_root);
+    mk_file(p, 100000, 63);
+    size_t dn = 0;
+    uint8_t *data = slurp(p, &dn);
+    if (!data) fail("fromname_slurp");
+    ntx_share_err e = NTX_SHARE_OK;
+    pm_park(&x, NTX_PM_OFF);
+
+    static const struct { const char *tag; const char *name; } bad[] = {
+        { "tab", "a\tb.bin" },        { "del", "a\x7f" "b.bin" },     { "nul_lead", "\x01" "b.bin" },
+        { "bad_utf8", "\xc3\x28.bin" }, { "overlong", "\xc0\x80.bin" }, { "slash", "a/b.bin" },
+        { "lone_cont", "\x80.bin" },
+    };
+    for (size_t k = 0; k < sizeof bad / sizeof bad[0]; k++) {
+        size_t tn = 0;
+        uint8_t *tb = mk_torrent_named(data, dn, 16384, 0, bad[k].name, &tn);
+        if (!tb) fail("fromname_mktorrent");
+        char tp[NTX_SHARE_PATH_MAX];
+        snprintf(tp, sizeof tp, "%s/fromname/%s.torrent", scratch_root, bad[k].tag);
+        if (write_all(tp, tb, tn) != 0) fail("fromname_write");
+        free(tb);
+        int ti = ntx_session_share_add(x.s, p, tp, &e);
+        if (ti != -1 || e != NTX_SHARE_E_BAD_ARG) {
+            printf("NAME %s -> rc=%d err=%d\n", bad[k].tag, ti, (int)e);
+            fail("fromname_rejected");
+        }
+        if (ntx_session_share_state(x.s, 0) != NTX_SHARE_NONE) fail("fromname_slot_used");
+    }
+    /* the legal multi-byte name still gets through (S15: over-long is CUT, never
+     * rejected, so a long-but-valid UTF-8 name must be accepted too) */
+    {
+        char longname[201];
+        for (int i = 0; i < 200; i++) longname[i] = (i % 3 == 2) ? 'k' : 'a';
+        longname[200] = 0;
+        size_t tn = 0;
+        uint8_t *tb = mk_torrent_named(data, dn, 16384, 0, longname, &tn);
+        if (!tb) fail("fromname_mktorrent_long");
+        char tp[NTX_SHARE_PATH_MAX];
+        snprintf(tp, sizeof tp, "%s/fromname/long.bin", scratch_root);
+        if (write_all(tp, tb, tn) != 0) fail("fromname_write_long");
+        free(tb);
+        int ti = share_add_parked(&x, p, tp, &e);
+        if (ti < 0 || e != NTX_SHARE_OK) fail("fromname_long_rejected");
+        ntx_session_remove(x.s, ti);
+    }
+    {
+        const char *u8 = "\xc5\xbc\xc3\xb3\xc5\x82\xe2\x82\xac.bin";
+        size_t tn = 0;
+        uint8_t *tb = mk_torrent_named(data, dn, 16384, 0, u8, &tn);
+        if (!tb) fail("fromname_mktorrent_u8");
+        char tp[NTX_SHARE_PATH_MAX];
+        snprintf(tp, sizeof tp, "%s/fromname/u8.bin", scratch_root);
+        if (write_all(tp, tb, tn) != 0) fail("fromname_write_u8");
+        free(tb);
+        int ti = share_add_parked(&x, p, tp, &e);
+        if (ti < 0 || e != NTX_SHARE_OK) fail("fromname_utf8_rejected");
+        ntx_session_remove(x.s, ti);
+    }
+    free(data);
+    ntx_session_share_free(x.s);
+    sess_close(&x);
+    tracker_stop(&tr);
+    ok("from_name_gate");
+}
+
 /* ---- A6 case d (review focus 5): same .torrent twice → EXISTS, first ok --- */
 static void test_from_duplicate(void) {
     scratch();
@@ -3079,6 +3286,8 @@ int main(void) {
     test_from_same_link();
     test_from_changed();
     test_from_bad_arg();
+    test_from_exact_document();
+    test_from_name_gate();
     test_from_duplicate();
     test_from_truncated();
     test_from_serve_io();
