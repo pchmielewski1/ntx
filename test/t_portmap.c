@@ -1673,8 +1673,9 @@ int main(void) {
             if (r != 12 || rd32(req + 8) != 0) continue;
             dels++;
             ck_eq(req_int_port(req), lp, "F4_delete_names_the_internal_port");
-            if (req[1] == 1) tcp_dels++;
-            if (req[1] == 2) udp_dels++;
+            /* RFC 6886 §3.3: opcode 1 is UDP, 2 is TCP — same as pm_op_of. */
+            if (req[1] == 2) tcp_dels++;
+            if (req[1] == 1) udp_dels++;
         }
         ck_eq(dels, 2, "F4_two_deletes_for_two_held_mappings");
         ck_eq(tcp_dels, 1, "F4_tcp_delete_sent");
