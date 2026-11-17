@@ -261,8 +261,10 @@ static void test_parse_natpmp(const gm *cases) {
         if (strcmp(kind, "parse_natpmp_addr") == 0) {
             uint8_t ip[4], want[4];
             const char *ext_ip_s = NULL;
+            int64_t wepoch = -1;
+            uint32_t sssoe = 0xCCCCCCCCu;
             memset(ip, 0xCC, sizeof ip);
-            int rc = natpmp_parse_addr(msg, len, ip);
+            int rc = natpmp_parse_addr(msg, len, ip, &sssoe);
             tname(tn, sizeof tn, "natpmp-addr", name);
             check(rc == (int)expect, tn);
             if (expect == 0) {
@@ -270,11 +272,16 @@ static void test_parse_natpmp(const gm *cases) {
                 check(str_field(c, "ext_ip", &ext_ip_s) == 0 &&
                       hexbytes(ext_ip_s, want, 4) == 4 &&
                       memcmp(ip, want, 4) == 0, tn);
+                /* R21: octets 4..7 are the gateway's Seconds Since Start of Epoch
+                 * (RFC 6886 §3.6) and the driver can only run §3.7's comparison
+                 * because the codec hands them back. */
+                tname(tn, sizeof tn, "natpmp-addr-epoch", name);
+                check(num_field(c, "epoch", &wepoch) == 0 && sssoe == (uint32_t)wepoch, tn);
             }
         } else if (strcmp(kind, "parse_natpmp_map") == 0) {
-            int64_t op, int_port, ext_port, lifetime;
+            int64_t op, int_port, ext_port, lifetime, wepoch = -1;
             uint16_t ep = 0xCC;
-            uint32_t lt = 0xCCCCCCCCu;
+            uint32_t lt = 0xCCCCCCCCu, sssoe = 0xCCCCCCCCu;
             if (num_field(c, "op", &op) != 0 ||
                 num_field(c, "int_port", &int_port) != 0 ||
                 num_field(c, "ext_port", &ext_port) != 0 ||
@@ -283,12 +290,14 @@ static void test_parse_natpmp(const gm *cases) {
                 continue;
             }
             int rc = natpmp_parse_map(msg, len, (uint8_t)op, (uint16_t)int_port,
-                                     &ep, &lt);
+                                     &ep, &lt, &sssoe);
             tname(tn, sizeof tn, "natpmp-map", name);
             check(rc == (int)expect, tn);
             if (expect == 0) {
                 tname(tn, sizeof tn, "natpmp-map-val", name);
                 check(ep == (uint16_t)ext_port && lt == (uint32_t)lifetime, tn);
+                tname(tn, sizeof tn, "natpmp-map-epoch", name);
+                check(num_field(c, "epoch", &wepoch) == 0 && sssoe == (uint32_t)wepoch, tn);
             }
         }
     }

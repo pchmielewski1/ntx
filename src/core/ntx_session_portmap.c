@@ -41,6 +41,25 @@
  * Lifetime field. The wait is honoured, but never taken below this floor — a gateway
  * handing out lifetime 0 would otherwise buy a tight retry loop. */
 #define PM_RETRY_MIN_S 60u
+/* R23: the FLOOR under the renewal gap. A grant is renewed at half its lifetime
+ * (RFC 6887 §8 / RFC 6886 §3.3 "halfway to expiry, like DHCP"), and pm_cap_life only
+ * bounds the CEILING — a gateway handing out lifetime 1 s therefore asks for renew_at
+ * == now (life/2 truncates to 0) and the renewal loop, which walks `active &&
+ * !failed` on every tick, re-opens the query each tick: the outstanding schedule is
+ * reset before it is ever spent and the loop runs at 100% CPU against the gateway.
+ * Nothing under half a second is a renewal any more, it is a poll.
+ *
+ * The floor is scoped to the NAT-PMP leg, which is where the review measured it:
+ * RFC 6886 §3.1 gives that family no jitter and no MRT — nine sends from 250 ms and
+ * nothing between them — so a renew window shorter than that cycle overlaps the
+ * schedules of both phases and of the deferred retry. The PCP leg keeps the pinned
+ * "half the grant" pacing (G/I/M9/P5 read it against the virtual clock, and its
+ * retransmission schedule is jittered and doubling from IRT 3 s per §8.1.1).
+ * ponytail: the ceiling is one floor for both phases of the NAT-PMP leg and no floor
+ * on the PCP leg; the upgrade path if a PCP gateway is ever met that grants seconds is
+ * to bring `half` down to this same constant there too, which only needs the pacing
+ * cases re-pinned to a lifetime above twice the floor. */
+#define PM_RENEW_MIN_S 30u
 /* The §8.5 restart test compares the Epoch the gateway reports against what the
  * client's own clock says it must be, so a gateway whose Epoch just stands still is
  * judged a restart on every answer — and each judgement means one re-request. The
@@ -211,6 +230,23 @@ struct ntx_portmap {
     uint32_t epoch;
     int epoch_seen;            /* 0 until the first PCP answer: no baseline */
     uint64_t epoch_at;         /* virtual ms the baseline Epoch was received (§8.5) */
+    /* R21 · the NAT-PMP leg's own §8.5 baseline. RFC 6886 §3.6 puts a Seconds Since
+     * Start of Epoch in octets 4..7 of EVERY packet the gateway sends — the address
+     * reply of §3.2 and the mapping reply of §3.3, refusals included (§3.5) — counted
+     * from the instant its port-mapping table came up, and §3.7 says a client that
+     * sees that notion of time go backwards recreates its mappings. The field was
+     * never read, so a router that rebooted between two answers was invisible and the
+     * stale grant kept being renewed against a gateway that had already forgotten it.
+     * PARALLEL to the PCP fields above and deliberately not shared with them: `fam`
+     * only ever steps PCP → NAT-PMP once per sequence, so one counter could be
+     * exhausted by the leg it no longer describes, and the two legs are compared
+     * against two different packets. The NAT-PMP leg's counter is bounded by the same
+     * PM_MAX_RESTARTS — one re-request per detection, one diag line and the sequence
+     * over once it is spent, exactly the PCP rule (R10). */
+    uint32_t np_epoch;
+    int np_epoch_seen;         /* 0 until the first accepted NAT-PMP answer: no baseline */
+    uint64_t np_epoch_at;      /* virtual ms that baseline was received */
+    int np_restarts;           /* consecutive restart detections; an accepted answer resets them */
     int fallback_used;    /* the one PCP → NAT-PMP step of this sequence is spent (R9) */
     int retry_ph;         /* query the gateway told us to ask for again, -1 = none (R14) */
     uint64_t retry_at;    /* virtual ms that retry may go out (never sooner than PM_RETRY_MIN_S) */
@@ -552,6 +588,11 @@ static void pm_reset(struct ntx_portmap *pm, ntx_pm_state st) {
     pm->gave_up = 0;
     pm->addr_done = 0;
     pm->epoch_seen = 0;
+    /* R21: the NAT-PMP leg's baseline dies with the sequence too — the next sequence
+     * opens as PCP again (pm_open sets `fam`), and a baseline left over from a leg this
+     * sequence has not spoken yet would judge its first reply against a dead gateway. */
+    pm->np_epoch_seen = 0;
+    pm->np_restarts = 0;
     pm->fallback_used = 0; /* the PCP → NAT-PMP step is per sequence, not per process (R9) */
     pm->retry_ph = -1;
     pm->retry_at = 0;
@@ -827,7 +868,16 @@ static void pm_send_deletes(struct ntx_portmap *pm) {
             n = pcp_build_map(buf, pm->client_ip, pm->grant_nonce[ph], proto, lp, pm->ext[ph], 0,
                               pm->grant_ip[ph]);
         } else {
-            n = natpmp_build_map(buf, pm_op_of(ph), lp, pm->ext[ph], 0);
+            /* R20: RFC 6886 §3.4 — "The Suggested External Port MUST be set to zero by
+             * the client on sending, and MUST be ignored by the gateway on reception."
+             * The delete is the mapping request with the lifetime at 0 and NOTHING else
+             * carried over: PCP §11.1 keeps the granted port as the preference (§11.2
+             * identifies the mapping by its nonce and suggests the assigned address),
+             * NAT-PMP has no nonce and identifies the mapping by opcode + internal port,
+             * so the granted port here is a preference for a NEW mapping that a delete
+             * is not asking for — a gateway that honours it instead of ignoring it is
+             * left with a lifetime-0 request naming the live mapping's port. */
+            n = natpmp_build_map(buf, pm_op_of(ph), lp, 0, 0);
         }
         (void)pm_drain_err(pm); /* an ICMP for the last live query must not skip this delete (R9) */
         pm->del_tried++;
@@ -865,7 +915,16 @@ static void pm_grant(struct ntx_portmap *pm, int phase, uint16_t ext_port, uint3
         ext_port != pm->ext[PM_PH_TCP])
         ntx_diag("ntx: port map: UDP port %u differs from the TCP port %u the swarm is told\n",
                  (unsigned)ext_port, (unsigned)pm->ext[PM_PH_TCP]);
-    pm->renew_at[phase] = pm_now() + (uint64_t)(life / 2) * 1000u;
+    /* R23: half the grant, floored on the NAT-PMP leg — see PM_RENEW_MIN_S. `half` is
+     * spelled out because the two legs keep different pacing rules and the RFCs give
+     * each one its own: PCP stays at half the grant (the schedule is jittered and
+     * doubling from IRT 3 s, RFC 6887 §8.1.1), NAT-PMP cannot go under 30 s (nine
+     * sends from 250 ms with nothing between them, RFC 6886 §3.1, so a shorter window
+     * overlaps the schedule of the query it is renewing). A lifetime of 1 s truncates
+     * to 0 here, which is the state that made the tick renew forever. */
+    uint32_t half = life / 2;
+    if (pm->fam == PM_NATPMP && half < PM_RENEW_MIN_S) half = PM_RENEW_MIN_S;
+    pm->renew_at[phase] = pm_now() + (uint64_t)half * 1000u;
     /* R12: the instant the gateway itself stops forwarding this grant. A renewal that
      * is still in flight past it cannot be assumed held any more, and
      * `ntx_session_adv_port` must not tell the swarm to dial a port the gateway has
@@ -965,6 +1024,42 @@ static int pcp_epoch_restarts(uint32_t base, uint64_t base_at, uint32_t epoch) {
 static int pcp_epoch_restarted(const struct ntx_portmap *pm, uint32_t epoch) {
     if (!pm->epoch_seen) return 0;
     return pcp_epoch_restarts(pm->epoch, pm->epoch_at, epoch);
+}
+
+static void pm_no_mapping(struct ntx_portmap *pm, int ph, const char *why); /* below */
+
+/* R21 · the NAT-PMP leg's half of that rule, and the reason pcp_epoch_restarts is
+ * shared instead of copied: RFC 6886 §3.7 asks for exactly the §8.5 judgement —
+ * "where the gateway's notion of time has apparently gone backwards compared to the
+ * client's" — on a counter that means the same thing (seconds since the gateway's
+ * port-mapping table came up, §3.6). The FIRST accepted reply of the leg carries no
+ * comparison to make and only sets the baseline, exactly as PCP's `epoch_seen` does.
+ *
+ * Returns 1 when the caller must stop handling the reply: the grants are gone and the
+ * tick owes the sequence one fresh query (`pm_lost`, nothing sent from the receive
+ * path — R10), or the bound is spent and the sequence ends like any other stated
+ * refusal. Returns 0 when the reply is healthy and says what it says.
+ *
+ * Like the PCP arm, the baseline moves BEFORE the rollback, so the reply that revealed
+ * the restart cannot reveal it again, and `np_restarts` caps the one case the rollback
+ * still cannot satisfy: a counter that never agrees with our clock (RFC 6886 §3.7's
+ * "recreation packets" from a gateway that keeps losing state). */
+static int pm_np_epoch_rollback(struct ntx_portmap *pm, int ph, uint32_t sssoe) {
+    if (pm->np_epoch_seen && pcp_epoch_restarts(pm->np_epoch, pm->np_epoch_at, sssoe)) {
+        pm->np_epoch = sssoe;
+        pm->np_epoch_at = pm_now();
+        if ((uint32_t)++pm->np_restarts > PM_MAX_RESTARTS) {
+            pm_no_mapping(pm, ph, "epoch never agrees with our clock");
+            return 1;
+        }
+        pm_lost(pm);
+        return 1;
+    }
+    pm->np_epoch = sssoe;
+    pm->np_epoch_at = pm_now();
+    pm->np_epoch_seen = 1;
+    pm->np_restarts = 0;
+    return 0;
 }
 
 static void pm_no_mapping(struct ntx_portmap *pm, int ph, const char *why) {
@@ -1104,7 +1199,14 @@ static void pm_rx(struct ntx_portmap *pm, const uint8_t *b, size_t n) {
 
     if (ph == PM_PH_ADDR) {
         uint8_t ip4[4];
-        if (natpmp_parse_addr(b, n, ip4) != 0) return;
+        uint32_t sssoe = 0;
+        if (natpmp_parse_addr(b, n, ip4, &sssoe) != 0) return;
+        /* R21: the external-address reply is the first packet this leg ever sees and
+         * every one of them carries the counter, so it is where the baseline starts —
+         * and the restart test runs ahead of the CGNAT verdict exactly as the PCP arm
+         * puts it ahead of R22: a gateway that reset is not reporting the ISP's
+         * address any more, it is reporting whatever it has after the reboot. */
+        if (pm_np_epoch_rollback(pm, ph, sssoe)) return;
         uint32_t net;
         memcpy(&net, ip4, 4);
         uint8_t wide[16];
@@ -1121,13 +1223,18 @@ static void pm_rx(struct ntx_portmap *pm, const uint8_t *b, size_t n) {
     }
 
     uint16_t ext = 0;
-    uint32_t life = 0;
-    int rc = natpmp_parse_map(b, n, pm_op_of(ph), pm->iport, &ext, &life);
+    uint32_t life = 0, sssoe = 0;
+    int rc = natpmp_parse_map(b, n, pm_op_of(ph), pm->iport, &ext, &life, &sssoe);
     if (rc > 1) { /* the gateway stated a verdict: not a grant (R14) */
         pm_refused_result(pm, ph, (uint32_t)rc, life);
         return;
     }
     if (rc != 0) return;
+    /* R21: a mapping reply from a gateway whose counter went backwards grants nothing
+     * that still exists — the table it was granted into is gone (§3.7). Compared
+     * before the lifetime and the port are judged, and before the grant is recorded,
+     * so a reboot cannot be answered with a renewal of a dead mapping. */
+    if (pm_np_epoch_rollback(pm, ph, sssoe)) return;
     life = pm_cap_life(life);
     if (life == 0) {
         pm_zero_lifetime(pm, ph);

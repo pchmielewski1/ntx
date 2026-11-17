@@ -60,9 +60,17 @@ size_t natpmp_build_map(uint8_t out[12], uint8_t op /*1 udp, 2 tcp*/, uint16_t i
  * *lifetime then carries the retry-after the reply names.
  * Lifetime is the server's value VERBATIM, unclamped — RFC 6887 §8.3 wants the
  * client to cap an absurd one, and that cap (with the renewal clock) is the
- * session driver's job, so ntx_session_portmap.c must bound it before use. */
-int natpmp_parse_addr(const uint8_t *b, size_t n, uint8_t ext_ip[4]);
-int natpmp_parse_map(const uint8_t *b, size_t n, uint8_t op, uint16_t int_port, uint16_t *ext_port, uint32_t *lifetime);
+ * session driver's job, so ntx_session_portmap.c must bound it before use.
+ *
+ * Both also read octets 4..7 — the gateway's Seconds Since Start of Epoch (RFC 6886
+ * §3.6, carried by every packet it sends, refusals included per §3.5). `sssoe` is an
+ * optional read-out (NULL = not interested), written once the packet's shape —
+ * version, opcode, length — has been accepted; on a -1 its value is unspecified. The
+ * client compares it (RFC 6886 §3.7) and the comparison is the driver's job, exactly
+ * like the lifetime cap above. */
+int natpmp_parse_addr(const uint8_t *b, size_t n, uint8_t ext_ip[4], uint32_t *sssoe);
+int natpmp_parse_map(const uint8_t *b, size_t n, uint8_t op, uint16_t int_port, uint16_t *ext_port,
+                     uint32_t *lifetime, uint32_t *sssoe);
 
 /* 1 when the address is in 10/8, 172.16/12, 192.168/16, 100.64/10 (CGNAT) or
  * fc00::/7, else 0. Input is always the 16-byte form that goes on the wire: an

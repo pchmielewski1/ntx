@@ -536,9 +536,89 @@ static void pcp_v4(uint8_t ip16[16], uint8_t a, uint8_t b, uint8_t c, uint8_t d)
     ip16[15] = d;
 }
 
+/* R21: the canned NAT-PMP replies now carry a gateway counter. RFC 6886 §3.6 puts a
+ * Seconds Since Start of Epoch in OCTETS 4..7 of every packet the gateway sends (the
+ * address reply of §3.2 and the mapping reply of §3.3 both), counted from the instant
+ * its port-mapping table came up. A healthy gateway's counter advances with the same
+ * seconds the client's clock advances, so a case that does not ask for a reboot is
+ * never accidentally handed one; a case that does overwrites the field after building
+ * the reply (see Z5/Z6). */
+static void wr32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+/* The fake gateway's own counter: seconds since its port-mapping table came up. It is
+ * the GATEWAY's clock, not the client's baseline read back (that would make a healthy
+ * answer unfalsifiable) — it starts at 0 the first time a canned NAT-PMP reply is
+ * built and then advances with the same virtual clock the client advances by, which is
+ * exactly what a gateway in step must report. gw_np_reboot() is the router losing its
+ * table: the count starts over from zero at that instant, as §3.6 requires. */
+static uint64_t gw_np_boot_at;
+
+static uint32_t gw_np_epoch(void) {
+    if (!gw_np_boot_at) gw_np_boot_at = pm_now();
+    return (uint32_t)((pm_now() - gw_np_boot_at) / 1000u);
+}
+
+/* Asks, not datagrams. RFC 6886 §3.3 gives a NAT-PMP request no nonce at all — the
+ * gateway keys it on (opcode, internal port) — so the client's §3.5 retransmissions are
+ * BYTE-IDENTICAL to the query they repeat, and counting packets would call three copies
+ * of one ask "three asks" (the PCP probe cannot be confused this way: §7.2 puts a nonce
+ * in every request, so pc_preflight's `nw` already counts asks).
+ *
+ * So an ask is recognised by its CONTENT and by the instant it left: the retry schedule
+ * is 500 ms, 1 s, 2 s, 4 s, 8 s, 16 s, 32 s apart, and a tick is 200 ms, so copies share
+ * an instant while anything that legitimately asks for the same bytes twice does so from
+ * a LATER tick — a driver that does not settle asks every single tick. Hence:
+ * distinct (bytes, instant) pairs. gw_np_reboot() clears the history, because a router
+ * that came back is expected to be asked again.
+ *
+ * The teeth: a driver spinning every tick (the R23 symptom) or re-asking from inside its
+ * own receive path (the R10/R21 loop) records one ask per tick. Past GW_NP_HIST the
+ * count saturates, which is still "not one", and the driver's own 64-datagram bail fires
+ * long before a window of this length could be walked silently. */
+#define GW_NP_HIST 64
+static struct {
+    int used;
+    uint64_t at;
+    uint8_t b[12];
+} gw_np_hist[GW_NP_HIST];
+static int gw_np_hist_n;
+
+static void gw_np_reset(void) {
+    memset(gw_np_hist, 0, sizeof gw_np_hist);
+    gw_np_hist_n = 0;
+}
+
+static void gw_np_ask_seen(const uint8_t *b) {
+    uint64_t now = pm_now();
+    for (int i = 0; i < GW_NP_HIST; i++)
+        if (gw_np_hist[i].used && gw_np_hist[i].at == now && !memcmp(gw_np_hist[i].b, b, 12)) return;
+    int slot = gw_np_hist_n < GW_NP_HIST ? gw_np_hist_n++ : (int)((now / 200u) % GW_NP_HIST);
+    gw_np_hist[slot].used = 1;
+    gw_np_hist[slot].at = now;
+    memcpy(gw_np_hist[slot].b, b, 12);
+}
+
+static int gw_np_reqs(void) {
+    int n = 0;
+    for (int i = 0; i < GW_NP_HIST; i++)
+        if (gw_np_hist[i].used) n++;
+    return n;
+}
+
+static void gw_np_reboot(void) {
+    gw_np_boot_at = pm_now();
+    gw_np_reset(); /* being asked again after this instant is the point, not a loop */
+}
+
 static void natpmp_addr_resp(uint8_t out[12], uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     memset(out, 0, 12);
     out[1] = 128; /* OP 0 + response bit */
+    wr32(out + 4, gw_np_epoch());
     out[8] = a;
     out[9] = b;
     out[10] = c;
@@ -548,6 +628,7 @@ static void natpmp_addr_resp(uint8_t out[12], uint8_t a, uint8_t b, uint8_t c, u
 static void natpmp_map_resp(uint8_t out[16], uint8_t op, uint16_t int_port, uint16_t ext_port, uint32_t lifetime) {
     memset(out, 0, 16);
     out[1] = (uint8_t)(128 + op);
+    wr32(out + 4, gw_np_epoch());
     out[8] = (uint8_t)(int_port >> 8);
     out[9] = (uint8_t)int_port;
     out[10] = (uint8_t)(ext_port >> 8);
@@ -853,6 +934,93 @@ static int gw_to_natpmp_map(sess *x, uint8_t *req, size_t cap) {
     gw_send(aresp, sizeof aresp);
     pump_ms(x->n, 40); /* the driver only reads the reply when the loop runs */
     return (int)gw_wait(req, cap, 300);
+}
+
+/* ---- R21: the NAT-PMP leg's §8.5 probes ------------------------------------
+ * The siblings of pcp_answer_all / gw_epoch_live for the fallback. NAT-PMP has no
+ * nonce to tell a query from a retransmission with (RFC 6886 §3.3 keys a request on
+ * version/opcode/internal port), so what is counted here is the datagram: a driver
+ * that re-requests from inside its receive path shows up as one datagram per round
+ * trip, and a driver that rolls back once shows up as one. The pump is bounded, so a
+ * looping driver fails instead of hanging.
+ *
+ * `epoch` is what the gateway's Seconds Since Start of Epoch (RFC 6886 §3.6, octets
+ * 4..7 of every packet it sends) reads on every answer; NULL answers with what a
+ * gateway whose counter stayed in step with the client's clock must report, so a
+ * recovery round is never mistaken for a second restart. */
+
+/* The SSSoE a healthy gateway owes the driver now. The gateway keeps its own counter
+ * (RFC 6886 §3.6 counts from the instant ITS port-mapping table came up, and knows
+ * nothing about the client's baseline), so the figure is the fake gateway's own clock:
+ * seconds since the first canned NAT-PMP answer of the run, advanced by the same
+ * virtual clock the client advances by — the number a gateway in step with the
+ * client's clock must report, with no real-clock jitter to read as a restart. */
+static uint32_t gw_np_epoch_live(void) { return gw_np_epoch(); }
+
+
+static int natpmp_answer_all(sess *x, uint8_t op, uint16_t ext, uint32_t lifetime, const uint32_t *epoch,
+                             const char *tag, uint64_t step_ms, int steps) {
+    const int cap = 64; /* nothing legitimately asks this often in the window below */
+    uint8_t buf[2048], rsp[16];
+    int q = 0;
+    for (int i = 0; i < steps; i++) {
+        ssize_t r;
+        /* Drained BEFORE the clock moves: a datagram sent from inside the receive
+         * path is exactly what is being probed and must not be skipped. */
+        while ((r = gw_get(buf, sizeof buf)) > 0) {
+            if (r != 12 || buf[0] != 0 || buf[1] != op || rd32(buf + 8) != 7200) continue;
+            /* Counted by CONTENT and instant, not by packet — see gw_np_ask_seen(): a
+             * NAT-PMP request has no nonce, so the §3.5 retransmissions are copies of the
+             * ask. Counting them would report a paced schedule as a loop. */
+            gw_np_ask_seen(buf);
+            if (q >= cap) {
+                printf("  (%s: %d requests in %d ms — request loop)\n", tag, q, (int)(step_ms * steps));
+                gw_drain();
+                return q;
+            }
+            q++;
+            natpmp_map_resp(rsp, op, (uint16_t)((buf[4] << 8) | buf[5]), ext, lifetime);
+            wr32(rsp + 4, epoch ? *epoch : gw_np_epoch_live());
+            gw_send(rsp, sizeof rsp);
+        }
+        /* And the client is let READ them before the clock moves: a reply still sitting
+         * in the socket when the next tick runs makes §3.5 retransmit, and a NAT-PMP
+         * retransmission is byte-identical to the ask it repeats (RFC 6886 §3.3 gives the
+         * request no nonce), so answering in-step is what lets gw_np_reqs() count asks
+         * rather than copies. A driver that asks again from inside its own receive path is
+         * NOT hidden: that datagram is sent before the pump below it runs and is picked up
+         * by the next round's drain, before the clock moves. */
+        pump_ms(x->n, 10);
+        ntx_portmap_test_advance_ms(step_ms);
+        pm_tick(x);
+        pump_ms(x->n, 10);
+    }
+    gw_drain();
+    return q;
+}
+
+/* Answer the next mapping REQUEST of `op` (a 12 B ask for PM_LIFE_S — a lifetime-0
+ * delete is never an answer target) with `ext`/`lifetime` and copy the request out, so
+ * a case can read the port the ask suggested. Clock-walking and bounded: a driver that
+ * never asks is a FAIL, not a hang. */
+static int natpmp_grant(sess *x, uint8_t op, uint16_t ext, uint32_t lifetime, const uint32_t *epoch,
+                        uint8_t out12[12]) {
+    uint8_t buf[2048], rsp[16];
+    for (int spins = 0; spins < 800; spins++) {
+        ssize_t n = gw_get(buf, sizeof buf);
+        if (n == 12 && buf[0] == 0 && buf[1] == op && rd32(buf + 8) == 7200) {
+            if (out12) memcpy(out12, buf, 12);
+            natpmp_map_resp(rsp, op, (uint16_t)((buf[4] << 8) | buf[5]), ext, lifetime);
+            wr32(rsp + 4, epoch ? *epoch : gw_np_epoch_live());
+            gw_send(rsp, sizeof rsp);
+            pump_ms(x->n, 20);
+            return 1;
+        }
+        ntx_portmap_test_advance_ms(250);
+        pm_tick(x);
+        ntx_netx_run_once(x->n, 2);
+    }
+    return 0;
 }
 
 /* One retransmission: nothing may go out before the scheduled instant, and the
@@ -5388,6 +5556,260 @@ int main(void) {
         ntx_portmap_test_set_client6(NULL);
         gw_drain();
         gw6_drain();
+    }
+
+    /* ---- Z. R23 + R20 + R21: the NAT-PMP leg's renewal floor, delete port and epoch.
+     *
+     * Z1/Z2 · R23. A gateway may hand out any lifetime it likes (RFC 6886 §3.3: "The
+     * NAT gateway MAY reduce the lifetime from what the client requested"), including
+     * one second. The renewal is due at half the grant, so lifetime 1 truncates to
+     * `renew_at == now`: the renewal arm of the tick, which walks `active && !failed`,
+     * re-opened the query on EVERY tick and its nine-send schedule never got spent —
+     * the datagram rate of a poll, at 100% CPU, against the gateway. `pm_cap_life`
+     * bounds the ceiling and says nothing about the floor. PM_RENEW_MIN_S pins it on
+     * this leg (the constant's comment is why PCP keeps its pinned pacing).
+     *
+     * Z3/Z4 · R20. RFC 6886 §3.4: a delete is the mapping request with the lifetime at
+     * 0 and "The Suggested External Port MUST be set to zero by the client on sending,
+     * and MUST be ignored by the gateway on reception." Z4 keeps the other half — a
+     * RENEWAL is the grant's request again and still suggests the assigned port (the
+     * S12/S13 rule, untouched).
+     *
+     * Z5/Z6 · R21. RFC 6886 §3.6 puts a Seconds Since Start of Epoch in octets 4..7 of
+     * EVERY packet the gateway sends — the external-address reply of §3.2 (the carrier
+     * this leg's baseline comes from) and the mapping reply of §3.3, and §3.5 requires
+     * the field even on a refusal. §3.7: when that notion of time goes backwards
+     * against the client's, the table was reset and the mappings are recreated. The
+     * field was never read, so a router that rebooted between two answers stayed
+     * invisible and the stale grant kept being renewed against a gateway that had
+     * forgotten it. The fix runs the shared RFC 6887 §8.5 judgement on it with a
+     * baseline of this leg's own, one re-request per detection out of the TICK (not the
+     * receive path — R10), bounded by PM_MAX_RESTARTS like the PCP arm (H2–H6).
+     *
+     * Z7/Z8 are the guards the step names: the healthy NAT-PMP leg is never judged a
+     * restart, and the PCP leg's pacing and delete shape are exactly what they were. */
+    {
+        /* ---- Z1. lifetime 1 s: nothing goes out before the 30 s floor. */
+        sess x;
+        sess_open(&x, "z1");
+        x.cfg.port_map = 1;
+        pm_start(&x);
+        uint8_t req[2048];
+        ck_eq(gw_to_natpmp_map(&x, req, sizeof req), 12, "Z1_natpmp_map_request");
+        ck(natpmp_grant(&x, 2, EXT_PORT, 1, NULL, NULL), "Z1_granted");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "Z1_active");
+        gw_drain();
+        ntx_portmap_test_advance_ms(29000); /* the whole window under the floor */
+        pm_tick(&x);
+        pump_ms(x.n, 10);
+        ck(!gw_pending(), "Z1_no_renewal_before_the_floor");
+        ntx_portmap_test_advance_ms(1000); /* the floor: 30 s after the grant */
+        pm_tick(&x);
+        ck_eq(gw_get(req, sizeof req), 12, "Z1_renewal_at_the_floor");
+        ck(!gw_pending(), "Z1_one_renewal_only");
+        ck_eq(x.s->pm->tries, 1, "Z1_renewal_one_send");
+        ck(pm_wait_close(x.s->pm, NATPMP_IRT_MS), "Z1_renewal_paces_at_the_IRT");
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        gw_drain();
+
+        /* ---- Z2. lifetime 3 s: half of it is 1 s, so the floor again. */
+        sess y;
+        sess_open(&y, "z2");
+        y.cfg.port_map = 1;
+        pm_start(&y);
+        ck_eq(gw_to_natpmp_map(&y, req, sizeof req), 12, "Z2_natpmp_map_request");
+        ck(natpmp_grant(&y, 2, EXT_PORT, 3, NULL, NULL), "Z2_granted");
+        gw_drain();
+        ck_eq(pm_sends_in(&y, 1000, 29), 0, "Z2_quiet_below_the_floor");
+        ntx_portmap_test_advance_ms(1500);
+        pm_tick(&y);
+        ck_eq(gw_get(req, sizeof req), 12, "Z2_renewal_at_the_floor");
+        ntx_session_portmap_stop(y.s);
+        sess_close(&y);
+        gw_drain();
+
+        /* ---- Z3. the delete suggests port 0 (R20), one per held mapping. */
+        sess z;
+        sess_open(&z, "z3");
+        z.cfg.utp = 1;
+        z.cfg.port_map = 1;
+        pm_start(&z);
+        uint16_t lp = ntx_netx_port(z.n);
+        ck_eq(gw_to_natpmp_map(&z, req, sizeof req), 12, "Z3_natpmp_map_request");
+        ck(natpmp_grant(&z, 2, EXT_PORT, 3600, NULL, NULL), "Z3_tcp_granted");
+        ck(natpmp_grant(&z, 1, EXT_PORT, 3600, NULL, NULL), "Z3_udp_granted");
+        gw_drain();
+        ntx_session_portmap_stop(z.s);
+        int dels = 0, tcp_dels = 0, udp_dels = 0, nonzero = 0;
+        ssize_t r;
+        while ((r = gw_get(req, sizeof req)) >= 0) {
+            if (r != 12 || req[0] != 0 || rd32(req + 8) != 0) continue; /* a lifetime-0 ask */
+            dels++;
+            if ((req[6] << 8) | req[7]) nonzero++;
+            ck_eq(req_int_port(req), lp, "Z3_delete_names_the_internal_port");
+            if (req[1] == 2) tcp_dels++;
+            if (req[1] == 1) udp_dels++;
+        }
+        ck_eq(dels, 2, "Z3_two_deletes");
+        ck_eq(tcp_dels, 1, "Z3_tcp_delete");
+        ck_eq(udp_dels, 1, "Z3_udp_delete");
+        ck_eq(nonzero, 0, "Z3_delete_suggests_port_0");
+        sess_close(&z);
+        gw_drain();
+
+        /* ---- Z4. the RENEWAL still suggests the granted port (S12 rule untouched). */
+        sess w;
+        sess_open(&w, "z4");
+        w.cfg.port_map = 1;
+        pm_start(&w);
+        ck_eq(gw_to_natpmp_map(&w, req, sizeof req), 12, "Z4_natpmp_map_request");
+        ck(natpmp_grant(&w, 2, EXT_PORT, 3600, NULL, NULL), "Z4_granted");
+        gw_drain();
+        ntx_portmap_test_advance_ms(1801000); /* past half the 3600 s grant */
+        pm_tick(&w);
+        ck_eq(gw_get(req, sizeof req), 12, "Z4_renewal_sent");
+        ck_eq(req[1], 2, "Z4_renewal_opcode");
+        ck_eq(rd32(req + 8), 7200, "Z4_renewal_is_not_a_delete");
+        ck_eq(req_int_port(req), ntx_netx_port(w.n), "Z4_renewal_internal_port");
+        ck_eq((req[6] << 8) | req[7], EXT_PORT, "Z4_renewal_suggests_the_granted_port");
+        ntx_session_portmap_stop(w.s);
+        sess_close(&w);
+        gw_drain();
+
+        /* ---- Z5. the gateway rebooted between two answers: one re-request (R21). */
+        sess v;
+        sess_open(&v, "z5");
+        v.cfg.port_map = 1;
+        pm_start(&v);
+        ck_eq(gw_to_natpmp_map(&v, req, sizeof req), 12, "Z5_natpmp_map_request");
+        ck(natpmp_grant(&v, 2, EXT_PORT, 3600, NULL, NULL), "Z5_granted");
+        ck(ntx_session_portmap_state(v.s) == NTX_PM_ACTIVE, "Z5_active");
+        ck_eq(ntx_session_adv_port(v.s), EXT_PORT, "Z5_adv_port");
+        gw_drain();
+        ntx_portmap_test_advance_ms(1801000);
+        pm_tick(&v);
+        ck_eq(gw_get(req, sizeof req), 12, "Z5_renew_sent");
+        /* The router loses its table here: its counter starts over (§3.6), so the
+         * renewal answer it sends next reports an Epoch far below the baseline. */
+        gw_np_reboot();
+        natpmp_map_resp(req, 2, req_int_port(req), 40124, 3600);
+        wr32(req + 4, gw_np_epoch_live()); /* 0: counting from the reboot */
+        gw_send(req, 16);
+        pump_ms(v.n, 40);
+        gw_np_reset(); /* the tally below is the restart's cost, nothing before it */
+        pm_tick(&v);
+        ck(ntx_session_portmap_state(v.s) == NTX_PM_PENDING, "Z5_rollback_pending");
+        ck_eq(ntx_session_adv_port(v.s), ntx_netx_port(v.n), "Z5_rollback_no_stale_port");
+        /* One re-request for one reboot, on the schedule — and the gateway that came
+         * back is the rebooted one, so its counter is near zero and its first answer
+         * becomes the new baseline. */
+        /* What the restart COSTS is one ask: the datagram the rollback put on the wire
+         * after the poisoned answer. answer_all's own tally counts copies too (a NAT-PMP
+         * request has no nonce, so its retransmissions are the ask again — see
+         * gw_np_ask_seen), so the bound is on distinct asks. */
+        natpmp_answer_all(&v, 2, 40124, 3600, NULL, "Z5", 1000, 30);
+        ck_eq(gw_np_reqs(), 1, "Z5_one_re_request_not_a_loop");
+        ck(ntx_session_portmap_state(v.s) == NTX_PM_ACTIVE, "Z5_recovered");
+        ck_eq(ntx_session_adv_port(v.s), 40124, "Z5_recovered_adv_port");
+        ntx_session_portmap_stop(v.s);
+        sess_close(&v);
+        gw_drain();
+
+        /* ---- Z6. a counter that never agrees ends the sequence (R21, the H6 shape). */
+        sess u;
+        sess_open(&u, "z6");
+        u.cfg.port_map = 1;
+        pm_start(&u);
+        ck_eq(gw_to_natpmp_map(&u, req, sizeof req), 12, "Z6_natpmp_map_request");
+        ck(natpmp_grant(&u, 2, EXT_PORT, 3600, NULL, NULL), "Z6_granted");
+        gw_drain();
+        ntx_portmap_test_advance_ms(1801000);
+        pm_tick(&u);
+        ck_eq(gw_get(req, sizeof req), 12, "Z6_renew_sent");
+        const uint32_t frozen = 5; /* far below the baseline and never moving */
+        natpmp_map_resp(req, 2, req_int_port(req), EXT_PORT, 3600);
+        wr32(req + 4, frozen);
+        gw_send(req, 16);
+        pump_ms(u.n, 40);
+        /* No pm_tick here, and that is the whole point of the shape: the rollback's
+         * re-request must be owed to the LOOP's first tick, so the answer that judges it
+         * lands one step (3 s) after the baseline the poisoned reply set. Answered in the
+         * same virtual instant, a frozen counter would agree with itself and the broken
+         * gateway would be taken for a healthy one — which is also why H6 is written this
+         * way. 3 s per step keeps every answer far enough from the previous baseline to
+         * be judged a restart again. */
+        gw_np_reset();
+        int q = natpmp_answer_all(&u, 2, EXT_PORT, 3600, &frozen, "Z6", 3000, 40);
+        if (gw_np_reqs() > 5) { /* one ask per restart, PM_MAX_RESTARTS of them, plus slack */
+            printf("FAIL Z6_bounded_requests got=%d want<=5\n", gw_np_reqs());
+            fails++;
+        }
+        ck(q >= 1, "Z6_re-requested_at_all");
+        ck(ntx_session_portmap_state(u.s) == NTX_PM_NONE, "Z6_none_after_bound");
+        ck_eq(u.s->pm->phase, -1, "Z6_nothing_outstanding");
+        ck_eq(pm_sends_in(&u, 60000, 6), 0, "Z6_stays_quiet");
+        ntx_session_portmap_stop(u.s);
+        sess_close(&u);
+        gw_drain();
+        gw_np_reboot(); /* the next case starts against a gateway it did not crash */
+
+        /* ---- Z7. the guard on Z5: a gateway whose counter stays in step is never
+         * judged a restart, however long the gap between two answers. */
+        sess t;
+        sess_open(&t, "z7");
+        t.cfg.port_map = 1;
+        pm_start(&t);
+        ck_eq(gw_to_natpmp_map(&t, req, sizeof req), 12, "Z7_natpmp_map_request");
+        ck(natpmp_grant(&t, 2, EXT_PORT, 3600, NULL, NULL), "Z7_granted");
+        gw_drain();
+        ntx_portmap_test_advance_ms(1801000);
+        pm_tick(&t);
+        /* The renewal is answered by the gateway that stayed in step, inside the same
+         * step it went out — an unanswered ask would retransmit per §3.5 and the case
+         * would then be measuring the retry schedule, not the judgement. */
+        gw_np_reset();
+        ck_eq(natpmp_answer_all(&t, 2, EXT_PORT, 3600, NULL, "Z7", 1000, 5), 1,
+              "Z7_one_renewal_only");
+        ck_eq(gw_np_reqs(), 1, "Z7_one_ask_only");
+        ck(ntx_session_portmap_state(t.s) == NTX_PM_ACTIVE, "Z7_stays_active");
+        ck_eq(ntx_session_adv_port(t.s), EXT_PORT, "Z7_adv_port_kept");
+        ntx_session_portmap_stop(t.s);
+        sess_close(&t);
+        gw_drain();
+
+        /* ---- Z8. the PCP leg is untouched by all three: half the grant is still half
+         * the grant (40 s → renewal at 20 s, the P5 shape), and its delete keeps the
+         * granted port and address (§11.1/§11.2, the S12 rule). */
+        sess s;
+        sess_open(&s, "z8");
+        s.cfg.port_map = 1;
+        uint8_t pub[16];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pm_start(&s);
+        pcp_grant(&s, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 40);
+        ck_eq(ntx_session_adv_port(s.s), EXT_PORT, "Z8_pcp_adv_port");
+        gw_drain();
+        ntx_portmap_test_advance_ms(19000);
+        pm_tick(&s);
+        ck(!gw_pending(), "Z8_pcp_no_early_renew");
+        ntx_portmap_test_advance_ms(1500);
+        pm_tick(&s);
+        ck_eq(gw_get(req, sizeof req), 60, "Z8_pcp_renewal_at_half_the_grant");
+        ck(req_is(req, 60, NTX_PCP_PROTO_TCP, 7200), "Z8_pcp_renewal_shape");
+        ck_eq((req[42] << 8) | req[43], EXT_PORT, "Z8_pcp_renewal_suggests_granted_port");
+        gw_drain();
+        ntx_session_portmap_stop(s.s);
+        int pdels = 0;
+        while ((ssize_t)(gw_get(req, sizeof req)) >= 0) {
+            if (rd32(req + 4) != 0) continue;
+            pdels++;
+            ck_eq((req[42] << 8) | req[43], EXT_PORT, "Z8_pcp_delete_suggests_granted_port");
+            ck(memcmp(req + 44, pub, 16) == 0, "Z8_pcp_delete_suggests_granted_ip");
+        }
+        ck_eq(pdels, 1, "Z8_pcp_delete_sent");
+        sess_close(&s);
+        gw_drain();
     }
 
     write_routes(GW_LO);

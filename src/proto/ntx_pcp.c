@@ -140,16 +140,23 @@ size_t natpmp_build_map(uint8_t out[12], uint8_t op, uint16_t int_port,
     return 12;
 }
 
-int natpmp_parse_addr(const uint8_t *b, size_t n, uint8_t ext_ip[4]) {
+/* R21: octets 4..7 of both replies below are the gateway's Seconds Since Start of
+ * Epoch (RFC 6886 §3.6, §3.5: set correctly even on a refusal). The codec only reads
+ * the field out — the §3.7 comparison against the client's clock is the driver's, like
+ * the lifetime cap. sssoe is optional (NULL = not interested) and is written once the
+ * packet's SHAPE (version, opcode, length) is accepted; on a -1 it is unspecified. */
+
+int natpmp_parse_addr(const uint8_t *b, size_t n, uint8_t ext_ip[4], uint32_t *sssoe) {
     /* §3.2: Vers|OP|Result(16)|SSSE(32)|External IPv4(32) = 12 B. */
     if (!b || !ext_ip || n != 12 || b[0] != 0 || b[1] != 128) return -1;
+    if (sssoe) *sssoe = pcp_get32(b + 4);
     if (pcp_get16(b + 2) != PCP_RESULT_SUCCESS) return -1;
     memcpy(ext_ip, b + 8, 4);
     return 0;
 }
 
 int natpmp_parse_map(const uint8_t *b, size_t n, uint8_t op, uint16_t int_port,
-                     uint16_t *ext_port, uint32_t *lifetime)
+                     uint16_t *ext_port, uint32_t *lifetime, uint32_t *sssoe)
 {
     /* §3.3: Vers|OP|Result(16)|SSSE(32)|InternalPort|MappedPort|Lifetime(32) = 16 B.
      * op is pinned to the two mapping opcodes; without the range check a caller
@@ -158,6 +165,7 @@ int natpmp_parse_map(const uint8_t *b, size_t n, uint8_t op, uint16_t int_port,
         (op != PCP_NATPMP_OP_UDP && op != PCP_NATPMP_OP_TCP) ||
         b[1] != (uint8_t)(128 + op))
         return -1;
+    if (sssoe) *sssoe = pcp_get32(b + 4);
     uint16_t result = pcp_get16(b + 2);
     if (result != PCP_RESULT_SUCCESS) {
         /* §3.3 puts the result and the lifetime in the same reply, so an error
