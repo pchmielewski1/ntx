@@ -351,6 +351,56 @@ wait "$R4_PID" 2>/dev/null || rc4=$?
 [ "$rc4" -eq 1 ] || fail "r4: CLI exit $rc4 after a failed share, want 1" "$WORK/r4.err"
 say "r4: CLI reported 'share failed' and exited 1"
 
+# 8 — R33: a magnet that cannot be written to stdout is an honest failure, not a
+# silent success. The two injections are the real thing, over the shipped binary:
+# stdout = /dev/full (ENOSPC at the flush) and stdout = a pipe whose reader exited
+# (EPIPE at the write — the binary ignores SIGPIPE, so it is an errno, not a death).
+# Pre-fix both printed `ntx: shared — …` and exited 0 with no link delivered.
+say "r33: CLI share with stdout on /dev/full"
+R33A="$WORK/storeR33A"
+mkdir -p "$R33A" || fail "cannot create $R33A"
+dd if=/dev/urandom of="$SRC/r33.bin" bs=65536 count=32 >/dev/null 2>&1 || fail "dd r33 payload"
+if [ -w /dev/full ] || [ -c /dev/full ]; then
+    timeout -k 5 120 "$ROOT/$BIN" --share="$SRC/r33.bin" --allow-local-peers \
+        --store-dir="$R33A" --no-port-map --port-lo=0 --port-hi=0 \
+        </dev/null >/dev/full 2>"$WORK/r33.err" &
+    spawn
+    R33_PID=$!
+    poll 60 "$WORK/r33.err" 'cannot write the magnet' \
+        || fail "r33: /dev/full produced no 'cannot write the magnet' line" "$WORK/r33.err"
+    if grep -qF 'ntx: shared —' "$WORK/r33.err"; then
+        fail "r33: /dev/full still printed the 'shared —' note" "$WORK/r33.err"
+    fi
+    rc33=0
+    wait "$R33_PID" 2>/dev/null || rc33=$?
+    [ "$rc33" -eq 1 ] || fail "r33: /dev/full exit $rc33, want 1" "$WORK/r33.err"
+    say "r33: ENOSPC on stdout reported and exit 1"
+else
+    say "r33: SKIP /dev/full (node absent on this host)"
+fi
+
+say "r33: CLI share into a pipe whose reader is gone"
+R33B="$WORK/storeR33B"
+mkdir -p "$R33B" || fail "cannot create $R33B"
+dd if=/dev/urandom of="$SRC/r33p.bin" bs=65536 count=32 >/dev/null 2>&1 || fail "dd r33p payload"
+FIFO="$WORK/r33.fifo"
+rm -f "$FIFO"
+mkfifo "$FIFO" || fail "cannot create $FIFO"
+# The reader blocks in open() until ntx opens the other end, then reads nothing
+# and exits, so the read end is closed long before the magnet is written.
+head -c0 <"$FIFO" >/dev/null 2>&1 &
+spawn
+rc33p=0
+timeout -k 5 120 "$ROOT/$BIN" --share="$SRC/r33p.bin" --allow-local-peers \
+    --store-dir="$R33B" --no-port-map --port-lo=0 --port-hi=0 \
+    </dev/null >"$FIFO" 2>"$WORK/r33p.err" || rc33p=$?
+rm -f "$FIFO"
+grep -q 'cannot write the magnet' "$WORK/r33p.err" \
+    || fail "r33: a closed pipe produced no 'cannot write the magnet' line" "$WORK/r33p.err"
+[ "$rc33p" -eq 1 ] || fail "r33: closed pipe exit $rc33p, want 1" "$WORK/r33p.err"
+[ "$rc33p" -ne 141 ] || fail "r33: died on SIGPIPE (141) instead of reporting EPIPE"
+say "r33: EPIPE on stdout reported and exit 1 (no SIGPIPE death)"
+
 say "r4: JSON share -> ready -> file changed -> one ok:0 event"
 R4B="$WORK/storeR4B"
 mkdir -p "$R4B" || fail "cannot create $R4B"

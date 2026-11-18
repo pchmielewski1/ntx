@@ -1878,5 +1878,154 @@ int main(void) {
         if (ok("r31_one_magnet_limit")) return 1;
     }
 
+    { /* ── R33 · S29: a magnet that cannot be written to stdout must be an
+         honest failure, never a silent success ────────────────────────────────
+         The bug: share_drain_events printed the magnet with puts() + fflush() and
+         checked nothing, so on ENOSPC (stdout = /dev/full) or EPIPE (stdout is a
+         pipe whose reader died) the operator saw `ntx: shared — …` on stderr and
+         exit 0 while the link — the ONE thing `ntx --share=f > link.txt` is for —
+         never arrived. The shipped consumer is driven here over two real, broken
+         fds: /dev/full (ENOSPC at the flush) and a pipe with no reader (EPIPE at
+         the write). SIGPIPE is ignored for the block, exactly as main() does at
+         ntx_main.c:500, so EPIPE is an errno and not a death. Pre-fix: drained 0,
+         fatal 0, no message — the run kept serving and exited 0. */
+        int efull = open("/dev/full", O_WRONLY);
+        if (efull < 0) { /* the node is not there: nothing to assert, say so loudly */
+            printf("SKIP r33 (no /dev/full on this host)\n");
+        } else {
+            signal(SIGPIPE, SIG_IGN); /* the shipped binary does the same before the loop */
+            ntx_config cfg;
+            ntx_netx *nx;
+            memset(&cfg, 0, sizeof cfg);
+            cfg.store_dir = "/tmp/ntx-ipc-r33";
+            if (mkdir("/tmp/ntx-ipc-r33", 0755) != 0 && errno != EEXIST) return fail("r33_dir");
+            FILE *wf = fopen("/tmp/ntx-ipc-r33/r33.bin", "wb");
+            if (!wf) return fail("r33_file");
+            fputs("0123456789", wf);
+            fclose(wf);
+
+            /* one READY event, re-armed per case (each case spends it) */
+            ntx_session *s = mk(&nx, &cfg);
+            ntx_share_err se = NTX_SHARE_OK;
+            int ti = ntx_session_share_add(s, "/tmp/ntx-ipc-r33/r33.bin", NULL, &se);
+            if (ti < 0) { drop(s, nx); return fail("r33_add"); }
+            struct ntx_share_slot *sl = s->share[ti];
+            sl->st = NTX_SHARE_READY;
+            snprintf(sl->name, sizeof sl->name, "r33.bin");
+            snprintf(sl->magnet, sizeof sl->magnet, "magnet:?xt=urn:btih:%040x", 33);
+            snprintf(sl->torrent_path, sizeof sl->torrent_path, "/tmp/ntx-ipc-r33/r33.torrent");
+
+            /* (0) positive control, taken while the stream is still pristine: a
+               healthy stdout gets the whole magnet AND the `shared —` note, and
+               the run stays alive. The two cases below must not change this. */
+            share_evq_push(sl);
+            int save_out = dup(1), save_err = dup(2);
+            fflush(stdout); fflush(stderr);
+            unlink("/tmp/ntx-ipc-r33-ok.txt");
+            unlink("/tmp/ntx-ipc-r33-ok.err");
+            int okfd = open("/tmp/ntx-ipc-r33-ok.txt", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            int okefd = open("/tmp/ntx-ipc-r33-ok.err", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            if (okfd < 0 || okefd < 0) { dup2(save_out, 1); close(save_out); dup2(save_err, 2);
+                                         close(save_err); drop(s, nx); return fail("r33_ok_file"); }
+            dup2(okfd, 1); dup2(okefd, 2); close(okfd); close(okefd);
+            int fatal = 0;
+            int drained = share_drain_events(s, &fatal);
+            fflush(stdout); fflush(stderr);
+            dup2(save_out, 1); dup2(save_err, 2);
+            close(save_out); close(save_err);
+            if (drained || fatal) { printf("R33 healthy stdout: drained=%d fatal=%d, want 0/0\n",
+                                           drained, fatal); drop(s, nx); return fail("r33_ok_fatal"); }
+            { FILE *rf = fopen("/tmp/ntx-ipc-r33-ok.txt", "rb"); char bl[256]; int mag = 0;
+              if (!rf) { drop(s, nx); return fail("r33_ok_read"); }
+              while (fgets(bl, sizeof bl, rf)) if (strncmp(bl, "magnet:?xt=urn:btih:", 20) == 0) mag = 1;
+              fclose(rf);
+              if (!mag) { printf("R33 healthy stdout: no magnet on stdout\n");
+                          drop(s, nx); return fail("r33_ok_magnet"); } }
+            { FILE *rf = fopen("/tmp/ntx-ipc-r33-ok.err", "rb"); char bl[256]; int note = 0;
+              if (!rf) { drop(s, nx); return fail("r33_ok_err_read"); }
+              while (fgets(bl, sizeof bl, rf)) if (strstr(bl, "ntx: shared \xe2\x80\x94")) note = 1;
+              fclose(rf);
+              if (!note) { printf("R33 healthy stdout: no 'shared —' note on stderr\n");
+                           drop(s, nx); return fail("r33_ok_note"); } }
+            if (ok("r33_healthy_stdout_unchanged")) return 1;
+
+            /* (a) ENOSPC: stdout is /dev/full. */
+            sl->ev_ready = 0; /* (0) spent the slot's one-shot flag — re-arm it */
+            share_evq_push(sl);
+            /* A failed flush leaves the stream's error indicator set for good
+               (glibc), so each case starts from a clean stream. In production the
+               process leaves the loop right after the failure and never writes
+               stdout again, so the stale flag is never observed. */
+            clearerr(stdout);
+            save_out = dup(1); save_err = dup(2);
+            fflush(stdout); fflush(stderr);
+            unlink("/tmp/ntx-ipc-r33-cli.err");
+            int errfd = open("/tmp/ntx-ipc-r33-cli.err", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            if (errfd < 0) { dup2(save_out, 1); close(save_out); dup2(save_err, 2); close(save_err);
+                             drop(s, nx); return fail("r33_errfile"); }
+            dup2(errfd, 2); close(errfd);
+            dup2(efull, 1);
+            fatal = 0; drained = 0;
+            drained = share_drain_events(s, &fatal);
+            fflush(stdout); fflush(stderr);
+            dup2(save_out, 1); dup2(save_err, 2);
+            close(save_out); close(save_err);
+            if (!drained || !fatal) {
+                printf("R33 /dev/full: drained=%d fatal=%d — the magnet was dropped "
+                       "silently and the run would have exited 0\n", drained, fatal);
+                drop(s, nx); return fail("r33_enospc_fatal");
+            }
+            { FILE *rf = fopen("/tmp/ntx-ipc-r33-cli.err", "rb"); char bl[512]; int saw = 0, note = 0;
+              if (!rf) { drop(s, nx); return fail("r33_enospc_read"); }
+              while (fgets(bl, sizeof bl, rf)) {
+                  if (strstr(bl, "ntx: cannot write the magnet")) saw = 1;
+                  if (strstr(bl, "ntx: shared \xe2\x80\x94")) note = 1;
+              }
+              fclose(rf);
+              if (!saw) { printf("R33 /dev/full: no 'cannot write the magnet' on stderr\n");
+                          drop(s, nx); return fail("r33_enospc_msg"); }
+              /* the success note belongs to a link the operator never got */
+              if (note) { printf("R33 /dev/full: 'shared —' note printed next to the failure\n");
+                          drop(s, nx); return fail("r33_enospc_no_note"); } }
+            if (ok("r33_enospc_reports_failure")) return 1;
+
+            /* (b) EPIPE: stdout is a pipe whose read end is already closed. */
+            int pfds[2];
+            if (pipe(pfds) != 0) { drop(s, nx); return fail("r33_pipe"); }
+            close(pfds[0]);
+            sl->ev_ready = 0; /* (a) spent the slot's one-shot flag — re-arm it */
+            share_evq_push(sl);
+            clearerr(stdout); /* (a) left the indicator set; same reasoning as above */
+            save_out = dup(1); save_err = dup(2);
+            fflush(stdout); fflush(stderr);
+            unlink("/tmp/ntx-ipc-r33-pipe.err");
+            errfd = open("/tmp/ntx-ipc-r33-pipe.err", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            if (errfd < 0) { dup2(save_out, 1); close(save_out); dup2(save_err, 2); close(save_err);
+                             close(pfds[1]); drop(s, nx); return fail("r33_pipe_errfile"); }
+            dup2(errfd, 2); close(errfd);
+            dup2(pfds[1], 1);
+            fatal = 0; drained = 0;
+            drained = share_drain_events(s, &fatal);
+            fflush(stdout); fflush(stderr);
+            dup2(save_out, 1); dup2(save_err, 2);
+            close(save_out); close(save_err); close(pfds[1]);
+            if (!drained || !fatal) {
+                printf("R33 closed pipe: drained=%d fatal=%d — EPIPE on the link went "
+                       "unnoticed\n", drained, fatal);
+                drop(s, nx); return fail("r33_epipe_fatal");
+            }
+            { FILE *rf = fopen("/tmp/ntx-ipc-r33-pipe.err", "rb"); char bl[512]; int saw = 0;
+              if (!rf) { drop(s, nx); return fail("r33_epipe_read"); }
+              while (fgets(bl, sizeof bl, rf)) if (strstr(bl, "ntx: cannot write the magnet")) saw = 1;
+              fclose(rf);
+              if (!saw) { printf("R33 closed pipe: no 'cannot write the magnet' on stderr\n");
+                          drop(s, nx); return fail("r33_epipe_msg"); } }
+            /* EPIPE is reported through errno, not through a signal death: the
+               block ran to this line instead of being killed by SIGPIPE. */
+            drop(s, nx);
+            if (ok("r33_epipe_reports_failure")) return 1;
+        }
+    }
+
     return 0; /* tasks append here; keep the final line intact */
 }

@@ -187,8 +187,34 @@ static int share_drain_events(ntx_session *s, int *fatal) {
             return 1;
         }
         ntx_diag_close_status_line(); /* R26: the one closer, same as ntx_diag's */
-        puts(ev.magnet);
-        fflush(stdout);
+        /* R33: the magnet is the deliverable, so a stdout that will not take it
+           (ENOSPC on `ntx --share=f > /dev/full`, EPIPE when the reader of a pipe
+           is gone — SIGPIPE is ignored at the loop entry, so EPIPE is an errno and
+           not a death) must not look like a success. puts + fflush + ferror is the
+           whole check. In CLI mode nothing else writes stdout, so the line sits in
+           the 4 KiB stdio buffer and the flush is ONE write for it: a failed flush
+           drops the bytes still buffered, i.e. the link is not claimed and no
+           prefix of it is left behind. The `shared —` note below is therefore not
+           printed on this path — it would certify a link the operator does not
+           have. The one case stdio cannot make whole-or-nothing is a kernel short
+           write (ENOSPC part-way through a real filesystem); no user-space check
+           fixes that, and every stdio writer shares it.
+           The verdict is the failure branch's own: ntx_diag — the channel of every
+           other diagnostic, so it closes the live status line through the R26 hook
+           (the closer above already ran and is a no-op by now) and mirrors into
+           --log — and fatal = 1, so main leaves the loop with exit 1. A share whose
+           link never arrived has not done the one job `--share` was asked for, and
+           docs/cli.md spells "started but could not continue" as exit 1, not 2:
+           this is no longer the command line, the session is live. */
+        int mag_w = puts(ev.magnet);
+        int mag_f = fflush(stdout);
+        int mag_errno = errno;
+        if (mag_w < 0 || mag_f != 0 || ferror(stdout)) {
+            ntx_diag("ntx: cannot write the magnet to stdout errno=%d — the link was not written\n",
+                     mag_errno);
+            *fatal = 1;
+            return 1;
+        }
         fprintf(stderr, "ntx: shared — %s (torrent %s)\n", ev.name, ev.torrent_path);
         fflush(stderr);
     }
@@ -318,7 +344,22 @@ static int parse_args(int argc, char **argv, ntx_config *cfg, char *proxy_buf, c
         else if (strcmp(a, "--allow-local-peers") == 0) cfg->allow_local_peers = 1;
         else if (strcmp(a, "--utp") == 0) cfg->utp = 1;
         else if (strcmp(a, "--smooth") == 0) cfg->smooth = 1;
-        else if (strncmp(a, "--share-from=", 13) == 0) g_share_from = a + 13;
+        else if (strncmp(a, "--share-from=", 13) == 0) {
+            /* R34: a second --share-from silently replaced the first, so a shell
+               that built the line twice shared the wrong link and said nothing —
+               while its partner --share, three lines down, already refuses a
+               repeat. Same treatment as that one: fixed wording on stderr, return
+               -1, main() prints the hint and exits 2. Only --share-from gains the
+               rule; the last-wins spellings of the plain path options
+               (--store-dir, --https-pin-file, --log) are untouched, and so is a
+               second slot for the same file, which the JSON `share` command may
+               still ask for. */
+            if (g_share_from) {
+                fprintf(stderr, "ntx: --share-from given twice\n");
+                return -1;
+            }
+            g_share_from = a + 13;
+        }
         else if (strncmp(a, "--share=", 8) == 0) {
             /* §9: --share is a torrent source, so it cannot ride a magnet or a
                .torrent argument, and it cannot be given twice. */

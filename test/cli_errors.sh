@@ -96,6 +96,18 @@ expect_exact share-twice        2 'ntx: --share given twice' \
   -- --share="$TMP/plain.bin" --share="$TMP/plain.bin"
 expect_exact share-from-no-share 2 'ntx: --share-from requires --share' \
   -- --share-from="$TMP/junk.torrent"
+# R34: a repeated --share-from was cicho accepted (last one wins) while every
+# other option is strict — the second occurrence is a command-line error, same
+# shape and same exit as `--share given twice`. Order-independent: the duplicate
+# is caught in the parser, before the "--share-from requires --share" check.
+expect_exact share-from-twice 2 'ntx: --share-from given twice' \
+  -- --share="$TMP/plain.bin" --share-from="$TMP/junk.torrent" --share-from="$TMP/empty.torrent"
+expect_exact share-from-twice-before-share 2 'ntx: --share-from given twice' \
+  -- --share-from="$TMP/junk.torrent" --share-from="$TMP/empty.torrent" --share="$TMP/plain.bin"
+# Guards: strictness must stop at the duplicate. One --share-from is still
+# accepted (the verdict below comes from the share module, not the parser), and
+# two --share slots stay the separate error they have always been.
+expect share-from-once-ok  1 'cannot share' -- --share="$TMP/plain.bin" --share-from="$TMP/junk.torrent"
 expect_exact portmap-both       2 'ntx: --port-map and --no-port-map are mutually exclusive' \
   -- --port-map --no-port-map "$MAG"
 expect_exact portmap-with-proxy 2 'ntx: --port-map cannot be used with --proxy or --tunnel (inbound traffic would bypass it and the mapping would reveal your address)' \
