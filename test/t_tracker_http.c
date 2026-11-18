@@ -105,6 +105,134 @@ static int parse_be(const uint8_t *b, size_t n, ntx_be *out) {
     return ntx_be_parse(b, n, out, &c, 16, n) == 0 && out->t == NTX_BE_DICT;
 }
 
+/* ---- S31 / R41 (decision D3): the ANNOUNCE parser tolerates trailing whitespace.
+ *
+ * opentracker-style servers end the announce dictionary with "e\r\n"; ntx_be_parse
+ * requires the input to be consumed exactly (p.pos != n -> error), so such a reply
+ * used to count as a tracker failure (docs/network.md: tr.nyacat.pw, open.ftorrent.com,
+ * tracker.foreverpirates.co). The trim lives in ntx_tracker_http_parse_ex and NEVER in
+ * ntx_be_parse: the strict end-of-input of ntx_be_parse is what makes the raw info
+ * subtree that --share hashes unambiguous (S26/R35 in ntx_share.c requires consumed == rd
+ * on a .torrent, whose hash IS the link). A .torrent is the access key, an HTTP reply is not.
+ *
+ * Tolerated trailing byte set: CR (0x0D), LF (0x0A) and space (0x20) — exactly what the
+ * plan names. A TAB is not tolerated (no surveyed tracker pads with one, so the set stays
+ * as small as the evidence). Everything else is unchanged: whitespace INSIDE the document
+ * is still invalid bencode, a trailing '}' or any other non-whitespace byte is still
+ * rejected, and a body that is whitespace only is still rejected — the trimmed document
+ * is zero-length, which ntx_be_parse does not accept as a successful parse. */
+
+static int r41_parse(const uint8_t *body, size_t n, const char *tail, size_t tn,
+                     uint32_t *interval, uint32_t *seeders, uint32_t *leechers,
+                     uint8_t *ips, uint16_t *ports, char *err, size_t err_cap) {
+    uint8_t tmp[512];
+    int32_t tid = 0;
+    if (n + tn > sizeof tmp) return -2;
+    memcpy(tmp, body, n);
+    if (tn) memcpy(tmp + n, tail, tn);
+    if (err_cap) err[0] = '\0';
+    return ntx_tracker_http_parse_ex(tmp, n + tn, &tid, interval, seeders, leechers,
+                                     ips, ports, 10, NULL, NULL, 0, err, err_cap);
+}
+
+static void expect_np(const char *name, int got, int want, const char *err) {
+    if (got == want) { printf("PASS %s\n", name); return; }
+    printf("FAIL %s (got=%d want=%d err=\"%s\")\n", name, got, want, err);
+    g_fail = 1;
+}
+
+static void test_r41_trailing_whitespace(void) {
+    uint8_t ips[64];
+    uint16_t ports[16];
+    uint32_t interval, seeders, leechers;
+    char err[128];
+    int np;
+
+    /* The three accepted reply shapes from the survey, plus the mixed padding. */
+    static const struct { const char *tag; const char *tail; size_t n; } good[] = {
+        { "crlf", "\r\n", 2 },        { "crlf-crlf", "\r\n\r\n", 4 },
+        { "lf", "\n", 1 },            { "spaces", "   ", 3 },
+        { "mixed", " \r\n ", 4 },
+    };
+    for (size_t k = 0; k < sizeof good / sizeof good[0]; k++) {
+        char tag[64];
+        snprintf(tag, sizeof tag, "http-parse-trailing-%s", good[k].tag);
+        np = r41_parse(dict_body, sizeof dict_body, good[k].tail, good[k].n,
+                       &interval, &seeders, &leechers, ips, ports, err, sizeof err);
+        if (np != 2) { expect_np(tag, np, 2, err); continue; }
+        expect(tag, interval == 1800 && seeders == 3 && leechers == 5 &&
+               ips[0] == 1 && ips[1] == 2 && ips[2] == 3 && ips[3] == 4 && ports[0] == 6881 &&
+               ips[4] == 5 && ips[5] == 6 && ips[6] == 7 && ips[7] == 8 && ports[1] == 6882 &&
+               err[0] == '\0');
+    }
+
+    /* Every byte the trim must NOT swallow. */
+    static const struct { const char *tag; const char *tail; size_t n; } bad[] = {
+        { "brace", "}", 1 },          { "second-doc", "e", 1 },
+        { "nul", "\x00", 1 },         { "tab", "\t", 1 },
+        { "junk", "xx", 2 },          { "brace-crlf", "}\r\n ", 4 },
+    };
+    /* The tail lengths are chosen so that sizeof dict_body + n is never a multiple of 6:
+     * below the bencode path there is a fallback that reads a length-multiple-of-6 body as
+     * raw compact peers, and a tail that lands on that alignment is answered by the
+     * fallback, not by the trim (pre-existing behaviour, unrelated to R41). */
+    for (size_t k = 0; k < sizeof bad / sizeof bad[0]; k++) {
+        char tag[64];
+        snprintf(tag, sizeof tag, "http-parse-trailing-%s", bad[k].tag);
+        np = r41_parse(dict_body, sizeof dict_body, bad[k].tail, bad[k].n,
+                       &interval, &seeders, &leechers, ips, ports, err, sizeof err);
+        expect_np(tag, np, -1, err);
+    }
+
+    /* Whitespace INSIDE the document is still invalid bencode: a space in the middle of
+     * the interval integer, and a space between two dict entries. */
+    {
+        uint8_t tmp[512];
+        int32_t tid = 0;
+        size_t mid = 0;
+        while (dict_body[mid] != '1' || dict_body[mid + 1] != '8') mid++; /* "i1800e" */
+        memcpy(tmp, dict_body, mid);
+        tmp[mid] = ' ';
+        memcpy(tmp + mid + 1, dict_body + mid, sizeof dict_body - mid);
+        expect_np("http-parse-inner-space-in-int",
+                  ntx_tracker_http_parse_ex(tmp, sizeof dict_body + 1, &tid, &interval, &seeders,
+                                            &leechers, ips, ports, 10, NULL, NULL, 0,
+                                            err, sizeof err), -1, err);
+        memcpy(tmp, dict_body, mid);
+        tmp[mid] = ' ';
+        memcpy(tmp + mid + 1, dict_body + mid, sizeof dict_body - mid);
+        memcpy(tmp + sizeof dict_body + 1, " \r\n", 3);
+        expect_np("http-parse-inner-space-trailing-crlf",
+                  ntx_tracker_http_parse_ex(tmp, sizeof dict_body + 4, &tid, &interval, &seeders,
+                                            &leechers, ips, ports, 10, NULL, NULL, 0,
+                                            err, sizeof err), -1, err);
+    }
+
+    /* A body of nothing but whitespace is not a response: trimmed it is a zero-length
+     * document, which must not be reported as a successful parse. */
+    static const struct { const char *tag; const char *body; size_t n; } blank[] = {
+        { "crlf-only", "\r\n", 2 },   { "spaces-only", "   ", 3 },
+        { "mixed-only", " \r\n\t ", 5 },
+        /* Length a multiple of 6: below the bencode path there is a fallback that reads
+         * such a body as raw compact peers, so pre-fix these were ACCEPTED as one and two
+         * garbage peers. The trimmed-to-nothing reply must be rejected before that. */
+        { "six-spaces", "      ", 6 }, { "twelve", " \r\n \r\n \r\n \r\n", 12 },
+    };
+    for (size_t k = 0; k < sizeof blank / sizeof blank[0]; k++) {
+        char tag[64];
+        snprintf(tag, sizeof tag, "http-parse-blank-%s", blank[k].tag);
+        np = r41_parse((const uint8_t *)blank[k].body, 0, blank[k].body, blank[k].n,
+                       &interval, &seeders, &leechers, ips, ports, err, sizeof err);
+        expect_np(tag, np, -1, err);
+    }
+
+    /* Guard on the untouched edge: an empty body keeps its existing verdict (the bencode
+     * path fails, the compact path sees 0 % 6 and reports zero peers, not -1). */
+    np = r41_parse((const uint8_t *)"", 0, "", 0, &interval, &seeders, &leechers,
+                   ips, ports, err, sizeof err);
+    expect_np("http-parse-empty-body-unchanged", np, 0, err);
+}
+
 static void test_http_connect_v4_loopback(void) {
     uint16_t port = (uint16_t)(40000 + (getpid() % 5000));
     int lfd = ntx_sock_tcp4();
@@ -256,6 +384,8 @@ int main(void) {
     } else {
         expect("http-parse-dict-ignores-v6", 0);
     }
+
+    test_r41_trailing_whitespace();
 
     test_http_connect_v4_loopback();
     test_http_connect_v6_loopback();

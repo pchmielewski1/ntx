@@ -181,7 +181,26 @@ int ntx_tracker_http_parse_ex(const uint8_t *buf, size_t n, int32_t *trans_id_un
 
     ntx_be be;
     size_t consumed = 0;
-    int rc = ntx_be_parse(buf, n, &be, &consumed, 16, n);
+    /* S31/R41 (decision D3): opentracker-style servers end the announce dictionary with
+     * "e\r\n". ntx_be_parse is exact — it fails unless it consumes every byte — so such a
+     * reply used to be an "unrecognized response" and the announce counted as a failure.
+     * The tolerance is introduced HERE and never inside ntx_be_parse: that parser's strict
+     * end-of-input is what makes the raw info subtree --share hashes unambiguous (S26/R35
+     * requires consumed == rd for a .torrent, whose info-hash IS the access link). Tolerated
+     * trailing bytes: CR (0x0D), LF (0x0A) and space (0x20) only — the set the survey needs;
+     * a TAB is not tolerated. Whitespace inside the document stays invalid bencode, and any
+     * other trailing byte is still rejected. The trim stops the bencode attempt: the compact
+     * fallback below reads the ORIGINAL n, because its bytes are binary and a trailing 0x0D
+     * 0x0A there is a port number (3338), not padding. A body that is nothing but whitespace
+     * is rejected outright: an empty document is not a response, and without the guard a
+     * six-space body would reach that fallback and come back as one peer 32.32.32.32:8224. */
+    size_t tn = n;
+    while (tn > 0 && (buf[tn - 1] == '\r' || buf[tn - 1] == '\n' || buf[tn - 1] == ' ')) tn--;
+    if (n > 0 && tn == 0) { /* nothing but padding: not a response of any shape */
+        if (error && err_cap > 0) snprintf(error, err_cap, "unrecognized response");
+        return -1;
+    }
+    int rc = ntx_be_parse(buf, tn, &be, &consumed, 16, tn);
     if (rc == 0 && be.t == NTX_BE_DICT) {
         int count = http_parse_dict_ex(&be, interval, seeders, leechers, ips4, ports4, max4,
                                        ips6, ports6, max6, error, err_cap);

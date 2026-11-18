@@ -409,11 +409,18 @@ they explain the C1 results:
 
   The same build before `5d46511` returned `FAIL … announce1: http/tls failure` for both. The
   remaining C1 cells stay as measured with the stub; re-measure them at I1 with the fixed resolver.
-- **Bencode bodies terminated with `CRLF`.** opentracker-style servers end the announce
+- **Bencode bodies terminated with `CRLF`** (fixed by `fix(tracker): tolerate trailing
+  whitespace in an announce response [R41]`). opentracker-style servers end the announce
   dictionary with `e\r\n`. `ntx_be_parse` requires the input to be consumed exactly
-  (`p.pos != n` → error), so `ntx_tracker_http_parse` answers "unrecognized response" and the
-  announce counts as a failure — the three `…e\r\n` rejections above. Peers behind such trackers
-  are unreachable for `ntx` even though the announce itself was accepted.
+  (`p.pos != n` → error), so `ntx_tracker_http_parse` used to answer "unrecognized response" and
+  the announce counted as a failure — the three `…e\r\n` rejections above; the cells stay as
+  measured. `ntx_tracker_http_parse_ex` now trims trailing `CR`, `LF` and `space` off the body
+  before handing it to `ntx_be_parse`, so those three hosts parse. The trim is confined to the
+  announce parser: a whitespace-padded reply is still a valid announce, while a `.torrent` must
+  stay byte-exact, because the strict end-of-input of `ntx_be_parse` is what makes the raw
+  `info` subtree that `--share` hashes unambiguous (S26/R35 in `ntx_share.c`). Only those three
+  bytes are tolerated — a trailing `TAB`, `}` or any other byte is still a failure — and a body
+  that is nothing but whitespace is rejected rather than read as an empty document.
 
 Unpinned HTTPS is **not** refused today: TOFU is on by default, so the survey run stored a new
 pin for every host contacted (`ntx: TOFU new pin: <host> (spki=…)` on stderr). Share mode must
