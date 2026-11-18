@@ -6,14 +6,18 @@
 # What it proves, in one run of a build whose share-tracker table is pinned to a
 # throwaway local HTTPS tracker:
 #   1. `--share` of a 5 MiB random file reaches ready and prints its magnet on
-#      stdout (docs/cli.md "Private shares" step 5);
+#      stdout — as that stream's only line, with every diagnostic on stderr
+#      (docs/cli.md "Private shares" step 5); under --stats-json the link travels
+#      only inside the JSON share event and nothing raw reaches stdout;
 #   2. a second ntx leeches that magnet through the pinned HTTPS tracker to
 #      completion and the bytes match byte for byte;
 #   3. the tracker saw two distinct peers for the hash and never a /scrape
 #      without info_hash;
 #   4. neither the share nor the leech produced any dht/pex diagnostic — BEP 27;
-#   5. the .torrent written into store-dir A is mode 0600 and the shared file's
-#      mtime is untouched (the share is read-only, §5.1/§5.4);
+#   5. the seed's store-dir A is created BY `--share` itself — mode 0700, and the
+#      .torrent written into it is mode 0600 — while the shared file's mtime stays
+#      untouched (the share is read-only, §5.1/§5.4; R2: the script must not
+#      pre-create A, or the "created on demand" promise is never exercised);
 #   6. an inbound plaintext handshake for the shared hash is torn down with zero
 #      bytes sent back (§7.1 strict MSE), observed against the seed's own listen
 #      port with test/interop/v2/hs_capture.py's own helpers (imported only).
@@ -123,7 +127,15 @@ done
 [ -d src ] || fail "must run from the repo root (no src/ here)"
 
 rm -rf "$WORK" 2>/dev/null || true
-mkdir -p "$SRC" "$A" "$B" "$CERTS" || fail "cannot create $WORK"
+# $A (the seed's store dir) is deliberately NOT created: docs/cli.md promises
+# "<store-dir> is created if missing (mode 0700 ...)" for a share, and creating it
+# here would make that promise untestable — this is the end-to-end half of R2
+# (the CLI half is test/cli_errors.sh's share-store-created-on-demand). `--share`
+# must create it itself, and assertion 4 below proves it did by finding the 0600
+# .torrent inside it. $B is created up front because the LEECH only writes a
+# download there; ntx_store creates it too, but the leech is not the subject of
+# this assertion.
+mkdir -p "$SRC" "$B" "$CERTS" || fail "cannot create $WORK"
 
 # Build flags mirror the ntx-sharetest recipe, so the only difference from
 # `make ntx-sharetest` is the rendered tracker table and the output name.
@@ -205,14 +217,34 @@ spawn
 SEED_PID=$!
 # docs/cli.md: the magnet goes to stdout once a share tracker answered; this is
 # the same line `ntx --share=f > link.txt` is documented to produce.
-poll 60 "$WORK/magnet.txt" '^magnet:?xt=urn:btih:' \
-    || fail "magnet not emitted within 60s" "$WORK/seed.err" "$WORK/seed.diag.log" "$WORK/tracker.log" "$WORK/tracker.err"
+# R2: this is also the end-to-end proof that --share created A on its own — with
+# the store dir missing and nothing else touching it, a share that cannot write
+# its .torrent dies here, so the message names that fact instead of just
+# "no magnet".
+if ! poll 60 "$WORK/magnet.txt" '^magnet:?xt=urn:btih:'; then
+    if [ ! -d "$A" ]; then
+        fail "r2: --share never created its store dir $A and never emitted a magnet" \
+            "$WORK/seed.err" "$WORK/seed.diag.log" "$WORK/tracker.log" "$WORK/tracker.err"
+    fi
+    fail "magnet not emitted within 60s (store A exists, $(find "$A" -maxdepth 1 -type f -name '*.torrent' 2>/dev/null | wc -l) .torrent(s) in it)" \
+        "$WORK/seed.err" "$WORK/seed.diag.log" "$WORK/tracker.log" "$WORK/tracker.err"
+fi
 MAG=$(grep '^magnet:?xt=urn:btih:' "$WORK/magnet.txt" | head -n 1)
 IH=$(printf '%s' "$MAG" | sed -n 's/.*urn:btih:\([0-9a-f]\{40\}\).*/\1/p')
 [ "${#IH}" -eq 40 ] || fail "magnet carries no 40-hex urn:btih" "$WORK/magnet.txt"
 if ! grep -q "tr=https%3A%2F%2F$IP_A%3A$PORT%2Fannounce" "$WORK/magnet.txt"; then
     fail "magnet has no tr= for the pinned tracker" "$WORK/magnet.txt"
 fi
+# stdout is the link and nothing else: docs/cli.md step 5 makes `ntx --share=f >
+# link.txt` a file ntx itself accepts, so the seed's whole stdout must be exactly
+# the one magnet line — the banner, the status line and the `shared —` note belong
+# on stderr, which the assertions below (dht/pex, plaintext_strict_share) read.
+OUT_LINES=$(wc -l < "$WORK/magnet.txt" | tr -d ' \t')
+MAG_LINES=$(count "$WORK/magnet.txt" '^magnet:?xt=urn:btih:')
+[ "$MAG_LINES" -eq 1 ] || fail "stdout carries $MAG_LINES magnet line(s), want exactly 1" "$WORK/magnet.txt"
+[ "$OUT_LINES" -eq 1 ] || { printf 'FAIL share_e2e: stdout holds %s line(s), want the magnet only\n' "$OUT_LINES"; head -n 5 "$WORK/magnet.txt" | cut -c1-160; exit 1; }
+grep -q '^ntx: build ' "$WORK/seed.err" || fail "the banner is not on stderr" "$WORK/seed.err"
+say "seed: stdout is the magnet alone (1 line)"
 say "seed: ready, ih=$IH"
 
 # ---------------------------------------------------------------- leech ------
@@ -249,7 +281,12 @@ for log in seed.err seed.diag.log leech.err leech.diag.log; do
     [ "$N" -eq 0 ] || { printf 'FAIL share_e2e: %s contains dht/pex line(s)\n' "$log"; grep -inE 'dht|pex' "$WORK/$log" | head -n 5; exit 1; }
 done
 
-# 4 — the .torrent written by the share is 0600
+# 4 — the .torrent written by the share is 0600, and store dir A itself is the
+# 0700 directory --share created for it (R2: A was never created by this script,
+# so finding these files inside it is the proof that the share made the dir).
+[ -d "$A" ] || fail "store A was never created — --share did not create its store dir on demand"
+AMODE=$(stat -c '%a' "$A")
+[ "$AMODE" = "700" ] || fail "store A has mode $AMODE, want 700 (docs/cli.md: created mode 0700)"
 TR_COUNT=$(find "$A" -maxdepth 1 -type f -name '*.torrent' | wc -l)
 [ "$TR_COUNT" -eq 1 ] || fail "expected exactly 1 .torrent in store A, found $TR_COUNT"
 TORRENT=$(find "$A" -maxdepth 1 -type f -name '*.torrent' | head -n 1)
@@ -417,7 +454,16 @@ poll 20 "$WORK/r4j.ndjson" '"type":"share","i":0,"ok":0,"code":"changed"' \
     || fail "r4: no ok:0 changed event after the file changed" "$WORK/r4j.ndjson" "$WORK/r4j.err"
 R4EV=$(count "$WORK/r4j.ndjson" '"type":"share"')
 [ "$R4EV" -eq 2 ] || fail "r4: $R4EV share event lines, want exactly 2 (ready + error)" "$WORK/r4j.ndjson"
-say "r4: JSON reported the failure as the slot's second share event"
+# Under --stats-json the link travels inside the JSON share event and NOTHING raw
+# may reach stdout (§9/C3): share_drain_events is CLI mode's emitter, so a ready
+# JSON share must not also print the bare `magnet:` line. A line starting with
+# `magnet:` is the failure here even though the event carries the same link under
+# its "magnet" key.
+RAW_MAG=$(count "$WORK/r4j.ndjson" '^magnet:')
+[ "$RAW_MAG" -eq 0 ] || { printf 'FAIL share_e2e: r4j: %s raw magnet line(s) on stdout under --stats-json\n' "$RAW_MAG"; grep -n '^magnet:' "$WORK/r4j.ndjson" | head -n 3 | cut -c1-160; exit 1; }
+grep -q '"type":"share","i":0,"ok":1,"ih":' "$WORK/r4j.ndjson" \
+    || fail "r4: the ready share event carries no ih field" "$WORK/r4j.ndjson"
+say "r4: JSON reported the failure as the slot's second share event, stdout stayed NDJSON"
 
 # --------------------------------------------------------------- wrap-up -----
 kill "$SEED_PID" 2>/dev/null || true
