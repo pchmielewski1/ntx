@@ -1826,10 +1826,10 @@ static int pm_open(struct ntx_portmap *pm) {
      * gateway refuses still keeps it. The call reads gw6_seen/gw6, writes only the
      * fd6/gw6_* fields, and cannot move the v4 state: `st`, `phase`, `tries`, `gap`,
      * `next_try` and the grants stay whatever the v4 path leaves them.
-     * ponytail: the ceiling is that the connected v6 socket is not yet reported
-     * anywhere (`st` is still the v4 sequence's alone, which is why a v6-only host
-     * still reads NONE). Upgrade path: S17d adds port_map6/ext_port6 and aggregates
-     * the two families into the reported `port_map`. */
+     * The v6 socket is reported in its own right: pm_set_st6 keeps `s6.st` and
+     * ntx_session_portmap_state6 exposes it, so stats.c:214 publishes `port_map6` and
+     * `ext_port6` (S17d) and `port_map` is the aggregate of the two — a v6-only host
+     * no longer reads NONE. */
     (void)pm_open6(pm);
     /* No v4 route means no v4 gateway to dial: the v6 nexthop cannot be widened into
      * one (that v4-mapped read is R15), and the socket here is AF_INET. */
@@ -2108,16 +2108,15 @@ ntx_pm_state ntx_session_portmap_state(const struct ntx_session *s) {
     return s->pm ? s->pm->st : NTX_PM_OFF;
 }
 
-/* S17c exposes the v6 family's own state and granted port, and nothing reads them
- * yet: ntx_session_portmap_state() — the value stats' `port_map` carries — keeps its
- * v4-only meaning until S17d aggregates the families and renders `port_map6` /
- * `ext_port6`. The distinction that matters for that aggregation is OFF vs the rest:
- * the v6 half was never brought up for this sequence (no route, no driver, mapping
- * off), whereas PENDING/ACTIVE/NONE are verdicts, including the §8 skip of a host
- * with no routable client address.
+/* S17c exposes the v6 family's own state and granted port; since S17d stats reads
+ * both — `port_map6`/`ext_port6` carry them verbatim and stats_pm_merge() folds the
+ * two families into `port_map`. The distinction that matters for that aggregation is
+ * OFF vs the rest: the v6 half was never brought up for this sequence (no route, no
+ * driver, mapping off), whereas PENDING/ACTIVE/NONE are verdicts, including the §8
+ * skip of a host with no routable client address.
  * ponytail: the ceiling is that NONE does not distinguish "gateway refused" from "no
- * routable client address" from "schedule ran out"; the diag lines do. Upgrade path is
- * S17d's stats, which wants one number and not the reason. */
+ * routable client address" from "schedule ran out"; the diag lines do, and stats
+ * wants one number and not the reason. */
 ntx_pm_state ntx_session_portmap_state6(const struct ntx_session *s) {
     return s->pm ? (ntx_pm_state)s->pm->s6.st : NTX_PM_OFF;
 }
