@@ -268,6 +268,147 @@ else
   fails=$((fails + 1))
 fi
 
+# ── the share size ceiling (§5.6, docs/cli.md "Validation and exit codes") ────
+# `too_big` is the one synchronous reason the plan's §6 still had no CLI case for:
+# t_share_session.c and t_share_contract.c cover the enum and the wire code, so
+# nothing proved the CLI ever refused an over-large file with the documented text.
+# The ceiling is NTX_SHARE_MAX_PIECES (32768) pieces at NTX_SHARE_PIECE_MAX
+# (64 MiB), decided by smeta_piece_len() from the stat alone — so one piece over
+# 32768 * 64 MiB is enough and the file is never read. It is SPARSE (dd `seek=`,
+# no blocks allocated), so the case costs a stat, not two terabytes.
+dd if=/dev/zero of="$TMP/huge.bin" bs=67108864 count=0 seek=32769 >/dev/null 2>&1
+if [ "$(stat -c%s "$TMP/huge.bin" 2>/dev/null)" = "2199090364416" ]; then
+  expect_exact share-too-big 1 "ntx: cannot share $TMP/huge.bin: file too large to share" \
+    -- --share="$TMP/huge.bin"
+  # Synchronous like every other reason: the piece ceiling is a stat, so a 2 TiB
+  # file must be refused before any hashing, and nothing may reach the store dir.
+  t0=$(date +%s)
+  timeout -k 1 20 ./ntx --store-dir="$TMP/toobig-store" --share="$TMP/huge.bin" \
+    --no-port-map --port-lo=0 --port-hi=0 --proxy=socks5:127.0.0.1:9 \
+    >"$TMP/out" 2>"$TMP/err" </dev/null
+  rc=$?
+  el=$(( $(date +%s) - t0 ))
+  n=$(find "$TMP/toobig-store" -maxdepth 1 -type f -name '*.torrent' 2>/dev/null | wc -l)
+  if [ "$rc" -eq 1 ] && [ "$el" -le 5 ] && [ "$n" -eq 0 ] \
+     && grep -Fq 'file too large to share' "$TMP/err" \
+     && ! grep -Fq 'cannot read the file' "$TMP/err"; then
+    echo "PASS share-too-big-early"
+  else
+    echo "FAIL share-too-big-early: exit $rc after ${el}s, torrent=$n, want 1 fast, no .torrent, 'file too large to share'" >&2
+    sed 's/^/    | /' "$TMP/err" | head -5 >&2
+    fails=$((fails + 1))
+  fi
+else
+  echo "SKIP share-too-big (no sparse files on this filesystem)" >&2
+fi
+
+# ── an empty --share= value ───────────────────────────────────────────────────
+# `--share=` with nothing after the equals sign is not "no share": g_share_path
+# becomes the empty string, the option is set, so it is the share module's
+# bad_arg (`invalid share argument`) and not the parser's — and it must not be
+# mistaken for a read error, which is what a missing path would say.
+expect_exact share-empty-value 1 'ntx: cannot share : invalid share argument' \
+  -- --share=
+
+# ── a --share-from that describes a DIFFERENT file (§5.6, docs/cli.md) ────────
+# docs/cli.md: "under --share-from the hashes are compared instead of published,
+# and a mismatch is the `changed` failure, never a share under a wrong link".
+# Only a rejected .torrent (junk, missing) was covered here; a VALID one for the
+# wrong bytes is the case that matters — it is the one where publishing would
+# hand out a link that does not describe the file being seeded. The pair comes
+# from the committed metainfo fixture (test/scripts/share_gen.py): meta.torrent
+# is valid, its data.bin is the file it really describes, and a fresh 16 KiB of
+# noise has the same length but different hashes. Skipped where the vectors are
+# not next to this script, as in the riscv scratch root of
+# scripts/riscv/run-shell-suites.sh.
+VEC="$ROOT/test/vectors/share/one_piece_16k"
+if [ -f "$VEC/meta.torrent" ] && [ -f "$VEC/data.bin" ]; then
+  dd if=/dev/urandom of="$TMP/other-16k.bin" bs=16384 count=1 >/dev/null 2>&1
+  if [ "$(stat -c%s "$TMP/other-16k.bin" 2>/dev/null)" = "16384" ]; then
+    # exit 1 is CLI mode's verdict for a share that died after being added; the
+    # reason is `changed`, the store dir gets no .torrent and stdout no magnet.
+    timeout -k 1 20 ./ntx --store-dir="$TMP/mismatch-store" \
+      --no-port-map --port-lo=0 --port-hi=0 --proxy=socks5:127.0.0.1:9 \
+      --share="$TMP/other-16k.bin" --share-from="$VEC/meta.torrent" \
+      >"$TMP/out" 2>"$TMP/err" </dev/null
+    rc=$?
+    n=$(find "$TMP/mismatch-store" -maxdepth 1 -type f -name '*.torrent' 2>/dev/null | wc -l)
+    if [ "$rc" -eq 1 ] && [ "$n" -eq 0 ] && ! grep -q '^magnet:' "$TMP/out" \
+       && grep -Fxq 'ntx: share failed: the file changed while sharing' "$TMP/err"; then
+      echo "PASS share-from-hash-mismatch"
+    else
+      echo "FAIL share-from-hash-mismatch: exit $rc, torrent=$n, want 1 + 0 + the exact 'share failed: the file changed while sharing' line and no magnet on stdout" >&2
+      printf '%s\n' '    want| ntx: share failed: the file changed while sharing' >&2
+      sed 's/^/    got | /' "$TMP/err" | head -5 >&2
+      tail -3 "$TMP/out" | cut -c1-160 | sed 's/^/    out | /' >&2
+      fails=$((fails + 1))
+    fi
+    # Non-vacuity: the SAME .torrent with the file it really describes must not be
+    # refused — an assertion that fires for every --share-from would pass here too.
+    # The share then announces, so `timeout` ends it (124); what is pinned is that
+    # it never said `share failed`.
+    timeout -k 1 3 ./ntx --store-dir="$TMP/match-store" \
+      --no-port-map --port-lo=0 --port-hi=0 --proxy=socks5:127.0.0.1:9 \
+      --share="$VEC/data.bin" --share-from="$VEC/meta.torrent" \
+      >"$TMP/out" 2>"$TMP/err" </dev/null
+    rc=$?
+    if [ "$rc" -eq 124 ] && ! grep -Fq 'share failed' "$TMP/err" \
+       && ! grep -Fq 'cannot share' "$TMP/err"; then
+      echo "PASS share-from-matching-torrent-ok"
+    else
+      echo "FAIL share-from-matching-torrent-ok: exit $rc, want 124 (still running) with no share failure for the file the .torrent describes" >&2
+      sed 's/^/    | /' "$TMP/err" | head -5 >&2
+      fails=$((fails + 1))
+    fi
+  else
+    echo "SKIP share-from-hash-mismatch (cannot write the 16 KiB payload)" >&2
+  fi
+else
+  echo "SKIP share-from-hash-mismatch (no test/vectors/share here)" >&2
+fi
+
+# ── stdout carries the magnet and nothing else (docs/cli.md step 5) ───────────
+# `ntx --share=FILE > link.txt` is documented to produce a file ntx itself
+# accepts, so stdout holds exactly one line — the magnet — and every diagnostic
+# (banner, status line, `shared —` note) stays on stderr. No tracker answers in
+# this file, so a share here never reaches ready and the half that is provable
+# without one is the SHAPE of stdout, which must hold in both states: empty
+# while the share is not ready, or exactly one magnet line — never a second line
+# and never anything that is not the link. Under --stats-json the same rule is
+# stricter still (nothing raw may touch stdout, §9/C3), so `--stats-json
+# --share=…` must emit NDJSON only and never a bare `magnet:` line. The positive
+# half — the ready magnet really is stdout's single line, and the JSON share
+# event really carries the link — is share_e2e.sh, where a tracker answers.
+start_share "$TMP/mag-cli"
+rc=1
+if poll_for 40 "$TMP/mag-cli"; then rc=0; fi
+stop_share
+out_lines=$(wc -l < "$TMP/out" | tr -d ' \t')
+mag_lines=$(grep -c '^magnet:?xt=urn:btih:' "$TMP/out" 2>/dev/null || true)
+mag_lines=${mag_lines:-0}
+if [ "$rc" -eq 0 ] && [ "$out_lines" -le "$mag_lines" ] && [ "$mag_lines" -le 1 ] \
+   && [ -s "$TMP/err" ] && grep -Fq 'ntx: build ' "$TMP/err"; then
+  echo "PASS share-magnet-is-stdout-only"
+else
+  echo "FAIL share-magnet-is-stdout-only: hashed=$rc, stdout=$out_lines line(s) of which $mag_lines magnet line(s), want <=1 line and it must be the magnet, with the banner on stderr" >&2
+  head -3 "$TMP/out" | cut -c1-160 | sed 's/^/    out| /' >&2
+  head -3 "$TMP/err" | cut -c1-160 | sed 's/^/    err| /' >&2
+  fails=$((fails + 1))
+fi
+
+start_share "$TMP/mag-json" --stats-json
+rc=1
+if poll_for 40 "$TMP/mag-json"; then rc=0; fi
+stop_share
+if [ "$rc" -eq 0 ] && grep -q '"type":"stats"' "$TMP/out" && ! grep -q '^magnet:' "$TMP/out"; then
+  echo "PASS no-raw-magnet-on-json-stdout"
+else
+  echo "FAIL no-raw-magnet-on-json-stdout: hashed=$rc, want stats lines on stdout and no raw magnet line" >&2
+  grep -n '^magnet:' "$TMP/out" | head -3 | cut -c1-160 | sed 's/^/    out| /' >&2
+  tail -2 "$TMP/out" | cut -c1-160 | sed 's/^/    out| /' >&2
+  fails=$((fails + 1))
+fi
+
 # Valid spellings must still be accepted: the client keeps running until `timeout`
 # kills it (124). Proxy points at a closed local port, so nothing leaves the host.
 expect valid-options-run 124 - -- --port-lo=0 --port-hi=0 --max-peers=0 --down-limit=0 \
