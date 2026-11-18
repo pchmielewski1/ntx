@@ -327,9 +327,10 @@ trackers at all, not to a reduced set. `make pins-check` will demand a re-pin ro
 "one CDN, seven hostnames", not as diversity. The two-pass survey over 27 candidate hosts found no
 qualified host outside Cloudflare (see the second table), so removing the risk needs either a
 non-CDN candidate from outside these two public lists or an explicit decision to accept it.
-**Therefore `--share` must not ship yet** — three things are outstanding: TOFU must be bypassed for
-share hosts (§6.1, Task 1), C1 must be re-measured with the unmodified binary on a dual-stack host,
-and the C5 single-operator risk must be fixed or explicitly accepted.
+
+2026-11-14: partner przyjął ryzyko jednego operatora (C5 / §6.4): wszystkie zakwalifikowane trackery
+stoją za Cloudflare; rotacja klucza albo awaria CDN wyłącza udostępnianie we wszystkich wydanych
+binarkach.
 
 `tracker.zhuqiy.com` is the one judgement call on C4. Only "leaks nothing" was recorded in the
 first pass, which is not defensible on its own, so it was re-measured with headers and bytes
@@ -422,11 +423,12 @@ they explain the C1 results:
   bytes are tolerated — a trailing `TAB`, `}` or any other byte is still a failure — and a body
   that is nothing but whitespace is rejected rather than read as an empty document.
 
-Unpinned HTTPS is **not** refused today: TOFU is on by default, so the survey run stored a new
-pin for every host contacted (`ntx: TOFU new pin: <host> (spki=…)` on stderr). Share mode must
-take its pins from the built-in pool with TOFU disabled (§6.1), which is Task 1 work. That is the
-first of the three outstanding items listed in the gate paragraph above — the ship verdict is
-stated there once, and it is **do not ship `--share` yet**.
+Unpinned HTTPS is **not** refused for ordinary hosts: TOFU is on by default, which is how the survey
+run stored a new pin for every host contacted (`ntx: TOFU new pin: <host> (spki=…)` on stderr). That
+no longer applies to sharing: a host named in the share table is fail-closed — its pin comes from the
+built-in table only, and `ntx_https_tofu_note` refuses it, so no share host is ever trusted on first
+sight (§6.1, implemented; see [Fail-closed trust for share hosts](#fail-closed-trust-for-share-hosts)
+below).
 
 ## Share trackers and pinned keys
 

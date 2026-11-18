@@ -363,6 +363,7 @@ osobiście.
   wejść do repozytorium, ale `--share` i komenda `share` są wtedy niedostępne w
   wydaniu: brak w `--help` i `caps`, a próba użycia daje błąd `no_trackers`. Brama z
   §6.2 pilnuje tego automatycznie.
+- Decyzja 2026-11-14: partner przyjmuje ryzyko jednego operatora; patrz `docs/network.md`.
 
 ## 7. Wymuszone szyfrowanie: tylko udostępnienia [partner]
 
