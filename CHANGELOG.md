@@ -35,6 +35,114 @@
   design §8, which asks for both families. The parser follows the kernel format now and the test
   fixture is a real `cat /proc/net/ipv6_route`, including the `lo` blackhole line (`metric
   ffffffff`, `RTF_REJECT`) that a `dst`-and-`dpl`-only check would have accepted.
+- **The MSE responder no longer answers with another slot's hash.** After `pe_verify_skey` it built
+  its reply from the *first live* torrent slot, so in a session holding a share and any other torrent
+  a peer that knew the second hash read the share's link out of the decrypted reply, and a share on a
+  slot other than the first was often simply unreachable (the client gets a foreign hash and drops
+  the connection). The reply is now built inside `PE_ST_RECV_HS` from the slot the SKEY matched and
+  is refused — at the cost of zero bytes — unless the initiator's own handshake resolves to that
+  same slot. A slot that is not serving is never matchable either: the all-zero hash of a share still
+  hashing was accepted by the inbound plaintext matcher and offered as an MSE SKEY candidate, and
+  since the zero hash is public knowledge anyone could pass MSE and land on a share whose bytes are
+  not verified yet. One gate now covers the v1 loop, the BEP 52 v2 upgrade loop and the candidate
+  list; plain torrent slots behave exactly as before. `docs/protocol.md`, `SECURITY.md`.
+- **A share is published only over bytes it can still prove.** `--store-dir` is created at the end of
+  the synchronous gate — parents `0755`, the leaf `0700` because it holds `.torrent` files, which are
+  access keys, `chmod`ed so the umask cannot widen it, an existing final component refused unless it
+  is a real directory — and writability is proven with one `O_CREAT | O_EXCL` probe rather than
+  `access(W_OK)`, which is a lie for root. Before, a missing store dir was paid for with the whole
+  hash and then answered `io` with "cannot read the file" for a *write* failure; it is an immediate
+  `io` now, and the failure names the destination. The `st_dev`/`st_ino`/`st_size`/`st_mtime`/`st_ctim`
+  snapshot is taken from the descriptor at open and re-checked before anything is built, written or
+  announced, so a byte edited during hashing ends the share as `changed` with no `.torrent` and no
+  magnet instead of publishing a link whose pieces fail forever, and a file that lost bytes under the
+  hash (`pread` 0) is `changed`, not `io`. `docs/storage.md`, `docs/cli.md`, `docs/json-api.md`.
+- **A failed share looks failed.** An error that followed its `ready` event was dropped on the floor
+  (the slot's one event had already been spent), so the CLI kept seeding a dead share and a JSON
+  consumer never saw `ok:0`; the two facts — a ready event and an error event — are separate now, each
+  set only once the event is really queued, a full queue delays instead of dropping, and `ok:1` always
+  precedes `ok:0` for an `i`. Both failure paths halt through one act: exactly one `stopped`, the
+  slot's peers dropped through the normal teardown, the announce schedule cleared after the drops so a
+  departing peer cannot re-arm it, and new handshakes naming the real hash refused. A failed share
+  reports `phase: "fail"` with a zeroed hash in stats, keeps announcing nothing, and never sends a
+  `stopped` for a swarm whose `started` was never answered. `docs/json-api.md`, `docs/cli.md`.
+- **A dead HTTPS tracker costs 0.9 s, not 30.7 s.** Five unreachable share trackers (the size of the
+  built-in pool) held the whole session loop for 153 s while TLS waited out its 15 s I/O timeout and
+  the 1.2 fallback waited out another, with JSON, IPC, DHT and every peer waiting; each announce now
+  carries a 900 ms budget that every blocking wait inside it clamps itself to, and the fetch dies as
+  an ordinary connect failure — one strike, dead after the usual count, revived by the share's own
+  revival. Measured: 964 ms worst iteration, 4.8 s for the five. `started_ok` is set by the reply to
+  the request that carried `started` instead of by whatever event the slot happened to hold, so an
+  answered `started` no longer leaves a share in `ANNOUNCING` forever (and owing no goodbye), a `none`
+  reply buys no `READY` it did not earn, and a BEP 15 connect answer no longer marks a share ready
+  before its `started` was sent. An announce response whose bencode ends in `\r`, `\n` or spaces is
+  accepted now — the share-tracker survey lost three hosts to those two trailing bytes, not to TLS.
+  A `.torrent` stays an exact document; the strict parser behind the share hash gates is deliberately
+  not relaxed. `docs/network.md`.
+- **Every share request gets an answer, and a bad one gets refused.** A queued share event whose JSON
+  could not be built (an escape refusal, a line over the cap) vanished after being dequeued, leaving
+  the consumer waiting forever for that `i`; it now emits the §11 failure shape for the same slot,
+  `{"type":"share","i":<i>,"ok":0,"code":"io"}`. `\u0000` in a JSON string is `bad_json`: it used to
+  decode, and every consumer downstream is `strlen`-based, so `{"cmd":"share","path":"a\u0000b"}`
+  seeded the file `a` and replied `ok`. The generator and `add` share one magnet length
+  (`NTX_MAGNET_MAX`, 2048 B, with a `_Static_assert` on the two buffers), so a link `ntx --share`
+  prints is always one `ntx add` accepts. A magnet that cannot be written to stdout is reported and
+  costs exit 1 instead of printing the `shared —` note over a link the operator never got (`/dev/full`,
+  or a pipe whose reader is gone). `--share-from` given twice is exit 2, like `--share`. A
+  `--share-from` `.torrent` must be one exact document — trailing garbage is `bad_arg`, never a share
+  published under a prefix's link — and one name gate (valid UTF-8, no ASCII control bytes, no `/`)
+  decides every name, including the one written into the metainfo. `docs/json-api.md`, `docs/cli.md`.
+- **The status line keeps the tags that matter.** For a share slot the safety block (`prv`, `shr`/
+  `shr!`, `enc!`, `pin!N`, `map`/`map!cg`, `inN`) is printed directly behind the name column and the
+  counters give way first, so on an 80-column terminal a share that stopped serving, failed its pin
+  check or will not take inbound no longer renders as a healthy line; a cut line really does end in
+  ` ..` now, where the ellipsis had been written behind the terminating NUL. Names are cut on a UTF-8
+  boundary and an ill-formed byte run becomes exactly one U+FFFD, so a share whose name held multi-byte
+  text no longer emits stats lines (one per 100 ms) that a strict JSON parser rejects. A diagnostic no
+  longer lands on top of the live status line — one CLI-owned hook closes it before any `ntx_diag`
+  bytes. The two `exists` cases read differently: a different `.torrent` already at the destination
+  versus this torrent already shared as `<name>`. Ctrl-C during hashing names the file instead of
+  printing an empty row. `docs/cli.md`, `docs/json-api.md`.
+- **The port mapper stops spinning and stops repeating itself.** A gateway that answers with ICMP
+  port-unreachable left a pending `SO_ERROR` no callback read, so the level-triggered event never went
+  away and the loop burned three million iterations a second; `SO_ERROR` is drained before each send
+  and inside the error callback, the `send()` result is honoured, and an `ECONNREFUSED` steps PCP →
+  NAT-PMP once per sequence. A §8.5 epoch restart costs one re-request from the tick, never one per
+  round trip from the receive path, the check now runs both directions against the baseline and
+  covers NAT-PMP's `Seconds Since Start of Epoch` too, and a `SUCCESS` grant with lifetime 0 is a
+  refusal in both families. Retries are paced per their own RFC (PCP 3 s doubled to a 1024 s MRT with
+  ±10 % jitter, NAT-PMP 250 ms doubled, nine sends), a gateway's stated result code is treated as the
+  verdict it is — a definitive refusal ends the schedule, `NO_RESOURCES` and `NETWORK_FAILURE` get one
+  deferred retry floored at 60 s — and a NAT-PMP renewal is never closer than 30 s to the last one.
+  `--share` waits at most 4 s for the mapping and then announces on the listen port, re-announcing
+  when the advertised port changes, where it used to print its magnet about two minutes late behind an
+  unresponsive gateway. `docs/network.md`.
+- **A mapping says what is true and is always torn down.** A renewal or a delete now carries the nonce
+  the gateway actually granted, so a renewal renews instead of opening a second mapping and a delete
+  names a request the gateway recognises. A renewal that fails drops the grant and backs off
+  (5 min, doubling to 1 h), so the swarm stops being told to dial a port the gateway stopped
+  forwarding — `ext_port` returns the listen port once the grant's own lifetime has passed. The CGNAT
+  verdict sends the lifetime-0 deletes for held mappings *before* clearing the fields those deletes
+  are built from, and the delete pump continues past a refused datagram instead of leaving the other
+  family's mapping forwarding for the rest of its 7200 s. A NAT-PMP delete suggests port 0 as
+  RFC 6886 §3.4 requires. A fresh UDP ask now suggests the TCP grant's port, and a gateway that
+  forwards UDP elsewhere is reported under `--verbose`. A grant whose external port is 0, whose
+  external address is all-zeros, or whose v4 address is not the IPv4-mapped form is refused as a
+  refusal — not reported as `port_map: active` with the listen port behind it.
+- **`--port-map` maps without a share, and reads the routing table honestly.** The flag used to be a
+  no-op for a session that is not sharing — nothing was mapped and no `map` tag appeared — while both
+  the CLI and the network docs promised the opposite; the mapping is requested at session bring-up
+  when the user asked for it. On the v4 side the default route now requires `RTF_UP` and `RTF_GATEWAY`
+  and refuses `RTF_REJECT` (the flags field is read as hex, as the kernel prints it), an equal metric
+  keeps the first usable line rather than the last one walked, and a failed `getsockname` aborts the
+  family instead of asking the gateway to forward to a zero or a stale client address. The IPv6 half of
+  the driver is covered by its own entries above. `docs/network.md`, `docs/cli.md`.
+- **A BEP 55 `connect` message cannot wipe a peer's dial penalty.** The holepunch dial cleared the
+  back-off record of the endpoint named in the message and then dialled unforced, so any connected peer
+  could reset a 30 s..10 min penalty on demand and every repeat message bought another attempt. The
+  dial is now explicitly forced — a fresh connect message is evidence the endpoint is worth trying —
+  while the failure history survives, re-arms on failure and keeps growing, and the address is tagged
+  as peer-sourced so the BEP 27 gate and the stats see its real origin.
 
 ## 0.1.5 - 2026-11-13
 
