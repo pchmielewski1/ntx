@@ -5456,6 +5456,220 @@ int main(void) {
         gw_drain();
     }
 
+    /* ---- X9. R24's other half: getsockname() fails on the v6 gateway socket.
+
+     * The R24 row covers BOTH families ("błąd getsockname zostawia zerowy adres
+     * klienta i żądanie idzie dalej" → "przerwać przy błędzie"), and the v6 abort was
+     * written — pm_open6 refuses to name a client it never learned. Nothing forced it.
+     * The X8 hook is v4-only, so the only case that ever ended a v6 family on an
+     * unlearned address is T4, which gets there through `ntx_portmap_test_set_client6`
+     * (a NON-ROUTABLE address the kernel really did report). That is a different
+     * predicate: `routable = have_src && pm6_is_global(...)`. Delete the `have_src`
+     * half of it and T4 stays green, because pm_client6_set forces have_src to 1 —
+     * which is exactly why the forcing hook must sit on the call, not on the address.
+     *
+     * Pre-fix, honestly: the branch was instrumented with abort() and the UNMODIFIED
+     * suite ran to `PASS portmap` with the probe never printed — no existing case takes
+     * it, which is the whole gap. The same instrumented build dies at that abort once X9
+     * arms the hook. And with the hook present but stubbed to a no-op — same fixture,
+     * same client6 stand-in, the ONE flag doing nothing — X9 goes red on
+     * X9_v6_none_when_getsockname6_fails (got=1 PENDING want=3 NONE),
+     * X9_no_request_with_an_unlearned_source, X9_no_stale_v6_client_kept and
+     * X9_aborted_v6_family_stays_quiet (got=6 want=0): the v6 sequence runs, asks, and
+     * names 2001:db8:d:ead1::1 — the poisoned field. That is what proves the HOOK, not
+     * the fixture, is what drops the family here.
+     *
+     * What "aborted" means on this side, and what it does not: unlike v4, the v6 half
+     * KEEPS its connected socket (pm_open6's own comment — S17b pins the §8 source rule
+     * on it, and a socket that only ever reads is no exposure), so `fd6` is not the
+     * witness of the abort. The witnesses are the verdict and the wire: state NONE, no
+     * outstanding query, no grant, no external port, a zeroed client field, and not one
+     * datagram out over six minutes of clock. (c) pins the strongest of them — a forged
+     * SUCCESS aimed at the kept socket grants nothing, because nothing was ever asked. */
+    {
+        write_routes(GW_LO);
+        write_route6(V6_DEFAULT_LO, v4path);
+        sess x;
+        sess_open(&x, "x9_src6");
+        x.cfg.port_map = 1;
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        uint8_t req[2048];
+
+        /* (a) the honest path first, hook disarmed: everything the armed phase must
+         * refuse is present here, so a later absence cannot be the fixture's doing. */
+        pm_start(&x);
+        pump_ms(x.n, 20);
+        ck_eq(x.s->pm->gw6_tried, 1, "X9_v6_attempted_with_the_hook_off");
+        ck(x.s->pm->fd6 >= 0, "X9_v6_socket_opens_with_the_hook_off");
+        ck_eq(pm6_state6(&x), NTX_PM_PENDING, "X9_v6_pending_with_the_hook_off");
+        ck_eq(gw6_wait(req, sizeof req, 400), 60, "X9_v6_request_on_wire_with_the_hook_off");
+        ck(memcmp(req + 8, V6_CLIENT_GLOBAL, 16) == 0, "X9_v6_client_is_the_learned_address");
+        ck(x.s->pm->fd >= 0, "X9_v4_socket_alive_with_the_hook_off");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "X9_v4_pending_with_the_hook_off");
+        ck_eq(gw_wait(req, sizeof req, 400), 60, "X9_v4_request_on_wire_with_the_hook_off");
+        gw_drain();
+        gw6_drain();
+
+        /* (b) the call itself fails. The sequence is restarted the way X8 restarts it —
+         * the proxy tick is the driver's own reset — and the client field is poisoned
+         * AFTER that reset and BEFORE the restart, in the window pm_open6 must clear.
+         * 2001:db8:dead:beef::1 is an address no hook and no fixture in this file
+         * produces, so surviving it can only mean a request was built out of a client
+         * the socket was never asked for. */
+        static const uint8_t stale6[16] = {0x20, 0x01, 0x0d, 0xb8, 0x00, 0x0d, 0xea, 0xd1,
+                                           0,    0,    0,    0,    0,    0,    0,    1};
+        ntx_portmap_test_set_getsockname6_fail(1);
+        x.cfg.proxy = 1;
+        pm_tick(&x);
+        x.cfg.proxy = 0;
+        memcpy(x.s->pm->s6.client_ip, stale6, 16);
+        pm_tick(&x);
+        pump_ms(x.n, 20);
+        ck_eq(pm6_state6(&x), NTX_PM_NONE, "X9_v6_none_when_getsockname6_fails");
+        ck_eq(x.s->pm->s6.phase, -1, "X9_no_v6_query_outstanding");
+        ck_eq(x.s->pm->s6.gave_up, 1, "X9_v6_gave_up");
+        ck_eq(x.s->pm->s6.active[PM_PH_TCP], 0, "X9_no_v6_tcp_grant");
+        ck_eq(x.s->pm->s6.active[PM_PH_UDP], 0, "X9_no_v6_udp_grant");
+        ck_eq(pm6_ext6(&x), 0, "X9_no_v6_ext_port");
+        static const uint8_t zero16[16];
+        ck(memcmp(x.s->pm->s6.client_ip, zero16, 16) == 0, "X9_no_stale_v6_client_kept");
+        ck(!gw6_pending(), "X9_no_request_with_an_unlearned_source");
+        uint8_t r6[2048];
+        int out6 = 0, maps6 = 0;
+        while (gw6_get(r6, sizeof r6) >= 0) {
+            out6++;
+            if (r6[1] == 1) maps6++; /* opcode MAP, whatever its client field says */
+        }
+        ck_eq(out6, 0, "X9_no_v6_datagram_at_all");
+        ck_eq(maps6, 0, "X9_no_v6_map_names_an_unlearned_client");
+
+        /* (c) the v4 half of that same sequence, read BEFORE any clock moves (the quiet
+         * loop below walks six minutes of it and would otherwise bury this query under
+         * its own retransmissions): the v6 abort neither stopped the v4 sequence nor fed
+         * it a zero address. Its socket is up, its own query is on the v4 wire, and its
+         * client field is the address ITS getsockname answered — ::ffff:127.0.0.1, which
+         * the v6 memset cannot touch because it clears `s6.client_ip` only. Answering it
+         * reaches ACTIVE, so the grant path is alive too. */
+        ck(x.s->pm->fd >= 0, "X9_v4_socket_alive_after_the_v6_abort");
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "X9_v4_state_unaffected");
+        ck_eq(gw_wait(req, sizeof req, 400), 60, "X9_v4_request_on_wire_after_the_v6_abort");
+        ck(req_is(req, 60, NTX_PCP_PROTO_TCP, 7200), "X9_v4_request_is_its_own_tcp_query");
+        /* Octets 8..23 of a MAP request are the client address (RFC 6887 §7.1); the v4
+         * half names it in the v4-mapped form, so the four v4 octets sit at 20..23 and
+         * pm_widen4's ff ff sits at 18..19. 127.0.0.1 is what ITS getsockname answered —
+         * the v6 memset cannot reach it, because it clears `s6.client_ip` only. */
+        static const uint8_t v4_client_on_wire[16] = {0, 0, 0,    0,    0, 0, 0, 0,
+                                                      0, 0, 0xff, 0xff, 127, 0, 0, 1};
+        ck(memcmp(req + 8, v4_client_on_wire, 16) == 0,
+           "X9_v4_client_field_is_still_the_learned_address");
+        uint8_t pub[16], rsp[60];
+        pcp_v4(pub, 203, 0, 113, 9);
+        pcp_resp(rsp, req, EXT_PORT, pub, 7200, gw_epoch_live(x.s->pm));
+        gw_send(rsp, 60);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "X9_v4_ACTIVE_with_v6_aborted");
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "X9_adv_port_is_the_v4_grant");
+        ck_eq(pm6_state6(&x), NTX_PM_NONE, "X9_v6_still_none_after_the_v4_grant");
+        ck_eq(pm6_ext6(&x), 0, "X9_v4_grant_gives_v6_nothing");
+
+        /* The v6 socket survives the abort (pm_open6 keeps it on purpose — S17b pins the
+         * §8 source rule on it and production reads it the same way), so the witness of
+         * the abort is not `fd6 < 0` the way X8's is. It is that the surviving socket is
+         * read-only in the strict sense: a SUCCESS the driver never asked for is read off
+         * it — the source rule passes it, same address, port and scope as the gateway —
+         * and dropped, because there is no outstanding query to match it against. A
+         * socket that cannot be turned into a mapping is an aborted family. */
+        ck(x.s->pm->fd6 >= 0, "X9_v6_socket_kept_but_harmless");
+        struct sockaddr_in6 me;
+        ck(pm6_sockname(x.s->pm, &me) == 0, "X9_v6_socket_still_addressable");
+        uint8_t forged[60];
+        memset(forged, 0, sizeof forged);
+        forged[0] = 2;
+        forged[1] = 0x81; /* R set | opcode MAP */
+        forged[7] = 0x20; /* lifetime 32 s — for a mapping no gateway was ever asked for */
+        forged[36] = NTX_PCP_PROTO_TCP;
+        gw6_to(forged, sizeof forged, &me);
+        pump_ms(x.n, 40);
+        pm_tick(&x);
+        ck_eq(x.s->pm->rx6_seen, 1, "X9_forged_reply_was_read");
+        ck_eq(x.s->pm->rx6_ok, 1, "X9_forged_reply_passed_the_source_rule");
+        ck_eq(pm6_state6(&x), NTX_PM_NONE, "X9_forged_reply_grants_nothing");
+        ck_eq(pm6_ext6(&x), 0, "X9_no_ext_port_from_a_forged_reply");
+        gw6_drain();
+
+        /* And silence, over six minutes of the driver's own clock: the renewal the v4
+         * grant owes goes out on the v4 socket, the aborted v6 half never speaks. */
+        ntx_portmap_test_advance_ms(3601000); /* past half the grant: the renewal is due */
+        pm_tick(&x);
+        ck_eq(gw_get(req, sizeof req), 60, "X9_v4_renewal_still_goes_out");
+        ck(req_is(req, 60, NTX_PCP_PROTO_TCP, 7200), "X9_v4_renewal_is_tcp");
+        ck_eq(gw6_sends_in(&x, 60000, 6), 0, "X9_aborted_v6_family_stays_quiet");
+        ck_eq(pm6_state6(&x), NTX_PM_NONE, "X9_v6_stays_none");
+        ntx_portmap_test_set_getsockname6_fail(0);
+        ntx_session_portmap_stop(x.s);
+        sess_close(&x);
+        gw_drain();
+        gw6_drain();
+
+        /* (d) the control that names the hook and not the fixture: the same session
+         * shape, the same two route files, the client6 stand-in still set, the ONE flag
+         * disarmed — the v6 half comes up and asks. Without this, (b) could be read as
+         * the proxy reset having broken v6 for good. */
+        sess y;
+        sess_open(&y, "x9_control_hook_off");
+        y.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        pm_start(&y);
+        pump_ms(y.n, 20);
+        gw6_drain();
+        y.cfg.proxy = 1;
+        pm_tick(&y);
+        y.cfg.proxy = 0;
+        pm_tick(&y);
+        pump_ms(y.n, 20);
+        ck(y.s->pm->fd6 >= 0, "X9_v6_socket_back_with_the_hook_off");
+        ck_eq(pm6_state6(&y), NTX_PM_PENDING, "X9_v6_pending_again_with_the_hook_off");
+        ck_eq(gw6_wait(req, sizeof req, 400), 60, "X9_v6_request_back_with_the_hook_off");
+        ck(memcmp(req + 8, V6_CLIENT_GLOBAL, 16) == 0, "X9_v6_client_back_with_the_hook_off");
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(y.s);
+        sess_close(&y);
+        gw_drain();
+        gw6_drain();
+
+        /* (e) and the separation the two hooks exist for (the S17b reason): arming the
+         * v4 hook aborts v4 ALONE. The v6 half of the same sequence is never told, keeps
+         * its socket, its PENDING and its own client address — which is also the
+         * evidence that X8's hook never reached the v6 branch and X9's never reaches
+         * v4's. */
+        sess z;
+        sess_open(&z, "x9b_v4_hook_only");
+        z.cfg.port_map = 1;
+        write_route6(V6_DEFAULT_LO, v4path);
+        ntx_portmap_test_set_client6(V6_CLIENT_GLOBAL);
+        ntx_portmap_test_set_getsockname_fail(1);
+        pm_start(&z);
+        pump_ms(z.n, 20);
+        ck(z.s->pm->fd < 0, "X9b_v4_aborted_by_its_own_hook");
+        ck(ntx_session_portmap_state(z.s) == NTX_PM_NONE, "X9b_v4_none");
+        ck(z.s->pm->fd6 >= 0, "X9b_v6_unaffected_by_the_v4_hook");
+        ck_eq(pm6_state6(&z), NTX_PM_PENDING, "X9b_v6_still_pending");
+        ck_eq(gw6_wait(req, sizeof req, 400), 60, "X9b_v6_request_while_v4_aborted");
+        ck(memcmp(req + 8, V6_CLIENT_GLOBAL, 16) == 0, "X9b_v6_client_untouched_by_v4_abort");
+        ck_eq(pm6_ext6(&z), 0, "X9b_no_v6_grant_yet");
+        ntx_portmap_test_set_getsockname_fail(0);
+        ntx_portmap_test_set_client6(NULL);
+        ntx_session_portmap_stop(z.s);
+        sess_close(&z);
+        gw_drain();
+        gw6_drain();
+        write_routes(GW_LO);
+        gw_drain();
+        gw6_drain();
+    }
+
     /* ---- Y. R25: every held mapping is owed its lifetime-0 delete.
      *
      * `pm_send_deletes` walked the phases and `break`ed on the first send() that

@@ -287,6 +287,14 @@ static int pm_client6_set;
  * pattern and a different verdict), and production never sets it — the call below is
  * exactly the kernel's answer whenever the flag is 0. */
 static int pm_getsockname_fail;
+/* R24 (v6 twin, same pattern and the same reason): the test's stand-in for
+ * getsockname() on the v6 gateway socket failing. Loopback is the only address bindable
+ * here (probed: EADDRNOTAVAIL outside lo, EPERM for `ip -6 addr add`), so the call
+ * cannot be made to fail on a freshly connect()ed socket from the outside, and
+ * production never sets it — with the flag 0 the call below is the kernel's own answer.
+ * It is its own hook rather than one flag for both families for the S17b reason: only
+ * two hooks can show that the v6 abort is the v6 half's alone. */
+static int pm_getsockname6_fail;
 static int pm_cgnat_warned;
 
 void ntx_portmap_test_set_route_files(const char *v4, const char *v6) {
@@ -320,6 +328,12 @@ void ntx_portmap_test_set_client6(const uint8_t *addr16) {
  * learned — RFC 6887 §7.1 makes that field the address the request came from, and a
  * zero or left-over one is a request for a mapping to somebody else's host. */
 void ntx_portmap_test_set_getsockname_fail(int on) { pm_getsockname_fail = on ? 1 : 0; }
+
+/* R24: make the v6 sequence's getsockname() fail, the X8 hook's twin. With the flag set
+ * pm_open6 must skip the family instead of naming a client address it never learned:
+ * RFC 6887 §7.1 makes that field the address the request came from, and a zero or
+ * left-over one is a request for a mapping to somebody else's host. */
+void ntx_portmap_test_set_getsockname6_fail(int on) { pm_getsockname6_fail = on ? 1 : 0; }
 
 void ntx_portmap_test_advance_ms(uint64_t ms) { pm_voff += ms; }
 
@@ -1785,6 +1799,12 @@ static int pm_open6(struct ntx_portmap *pm) {
         memcpy(pm->s6.client_ip, pm_client6_cfg, 16);
         have_src = 1;
     }
+    /* R24 (test X9): the hook stands in for the call itself failing, so it speaks LAST —
+     * an address the caller supplied is not one this kernel ever named for this socket,
+     * and a call that failed leaves the family with nothing to name. Both flags are
+     * test-only, so with both 0 this line cannot be taken and production takes the two
+     * branches above exactly as it always did. */
+    if (pm_getsockname6_fail) have_src = 0;
     int routable = have_src && pm6_is_global(pm->s6.client_ip);
     if (!have_src) memset(pm->s6.client_ip, 0, 16); /* nothing to name at all */
     pm->fd6 = fd;
