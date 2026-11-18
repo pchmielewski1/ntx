@@ -328,6 +328,22 @@ static size_t cli_status_tty(const ntx_stats *st, char *out, size_t cap, int col
     return strlen(out);
 }
 
+/* R26: the live line the tty path below drew in place, and the caller's
+ * pending-newline flag that belongs to it. The closer needs both, so the CLI —
+ * not the caller — owns the state of "a line is open": ntx_diag reaches it
+ * through ntx_diag_set_close_hook() and the magnet print reaches the very same
+ * function directly. One state, one closer, no caller-side spelling of it. */
+static FILE *g_line_fp;
+static int *g_line_needs_nl;
+
+void ntx_cli_close_status_line(void) {
+    if (!g_line_fp) return; /* nothing open: a no-op, prints nothing */
+    fputc('\n', g_line_fp);
+    fflush(g_line_fp);
+    g_line_fp = NULL;
+    if (g_line_needs_nl) *g_line_needs_nl = 0; /* spent: no blank line later */
+}
+
 void ntx_cli_status_update(const ntx_stats *st, FILE *fp, int *needs_nl) {
     if (!st || !fp) return;
     char line[CLI_MAX_LINE + 1];
@@ -343,7 +359,10 @@ void ntx_cli_status_update(const ntx_stats *st, FILE *fp, int *needs_nl) {
         prev_len = len;
         fflush(fp);
         if (needs_nl) *needs_nl = 1;
+        g_line_fp = fp;
+        g_line_needs_nl = needs_nl;
     } else {
+        g_line_fp = NULL; /* a pipe line is already terminated: nothing to close */
         ntx_cli_status_format(st, line, sizeof line);
         fputs(line, fp);
         fputc('\n', fp);
@@ -361,7 +380,13 @@ void ntx_cli_status_update(const ntx_stats *st, FILE *fp, int *needs_nl) {
 
 void ntx_cli_status_finish(const ntx_stats *st, FILE *fp, int needs_nl) {
     if (!st || !fp) return;
-    if (needs_nl) fputc('\n', fp);
+    /* R26: the summary is written where the live line stopped, so it goes
+     * through the one closer — which also FORGETS the line. Left registered, a
+     * later diagnostic (the tracker goodbyes below the caller's summary) would
+     * pay out a newline of its own on a line that is long over. A caller whose
+     * fp is not the line's fp keeps the plain flag spelling. */
+    if (fp == g_line_fp) ntx_cli_close_status_line();
+    else if (needs_nl) fputc('\n', fp);
     if (st->n <= 0) {
         fputs("ntx: stopped.\n", fp);
         fflush(fp);

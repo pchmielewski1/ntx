@@ -47,9 +47,12 @@ __attribute__((weak)) const char *ntx_share_err_msg(ntx_share_err e);
 static const char *main_share_err_msg(ntx_share_err e) {
     return ntx_share_err_msg ? ntx_share_err_msg(e) : "sharing is not available in this build";
 }
-static int g_cli_needs_nl;
 
 #ifndef NTX_NO_MAIN
+/* R26: only the guarded CLI loop below reads and writes it — the share-event
+   consumers no longer hand-roll the newline (they call
+   ntx_diag_close_status_line), so the flag lives with its only users. */
+static int g_cli_needs_nl;
 /* ntx_share_available/ntx_share_err_msg live in ntx_share_trackers.c / ntx_share.c
    and every shipped binary links them. test/t_cli_https.c includes this file
    standalone with its own stub list, where a strong reference would be an
@@ -173,16 +176,17 @@ static int share_drain_events(ntx_session *s, int *fatal) {
            or stderr, so the queue is left to the `share` event of Task C3
            (ntx_ipc_dispatch.c / ntx_stats.c) — polling it here would steal it. */
         if (!ev.ok) {
+            /* R26: the live line goes first, so this lands on its own line, and
+               closing it spends the pending newline — before the fix the line
+               stayed open under this message and the summary at exit still paid
+               the newline out, which is the blank line after a failure. */
+            ntx_diag_close_status_line();
             fprintf(stderr, "ntx: share failed: %s\n", main_share_err_msg(ev.err));
             fflush(stderr);
             *fatal = 1;
             return 1;
         }
-        if (g_cli_needs_nl) {
-            fputc('\n', stderr);
-            fflush(stderr);
-            g_cli_needs_nl = 0;
-        }
+        ntx_diag_close_status_line(); /* R26: the one closer, same as ntx_diag's */
         puts(ev.magnet);
         fflush(stdout);
         fprintf(stderr, "ntx: shared — %s (torrent %s)\n", ev.name, ev.torrent_path);
@@ -459,6 +463,11 @@ int main(int argc, char **argv) {
     }
     g_sess = s;
     g_cli_needs_nl = 0;
+    /* R26: one hook, so every diagnostic — from the share machinery, the portmap
+       driver, the session — closes the live status line before it prints. The
+       closer writes nothing when no line is open, so --stats-json and a pipe see
+       the same bytes as before. */
+    ntx_diag_set_close_hook(ntx_cli_close_status_line);
     ntx_doh_set_ui_kick(doh_ui_kick);
     /* A torrent that cannot be added is a hard error: otherwise the client would sit
        "idle" forever on a typo'd path or a malformed magnet link. */

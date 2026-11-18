@@ -108,6 +108,26 @@ static void share_io_msg_set(const char *dir) {
     snprintf(share_io_msg, sizeof share_io_msg, "cannot write the .torrent into %s", dir);
 }
 
+/* R27 (§9): `exists` is TWO facts and spec §9 asks for the .torrent case to read
+ * differently from the duplicate-share one — the first names the file that is in
+ * the way, the second the share that already owns the hash. One enum value and
+ * one wire code (`exists`, §11) carry both; only the human text splits, on the
+ * same module-static pattern as share_io_msg above: the caller that knows which
+ * fact it hit fills the sentence, share_fail clears it for every other failure. */
+static char share_exists_msg[NTX_SHARE_PATH_MAX + 64];
+
+static void share_exists_msg_clear(void) { share_exists_msg[0] = 0; }
+
+static void share_exists_msg_disk(const char *path) {
+    snprintf(share_exists_msg, sizeof share_exists_msg,
+             "a different .torrent is already at %s", path);
+}
+
+static void share_exists_msg_slot(const char *name) {
+    snprintf(share_exists_msg, sizeof share_exists_msg,
+             "this torrent is already shared as %s", name);
+}
+
 static const char *const share_codes[] = {"ok", "bad_arg", "io",     "full",       "no_trackers",
                                           "too_big", "exists", "changed", "bad_arg"};
 static const char *const share_msgs[] = {
@@ -130,6 +150,9 @@ const char *ntx_share_err_msg(ntx_share_err e) {
     if ((unsigned)e >= sizeof share_msgs / sizeof share_msgs[0]) return share_msgs[NTX_SHARE_E_BAD_ARG];
     /* §5.4 (R2): while set, the last io failure was the .torrent not reaching disk. */
     if (e == NTX_SHARE_E_IO && share_io_msg[0]) return share_io_msg;
+    /* R27: while set, the last exists was the file on disk (its path) or another
+     * slot (its name); unset exists keeps the generic text. */
+    if (e == NTX_SHARE_E_EXISTS && share_exists_msg[0]) return share_exists_msg;
     return share_msgs[e];
 }
 
@@ -279,8 +302,10 @@ static void share_free_slot(struct ntx_session *s, int ti) {
 static void share_fail(struct ntx_session *s, struct ntx_share_slot *sl, ntx_share_err e) {
     if (!sl || sl->st == NTX_SHARE_FAILED) return;
     /* R2: the destination-naming text is written by the caller that knows the dir,
-     * after this returns — every other failure starts from the generic reason. */
+     * after this returns — every other failure starts from the generic reason.
+     * R27: same rule for the two `exists` sentences. */
     share_io_msg_set(NULL);
+    share_exists_msg_clear();
     sl->st = NTX_SHARE_FAILED;
     sl->err = e;
     sl->started_pending = 0;
@@ -419,8 +444,12 @@ static int share_finish_from(struct ntx_session *s, struct ntx_share_slot *sl) {
      * is published, so the share that got there first is untouched. */
     for (int j = 0; j < NTX_SESSION_MAX_TTS; j++) {
         if (j == sl->ti || !s->share[j] || s->share[j]->st == NTX_SHARE_FAILED) continue;
-        if (s->tts[j].np && memcmp(s->tts[j].info_hash, sl->src_ih, 20) == 0)
-            return share_fail(s, sl, NTX_SHARE_E_EXISTS), -1;
+        if (s->tts[j].np && memcmp(s->tts[j].info_hash, sl->src_ih, 20) == 0) {
+            /* R27: names the share that got there first, set after share_fail. */
+            share_fail(s, sl, NTX_SHARE_E_EXISTS);
+            share_exists_msg_slot(s->share[j]->name);
+            return -1;
+        }
     }
 
     const char *trks[NTX_SESSION_MAX_TRK];
@@ -564,7 +593,10 @@ static int share_finish(struct ntx_session *s, struct ntx_share_slot *sl) {
         if (s->tts[j].np && memcmp(s->tts[j].info_hash, ih, 20) == 0) {
             ntx_store_close(&t->store);
             free(tbuf);
-            return share_fail(s, sl, NTX_SHARE_E_EXISTS), -1;
+            /* R27: names the share that got there first, set after share_fail. */
+            share_fail(s, sl, NTX_SHARE_E_EXISTS);
+            share_exists_msg_slot(s->share[j]->name);
+            return -1;
         }
     }
 
@@ -579,10 +611,13 @@ static int share_finish(struct ntx_session *s, struct ntx_share_slot *sl) {
     if (we != NTX_SHARE_OK) {
         ntx_store_close(&t->store);
         share_fail(s, sl, we);
-        /* §5.4 (R2): only a write failure gets the destination-naming text; the
-         * exists verdict keeps its own wording (§9). Set after share_fail, which
-         * clears the sentence for every other code. */
+        /* §5.4 (R2): only a write failure gets the destination-naming text.
+         * R27 (§9): the `exists` verdict is the OTHER fact — a .torrent that is
+         * not this one sits at the destination — so it names that file, which is
+         * the thing the operator has to move or rename. Both are set after
+         * share_fail, which clears every sentence for every other code. */
         if (we == NTX_SHARE_E_IO) share_io_msg_set(dir);
+        if (we == NTX_SHARE_E_EXISTS) share_exists_msg_disk(sl->torrent_path);
         return -1;
     }
     if (ntx_share_magnet(sl->magnet, sizeof sl->magnet, ih, ih2, sl->name, trks, ntrk) != 0) {
@@ -759,6 +794,7 @@ int ntx_session_share_add(ntx_session *s, const char *path, const char *from_tor
     if (err) *err = NTX_SHARE_E_BAD_ARG;
     if (!s || !path || !path[0]) return -1;
     share_io_msg_set(NULL); /* the reason belongs to this attempt only */
+    share_exists_msg_clear(); /* … both of them: R27 spells exists twice */
 
     /* §6.4: a build with no usable pinned share-tracker table does not have this
      * feature, so it is decided before the caller's path is touched — nothing is
@@ -879,6 +915,13 @@ int ntx_session_share_add(ntx_session *s, const char *path, const char *from_tor
     /* ponytail: init_meta on a reused slot matches what add_magnet does; the
      * DEAD-slot teardown in ntx_session_remove owns the previous field set. */
     ntx_torrent_init_meta(&s->tts[ti], zeros); /* §5.3: ih stays 40 zeros until hashed */
+    /* R28: the row the CLI renders while hashing is built from this slot, and
+     * its name field is filled by validate_metainfo — which a --share never
+     * reaches until the last byte is hashed. Seeding it here from the share's
+     * own name is what makes an interrupted hash read `stopped — <name> (…,
+     * phase hash)` instead of `stopped — (torrent) (…, phase hash)`.
+     * share_finish's validate_metainfo overwrites it with the real name. */
+    ntx_utf8_copy(s->tts[ti].name, sizeof s->tts[ti].name, sl->name);
     s->tts[ti].state = NTX_TTS_VERIFY;
     s->tts[ti].priv = 1; /* BEP27: a share is private by definition (§4) */
     s->tts_enc_strict[ti] = 1;

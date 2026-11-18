@@ -1,12 +1,29 @@
 /* Task C2 — status-line tags for private/share/strict/pins/port-map (design §10).
- * Includes the CLI TU directly; output captured via fmemopen (§10 line budget). */
+ * Includes the CLI TU directly; output captured via fmemopen (§10 line budget).
+ *
+ * R26 also needs the TTY branch of ntx_cli_status_update() (the live, in-place
+ * line) and the ioctl-driven width cannot be set from a test, so isatty is
+ * overridden the way test/t_rng.c overrides read(): declared first, then
+ * macro'd, so the <unistd.h> ntx_cli.c pulls in is the already-processed one. */
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static int g_test_isatty;
+static int test_isatty(int fd) {
+    (void)fd;
+    return g_test_isatty;
+}
+#define isatty test_isatty
 #include "../src/ui/ntx_cli.c"
+#undef isatty
 #include "../src/ui/ntx_diag.c"
 
 #include "util.h"
-
-#include <stdio.h>
-#include <string.h>
 
 static int fail(const char *msg) {
     fprintf(stderr, "FAIL %s\n", msg);
@@ -736,6 +753,225 @@ int main(void) {
             }
         }
         if (ok("r8_cli_name_boundary")) return 1;
+    }
+
+    /* ── R26: one "close the status line" hook for ntx_diag ─────────────────
+     * The tty line is rewritten in place (`\r` + clear line), so a diagnostic
+     * printed while it is open lands ON it: the two texts run together and the
+     * next redraw erases the message. Only the magnet path used to close the
+     * line (the hand-rolled g_cli_needs_nl block in ntx_main.c), which is also
+     * why a failure left an extra blank line behind: the flag stayed set and
+     * ntx_cli_status_finish() still paid it out.
+     * Both the status line and ntx_diag write to stderr, so the case redirects
+     * fd 2 into a scratch file the way test/t_ipc_ctrl.c redirects stdout. */
+    {
+        static const char *const R26_MSG = "ntx: share big.bin changed on disk, stopping\n";
+        char cap_path[128];
+        snprintf(cap_path, sizeof cap_path, "%s", "test/.scratch/r26_cli_tags.err");
+        if (mkdir("test/.scratch", 0755) != 0 && errno != EEXIST) return fail("r26_scratch");
+        ntx_diag_set_close_hook(ntx_cli_close_status_line); /* what ntx_main does at startup */
+        int save_out = dup(2);
+        if (save_out < 0) return fail("r26_dup");
+        char got[4096];
+        ssize_t gn;
+
+        /* (a) a diagnostic while the live line is open starts on its OWN line,
+         *     leaves no blank line behind, and spends the pending newline. */
+        seed(&st, "R26.Share.bin");
+        g_test_isatty = 1;
+        int needs_nl = 0;
+        unlink(cap_path);
+        {
+            int fd = open(cap_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            if (fd < 0) { dup2(save_out, 2); close(save_out); return fail("r26_open"); }
+            dup2(fd, 2);
+            close(fd);
+            ntx_cli_status_update(&st, stderr, &needs_nl);
+            if (!needs_nl) { /* the driver itself: a live line must be open */
+                fflush(stderr);
+                dup2(save_out, 2); close(save_out);
+                return fail("r26_update_no_flag");
+            }
+            ntx_diag("%s", R26_MSG);
+            fflush(stderr);
+            dup2(save_out, 2);
+        }
+        {
+            FILE *rf = fopen(cap_path, "rb");
+            if (!rf) { close(save_out); return fail("r26_read"); }
+            gn = fread(got, 1, sizeof got - 1, rf);
+            fclose(rf);
+            close(save_out);
+        }
+        if (gn < 0) return fail("r26_read2");
+        got[gn] = 0;
+        if (!strstr(got, "\r\033[2K")) { fprintf(stderr, "got: [%s]\n", got); return fail("r26_no_live_line"); }
+        if (!strstr(got, "\nntx: share big.bin changed on disk, stopping\n")) {
+            fprintf(stderr, "glued: [%s]\n", got);
+            return fail("r26_diag_own_line");
+        }
+        if (strstr(got, "\n\n")) { fprintf(stderr, "got: [%s]\n", got); return fail("r26_blank_line"); }
+        if (needs_nl != 0) { printf("needs_nl=%d\n", needs_nl); return fail("r26_flag_cleared"); }
+
+        /* (b) the hook is a no-op with no live line: two further diagnostics
+         *     write their own bytes and nothing else. */
+        save_out = dup(2);
+        if (save_out < 0) return fail("r26_dup2");
+        unlink(cap_path);
+        {
+            int fd = open(cap_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            if (fd < 0) { dup2(save_out, 2); close(save_out); return fail("r26_open2"); }
+            dup2(fd, 2);
+            close(fd);
+            ntx_diag("%s", R26_MSG);
+            ntx_diag("%s", R26_MSG);
+            fflush(stderr);
+            dup2(save_out, 2);
+        }
+        {
+            FILE *rf = fopen(cap_path, "rb");
+            if (!rf) { close(save_out); return fail("r26_read3"); }
+            gn = fread(got, 1, sizeof got - 1, rf);
+            fclose(rf);
+            close(save_out);
+        }
+        if (gn < 0) return fail("r26_read4");
+        got[gn] = 0;
+        {
+            size_t ml = strlen(R26_MSG);
+            if ((size_t)gn != 2 * ml || memcmp(got, R26_MSG, ml) != 0 ||
+                memcmp(got + ml, R26_MSG, ml) != 0) {
+                fprintf(stderr, "got: [%s]\n", got);
+                return fail("r26_noop_when_closed");
+            }
+        }
+
+        /* (c) the closer itself: one newline for an open line, nothing once
+         *     closed — the primitive the magnet path now goes through too. */
+        g_test_isatty = 1;
+        needs_nl = 0;
+        save_out = dup(2);
+        if (save_out < 0) return fail("r26_dup3");
+        unlink(cap_path);
+        {
+            int fd = open(cap_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            if (fd < 0) { dup2(save_out, 2); close(save_out); return fail("r26_open3"); }
+            dup2(fd, 2);
+            close(fd);
+            ntx_cli_status_update(&st, stderr, &needs_nl);
+            ntx_cli_close_status_line();
+            ntx_cli_close_status_line();
+            fflush(stderr);
+            dup2(save_out, 2);
+        }
+        {
+            FILE *rf = fopen(cap_path, "rb");
+            if (!rf) { close(save_out); return fail("r26_read5"); }
+            gn = fread(got, 1, sizeof got - 1, rf);
+            fclose(rf);
+            close(save_out);
+        }
+        if (gn < 0) return fail("r26_read6");
+        got[gn] = 0;
+        {
+            const char *nl = strrchr(got, '\n');
+            if (!nl || nl[1] != 0) { fprintf(stderr, "got: [%s]\n", got); return fail("r26_close_once_nl"); }
+            if (needs_nl != 0) return fail("r26_close_clears_flag");
+        }
+
+        /* (d) a pipe (isatty false) keeps its bytes EXACTLY: line, newline, the
+         *     diagnostic, the summary — no hook byte anywhere in the stream. */
+        g_test_isatty = 0;
+        needs_nl = 0;
+        seed(&st, "R26.Pipe.bin");
+        char want[4096];
+        char plain[CLI_MAX_LINE + 8];
+        ntx_cli_status_format(&st, plain, sizeof plain);
+        save_out = dup(2);
+        if (save_out < 0) return fail("r26_dup4");
+        unlink(cap_path);
+        {
+            int fd = open(cap_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            if (fd < 0) { dup2(save_out, 2); close(save_out); return fail("r26_open4"); }
+            dup2(fd, 2);
+            close(fd);
+            ntx_cli_status_update(&st, stderr, &needs_nl);
+            ntx_diag("%s", R26_MSG);
+            ntx_cli_status_finish(&st, stderr, needs_nl);
+            fflush(stderr);
+            dup2(save_out, 2);
+        }
+        {
+            FILE *rf = fopen(cap_path, "rb");
+            if (!rf) { close(save_out); return fail("r26_read7"); }
+            gn = fread(got, 1, sizeof got - 1, rf);
+            fclose(rf);
+            close(save_out);
+        }
+        if (gn < 0) return fail("r26_read8");
+        got[gn] = 0;
+        snprintf(want, sizeof want, "%s\n%s", plain, R26_MSG);
+        if (strncmp(got, want, strlen(want)) != 0) {
+            fprintf(stderr, "got : [%s]\nwant: [%s]\n", got, want);
+            return fail("r26_plain_bytes");
+        }
+        if (needs_nl != 0) return fail("r26_plain_flag");
+        if (strchr(got, '\r')) return fail("r26_plain_no_cr");
+
+        /* (e) the summary CLOSES the line it was written over: the tracker
+         *     goodbyes the caller runs after it are diagnostics, and a line
+         *     still registered at that point would pay out a stray newline. */
+        g_test_isatty = 1;
+        needs_nl = 0;
+        seed(&st, "R26.Exit.bin");
+        save_out = dup(2);
+        if (save_out < 0) return fail("r26_dup5");
+        unlink(cap_path);
+        {
+            int fd = open(cap_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            if (fd < 0) { dup2(save_out, 2); close(save_out); return fail("r26_open5"); }
+            dup2(fd, 2);
+            close(fd);
+            ntx_cli_status_update(&st, stderr, &needs_nl);
+            ntx_cli_status_finish(&st, stderr, needs_nl);
+            needs_nl = 0; /* as the caller does after the summary */
+            ntx_diag("%s", R26_MSG); /* a goodbye printed after the summary */
+            fflush(stderr);
+            dup2(save_out, 2);
+        }
+        {
+            FILE *rf = fopen(cap_path, "rb");
+            if (!rf) { close(save_out); return fail("r26_read9"); }
+            gn = fread(got, 1, sizeof got - 1, rf);
+            fclose(rf);
+            close(save_out);
+        }
+        if (gn < 0) return fail("r26_read10");
+        got[gn] = 0;
+        if (strstr(got, "\n\n")) { fprintf(stderr, "got: [%s]\n", got); return fail("r26_no_blank_after_finish"); }
+        if (!strstr(got, "phase dl)\nntx: share big.bin changed on disk, stopping\n")) {
+            fprintf(stderr, "got: [%s]\n", got);
+            return fail("r26_finish_closes_line");
+        }
+
+        /* (f) a row that is not a share and has no name keeps the placeholder:
+         *     the R28 fallback must not reach past the metainfo it never got. */
+        {
+            memset(&st, 0, sizeof st);
+            st.n = 1;
+            st.t[0].state = NTX_TTS_META;
+            snprintf(st.t[0].phase, sizeof st.t[0].phase, "meta");
+            char fin[CLI_MAX_LINE + 64];
+            FILE *fp = fmemopen(fin, sizeof fin, "w");
+            if (!fp) return fail("r26_fmemopen");
+            ntx_cli_status_finish(&st, fp, 0);
+            fclose(fp);
+            if (!strstr(fin, "stopped — (torrent) (metadata not fetched, phase meta)")) {
+                fprintf(stderr, "fin: [%s]\n", fin);
+                return fail("r28_noshare_placeholder_kept");
+            }
+            if (ok("r26_status_line_hook")) return 1;
+        }
     }
 
     return 0;

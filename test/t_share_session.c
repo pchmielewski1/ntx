@@ -69,7 +69,23 @@
 #include "../src/proto/ntx_utmeta.c"
 #include "../src/proto/ntx_pe_vc.c"
 
+/* R27: the .torrent destination is named after a 16-byte salt that lives INSIDE
+ * `info`, so the info hash — and with it the file name — is unpredictable, and a
+ * foreign file cannot be planted at the destination to force the disk collision.
+ * The one ntx_rand_bytes call ntx_share.c makes is therefore overridden the way
+ * test/t_rng.c overrides read(): off by default (every existing case keeps real
+ * randomness, which is what keeps two shares of one file two different hashes),
+ * switched on only by the case that needs the name to be computable. */
+static void (*g_real_rand_bytes)(void *, size_t) = ntx_rand_bytes;
+static int g_fixed_salt;
+static void test_rand_bytes(void *buf, size_t n) {
+    if (!g_fixed_salt) { g_real_rand_bytes(buf, n); return; }
+    uint8_t *s = buf;
+    for (size_t i = 0; i < n; i++) s[i] = 0x2a;
+}
+#define ntx_rand_bytes test_rand_bytes
 #include "../src/core/ntx_share.c"
+#undef ntx_rand_bytes
 #include "../src/core/ntx_share_meta.c"
 #include "../src/core/ntx_share_out.c"
 #include "../src/core/ntx_session_priv.c"
@@ -167,7 +183,8 @@ static void scratch(void) {
                                        "from","fromchg","fromerr","fromdup","fromio","fromserve",
                                        "frompread","fromexact","fromname","store","during","durtrunc",
                                        "r7dead","r7hash","r7pend",
-                                       "r5chg","r5io","r4evt","r4qa","r11","r11b","r12"};
+                                       "r5chg","r5io","r4evt","r4qa","r11","r11b","r12",
+                                       "exdisk","exslot","r28name"};
     for (size_t k = 0; k < sizeof tags / sizeof tags[0]; k++) {
         char d[640];
         snprintf(d, sizeof d, "%s/%s", scratch_root, tags[k]);
@@ -3264,6 +3281,175 @@ static void test_evq_full_delays(void) {
     ok("evq_full_delays");
 }
 
+/* ---- R27 (§9): the two `exists` verdicts are two different facts ----------
+ * ONE text covered both a .torrent that is already on disk under the destination
+ * name and the same info hash already live in another slot. Spec §9 wants the
+ * .torrent case to name the FILE and the slot case to name the SHARE that owns
+ * it; the wire code stays `exists` for both (§11 pins it). The two cases are
+ * driven apart here by what each one can see: (a) names the destination path and
+ * nothing else, (b) names the other share. Pre-fix both answer the identical
+ * string "this file is already shared", which is what the two *_still_generic
+ * checks below catch. */
+static void test_exists_two_messages(void) {
+    scratch();
+    tracker tr;
+    memset(&tr, 0, sizeof tr);
+    tracker_start(&tr);
+    set_test_trackers(&tr, 2);
+
+    /* (a) the .torrent could not reach disk because something that is not this
+     * hash sits at the destination. The destination is <store>/<name>-<8 hex of
+     * ih>.torrent and ih covers the salt, so the salt is pinned (see the
+     * test_rand_bytes override above) — that is what lets the file be planted
+     * where the share is about to write it. */
+    sess x;
+    sess_open(&x, "exdisk");
+    char p[256];
+    snprintf(p, sizeof p, "%s/exdisk/h.bin", scratch_root);
+    mk_file(p, 200000, 91);
+    ntx_share_err e = NTX_SHARE_OK;
+    g_fixed_salt = 1;
+    int ti = share_add_parked(&x, p, NULL, &e);
+    if (ti < 0 || e != NTX_SHARE_OK) {
+        printf("ADD e=%s\n", ntx_share_err_code(e));
+        fail("exdisk_add");
+    }
+    (void)pump_until_hashed(&x, ti, 8000, NULL);
+    if (ntx_session_share_state(x.s, ti) != NTX_SHARE_ANNOUNCING &&
+        ntx_session_share_state(x.s, ti) != NTX_SHARE_READY)
+        fail("exdisk_first_not_hashed");
+    char tp[NTX_SHARE_PATH_MAX];
+    if (ntx_share_torrent_path(tp, sizeof tp, x.cfg.store_dir, "h.bin",
+                              x.s->tts[ti].info_hash) != 0)
+        fail("exdisk_path_build");
+    { /* the file really was written under exactly that name */
+        struct stat st;
+        if (stat(tp, &st) != 0) { printf("TP=%s\n", tp); fail("exdisk_first_write"); }
+    }
+    ntx_session_remove(x.s, ti);
+    { /* a foreign file at the destination: not bencode, so never ours to replace */
+        int fd = open(tp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) fail("exdisk_plant_open");
+        if (write(fd, "not bencode at all", 18) != 18) fail("exdisk_plant_write");
+        close(fd);
+    }
+    e = NTX_SHARE_OK;
+    ti = share_add_parked(&x, p, NULL, &e);
+    if (ti < 0 || e != NTX_SHARE_OK) {
+        printf("ADD2 e=%s\n", ntx_share_err_code(e));
+        fail("exdisk_add_second");
+    }
+    (void)pump_until_hashed(&x, ti, 8000, NULL);
+    g_fixed_salt = 0;
+    if (ntx_session_share_state(x.s, ti) != NTX_SHARE_FAILED) fail("exdisk_not_failed");
+    if (x.s->share[ti]->err != NTX_SHARE_E_EXISTS) {
+        printf("ERR=%s\n", ntx_share_err_code(x.s->share[ti]->err));
+        fail("exdisk_not_exists");
+    }
+    {
+        const char *m = ntx_share_err_msg(NTX_SHARE_E_EXISTS);
+        printf("EXDISK msg=[%s]\n", m);
+        if (strcmp(ntx_share_err_code(NTX_SHARE_E_EXISTS), "exists") != 0) fail("exdisk_code");
+        if (strcmp(m, "this file is already shared") == 0) fail("exdisk_still_generic");
+        if (!strstr(m, tp)) fail("exdisk_names_the_file");
+    }
+    ntx_session_remove(x.s, ti);
+    unlink(tp);
+    sess_close(&x);
+
+    /* (b) the same info hash is already shared from another slot: the text names
+     * the OTHER share and never blames a file. Two --share-from attempts of one
+     * .torrent is the only way to get two slots with one hash — a plain --share
+     * salts its info, so its hash is never reproducible. */
+    sess_open(&x, "exslot");
+    char sp[256];
+    snprintf(sp, sizeof sp, "%s/exslot/s.bin", scratch_root);
+    mk_file(sp, 300000, 92);
+    size_t dn = 0;
+    uint8_t *data = slurp(sp, &dn);
+    if (!data) fail("exslot_slurp");
+    size_t tn = 0;
+    uint8_t *tb = mk_torrent_named(data, dn, 16384, 0, "Uniq.Dup.Alpha.torrent", &tn);
+    free(data);
+    if (!tb) fail("exslot_mktorrent");
+    char fjp[NTX_SHARE_PATH_MAX];
+    snprintf(fjp, sizeof fjp, "%s/exslot/dup.torrent", scratch_root);
+    if (write_all(fjp, tb, tn) != 0) fail("exslot_write");
+    free(tb);
+
+    e = NTX_SHARE_OK;
+    int sai = share_add_parked(&x, sp, fjp, &e);
+    if (sai < 0 || e != NTX_SHARE_OK) fail("exslot_add_first");
+    (void)pump_until_hashed(&x, sai, 2000, NULL);
+    if (!pump_to_ready(&x, sai)) fail("exslot_first_not_ready");
+
+    int sbi = share_add_parked(&x, sp, fjp, &e);
+    if (sbi < 0 || e != NTX_SHARE_OK) fail("exslot_add_second");
+    (void)pump_until_hashed(&x, sbi, 2000, NULL);
+    if (ntx_session_share_state(x.s, sbi) != NTX_SHARE_FAILED) fail("exslot_second_not_failed");
+    if (x.s->share[sbi]->err != NTX_SHARE_E_EXISTS) fail("exslot_second_not_exists");
+    {
+        const char *m = ntx_share_err_msg(NTX_SHARE_E_EXISTS);
+        printf("EXSLOT msg=[%s]\n", m);
+        if (strcmp(ntx_share_err_code(NTX_SHARE_E_EXISTS), "exists") != 0) fail("exslot_code");
+        if (strcmp(m, "this file is already shared") == 0) fail("exslot_still_generic");
+        if (!strstr(m, "Uniq.Dup.Alpha.torrent")) fail("exslot_names_the_share");
+        if (strstr(m, fjp)) fail("exslot_blames_a_file");
+    }
+    if (ntx_session_share_state(x.s, sai) != NTX_SHARE_READY) fail("exslot_first_broken");
+    ntx_session_remove(x.s, sai);
+    ntx_session_remove(x.s, sbi);
+    sess_close(&x);
+    tracker_stop(&tr);
+
+    /* (c) neither sentence outlives the share that set it. */
+    {
+        const char *m = ntx_share_err_msg(NTX_SHARE_E_CHANGED);
+        if (strcmp(m, "the file changed while sharing") != 0) {
+            printf("GENERIC=[%s]\n", m);
+            fail("exists_stale_sentence");
+        }
+    }
+    ok("exists_two_messages");
+}
+
+/* ---- R28: the name of a share is known long before its hash is ------------
+ * Ctrl-C during the hash phase built the summary row out of metainfo that never
+ * arrived, so it read `stopped — (torrent) (metadata not fetched, phase hash)`.
+ * The row is built from the stats name, so the stats row of a HASHING share has
+ * to carry the share's own name — the basename, which ntx_session_share_add
+ * knows the moment it opens the file (§5.3: only the HASH is unknown then). */
+static void test_hash_row_carries_the_name(void) {
+    scratch();
+    tracker tr;
+    memset(&tr, 0, sizeof tr);
+    tracker_start(&tr);
+    set_test_trackers(&tr, 2);
+    sess x;
+    sess_open(&x, "r28name");
+    char p[256];
+    snprintf(p, sizeof p, "%s/r28name/Stopping.Name.bin", scratch_root);
+    mk_file(p, 8u * 1024u * 1024u, 93);
+    ntx_share_err e = NTX_SHARE_OK;
+    int ti = share_add_parked(&x, p, NULL, &e);
+    if (ti < 0 || e != NTX_SHARE_OK) {
+        printf("ADD e=%s\n", ntx_share_err_code(e));
+        fail("r28_add");
+    }
+    if (ntx_session_share_state(x.s, ti) != NTX_SHARE_HASHING) fail("r28_not_hashing");
+    ntx_session_stats_refresh(x.s, 0);
+    ntx_stats st;
+    ntx_session_snapshot(x.s, &st);
+    printf("R28 n=%d phase=[%s] name=[%s]\n", st.n, st.t[0].phase, st.t[0].name);
+    if (st.n != 1) fail("r28_stats_n");
+    if (strcmp(st.t[0].phase, "hash") != 0) fail("r28_not_hash_phase");
+    if (strcmp(st.t[0].name, "Stopping.Name.bin") != 0) fail("r28_hash_row_has_name");
+    ntx_session_remove(x.s, ti);
+    sess_close(&x);
+    tracker_stop(&tr);
+    ok("hash_row_carries_the_name");
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     scratch_root_init();
@@ -3298,6 +3484,8 @@ int main(void) {
     test_halt_after_io();
     test_error_after_ready();
     test_evq_full_delays();
+    test_exists_two_messages();
+    test_hash_row_carries_the_name();
     ntx_share_trackers_test_set(NULL, -1);
     printf("ALL PASS\n");
     return 0;
