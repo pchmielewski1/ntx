@@ -133,6 +133,9 @@ struct ntx_session {
     int trk_pending[NTX_TRK_PENDING];
     int trk_pending_tts[NTX_TRK_PENDING];
     int trk_pending_trk[NTX_TRK_PENDING];
+    /* the announce event this request was built with, so trk_note_ok can key
+     * trk_started_ok to the answered request and not to the slot's current event */
+    int trk_pending_ev[NTX_TRK_PENDING];
     int trk_pending_used[NTX_TRK_PENDING];
     uint64_t trk_pending_t0[NTX_TRK_PENDING];
     uint32_t trk_pending_ip[NTX_TRK_PENDING];   /* where the request went (net order); replies must match */

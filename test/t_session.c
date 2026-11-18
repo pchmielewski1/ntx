@@ -315,7 +315,8 @@ int main(void) {
         if (bind(cfd, (struct sockaddr *)&src, sizeof src) != 0 ||
             getsockname(cfd, (struct sockaddr *)&src, &slen) != 0)
             fail("trk15_bind");
-        trk_store_pending(s, tid, 0, 0, src.sin_addr.s_addr, ntohs(src.sin_port));
+        /* no event: this reply only has to deliver peers */
+        trk_store_pending(s, tid, 0, 0, src.sin_addr.s_addr, ntohs(src.sin_port), NTX_TRACKER_EVENT_NONE);
         uint8_t resp[20 + NTX_TRACKER_NUMWANT * 6 + 18];
         memset(resp, 0, sizeof resp);
         ntx_wire_wr32(resp + 0, (uint32_t)NTX_TRACKER_ACTION_ANNOUNCE);

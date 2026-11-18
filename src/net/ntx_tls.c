@@ -1004,9 +1004,14 @@ static int tls13_fallback(ntx_tls *t, int fd, const char *sni, const uint8_t pin
         return NTX_TLS_FAIL;
     }
     struct pollfd pfd = { .fd = nfd, .events = POLLOUT };
-    if (poll(&pfd, 1, 5000) <= 0) {
-        close(nfd);
-        return NTX_TLS_FAIL;
+    /* R38: the fallback reconnect is inside the same fetch budget as the attempt. */
+    {
+        long left = ntx_tls_budget_left_ms();
+        int to = left < 5000 ? (left > 0 ? (int)left : 1) : 5000;
+        if (poll(&pfd, 1, to) <= 0) {
+            close(nfd);
+            return NTX_TLS_FAIL;
+        }
     }
     int soerr = 0;
     socklen_t sl2 = sizeof soerr;

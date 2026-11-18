@@ -228,6 +228,50 @@ The same code path is used by `ntx_http.c` for `https://` URLs (web seeds and HT
 - Only status `200` and `206` are accepted; **redirects are not followed**. The body is read by
   `Content-Length` or `Transfer-Encoding: chunked` (malformed chunk framing is an error).
 
+#### The tracker announce budget (measured 2026-11-18)
+
+An HTTPS tracker announce is **synchronous** — `trk_http_announce` calls `ntx_http_get` and the
+event loop waits inside it. That is fine for a live tracker (tens of milliseconds) and very bad
+for a dead one, so the fetch carries a wall-clock budget. The measurement, taken before the budget
+existed (`test/t_session_trk_http_stall.c`, a listener on loopback that accepts the TCP connection
+and then answers nothing; `127.0.0.1` is in the built-in pin pool, so the real TLS client runs and
+fails exactly as it does against a dead host; `https` URLs, five of them, one
+`ntx_session_trk_pump_http(s, 1)` per loop iteration):
+
+| announce | wall time of one loop iteration |
+| --- | --- |
+| 1 | 30372 ms |
+| 2 | 30720 ms |
+| 3 | 30721 ms |
+| 4 | 30720 ms |
+| 5 | 30720 ms |
+| **total** | **153253 ms** |
+
+A single dead tracker held the loop for **30.7 s**: the TLS 1.3 ClientHello write waits out the
+15 s handshake I/O timeout, `tls13_fallback` then retries under TLS 1.2 and waits out the same 15
+s again. Five dead trackers — the size of the share pool — meant a **153 s** stall, during which
+JSON, IPC, DHT and every peer connection went hungry. Design §5.3 caps only the hashing at ~50 ms
+per iteration, so nothing bounded this. It is a code-change case (> 1 s per iteration).
+
+The fix is `NTX_TRK_HTTP_BUDGET_MS` (900 ms) in `ntx_session_trk.c`: `trk_http_announce` sets an
+absolute deadline with `ntx_tls_set_io_deadline_ms` around the fetch and clears it after. Every
+blocking wait inside the fetch — the read/write arms and the `SO_RCVTIMEO`/`SO_SNDTIMEO` of
+`sock_timeouts` in `ntx_tls_rec.c`, the `poll` in `tls13_fallback`, the plain-HTTP recv loop, the
+connect `poll` and the socket timeouts of `ntx_http.c` — clamps itself to the time left
+(`ntx_tls_budget_arm` / `ntx_tls_budget_left_ms`), so the fetch ends on the budget rather than on
+its own timeouts. The deadline is armed only around the tracker announce: a web-seed fetch or a
+DoH request of its own keeps its timeouts. The DoH lookup a *named* tracker host needs
+(`ntx_sock_resolve` inside `http_connect`) does ride inside the armed window, so a stuck resolver
+now costs the announce instead of stalling the loop — the budget covers connect through reply,
+which is the point.
+
+After the fix the same test reports **worst iteration 964 ms, total 4805 ms** in the recorded run
+(the figure tracks the 900 ms budget plus connect overhead, so it comes out a few ms under 1 s on
+every run). The test asserts both the bound (each iteration ≤ 1000 ms) and, as a floor, that the
+trap is still stalling us (≥ 100 ms per announce) — otherwise the assertion would be vacuous. A
+dead tracker now costs one strike, goes away after `NTX_TRK_MAX_FAIL`, and is revived by
+`share_revive_trackers`.
+
 ## Share tracker survey (2026-11)
 
 `ntx --share` may announce only over HTTPS trackers whose leaf SPKI is compiled in (design

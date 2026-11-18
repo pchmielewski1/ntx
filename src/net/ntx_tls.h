@@ -77,6 +77,12 @@ void tls12_prf(const uint8_t *secret, size_t slen, const char *label,
 void to_hex(char *dst, size_t dstsz, const uint8_t *b, size_t n);
 void peer_ip_str(int fd, char *out, size_t outsz);
 void sock_timeouts(int fd, int sec);
+/* R38: absolute CLOCK_MONOTONIC deadline (ms) for one synchronous fetch; 0 = unbounded.
+ * ntx_tls_budget_arm returns 0 once the deadline has passed, so the record layer can
+ * bail out instead of sitting in a socket timeout for a tracker that never answers. */
+void ntx_tls_set_io_deadline_ms(uint64_t abs_ms);
+long ntx_tls_budget_left_ms(void);
+int ntx_tls_budget_arm(int fd);
 int rec_send(ntx_tls *t, uint8_t type, const uint8_t *body, size_t body_len, tls_dir *d);
 int rec_recv(ntx_tls *t, uint8_t *type_out, uint8_t *buf, size_t cap, size_t *out_len,
              tls_dir *d);

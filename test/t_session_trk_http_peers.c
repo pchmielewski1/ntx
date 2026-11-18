@@ -150,7 +150,7 @@ int main(void) {
     body[o++] = 'e';
 
     poison_stack();
-    trk_http_apply(s, 0, 0, s->trk_urls[0][0], body, o);
+    trk_http_apply(s, 0, 0, s->trk_urls[0][0], body, o, NTX_TRACKER_EVENT_NONE);
 
     if (!has_addr_v4(s, 0, htonl(0x08080404u))) return fail("real_v4_peer_missing");
     int c = count_peers(s, 0);
@@ -181,7 +181,7 @@ int main(void) {
         o += 6;
     }
     big[o++] = 'e';
-    trk_http_apply(s, 0, 0, s->trk_urls[0][0], big, o);
+    trk_http_apply(s, 0, 0, s->trk_urls[0][0], big, o, NTX_TRACKER_EVENT_NONE);
     c = count_peers(s, 0);
     if (c != 90) {
         printf("peers=%d\n", c);

@@ -4,6 +4,7 @@
 #include "../proto/ntx_http.h"
 #include "../proto/ntx_bencode.h"
 #include "../net/ntx_sock.h"
+#include "../net/ntx_tls.h"
 #include "../crypto/ntx_rng.h"
 #include "../net/ntx_netx.h"
 #include "ntx_time.h"
@@ -23,6 +24,10 @@
 
 #define TRK_DNS_CACHE 32
 
+/* R38 (spec §5.3 keeps one loop iteration near 50 ms): the wall-clock budget of ONE synchronous
+ * announce fetch, connect through reply. A dead host must cost one strike, not half a minute. */
+#define NTX_TRK_HTTP_BUDGET_MS 900u
+
 static struct {
     char host[128];
     uint32_t ip;
@@ -35,13 +40,19 @@ static int trk_is_dead(const struct ntx_session *s, int tts_idx, int trk_idx) {
     return s->trk_fail[tts_idx][trk_idx] >= NTX_TRK_MAX_FAIL;
 }
 
-static void trk_note_ok(struct ntx_session *s, int tts_idx, int trk_idx) {
+/* `event` is the one the ANSWERED request itself carried, never the slot's current
+ * trk_http_event: the reply to request A must not be judged by request B's event.
+ * The UDP announce and its answer live in different loop iterations, and a
+ * re-announce (periodic NONE, COMPLETED, STOPPED, or the portmap re-send of STARTED)
+ * moves the slot in between. Passing NTX_TRACKER_EVENT_NONE is how a caller that
+ * answered something which is not an announce at all (a connect) says so. */
+static void trk_note_ok(struct ntx_session *s, int tts_idx, int trk_idx, int event) {
     if (tts_idx < 0 || tts_idx >= NTX_SESSION_MAX_TTS) return;
     if (trk_idx < 0 || trk_idx >= NTX_SESSION_MAX_TRK) return;
     s->trk_fail[tts_idx][trk_idx] = 0;
     /* §5.5: a share is READY only once a pinned tracker answered this slot's
-     * `started`; the event is whatever trk_http_event currently holds. */
-    if (s->trk_http_event[tts_idx] == NTX_TRACKER_EVENT_STARTED) s->trk_started_ok[tts_idx] = 1;
+     * `started` — and only its own `started` answers count for that. */
+    if (event == NTX_TRACKER_EVENT_STARTED) s->trk_started_ok[tts_idx] = 1;
 }
 
 static void trk_note_fail(struct ntx_session *s, int tts_idx, int trk_idx, const char *why) {
@@ -147,12 +158,13 @@ static int32_t trk_new_tid(struct ntx_session *s) {
 }
 
 static void trk_store_pending(struct ntx_session *s, int32_t tid, int tts_idx, int trk_idx, uint32_t ip,
-                              uint16_t port) {
+                              uint16_t port, int event) {
     for (int i = 0; i < NTX_TRK_PENDING; i++) {
         if (!s->trk_pending_used[i]) {
             s->trk_pending[i] = tid;
             s->trk_pending_tts[i] = tts_idx;
             s->trk_pending_trk[i] = trk_idx;
+            s->trk_pending_ev[i] = event;
             s->trk_pending_ip[i] = ip;
             s->trk_pending_port[i] = port;
             s->trk_pending_t0[i] = ntx_mono_ms();
@@ -209,7 +221,7 @@ static void trk_send_announce_one(struct ntx_session *s, int tts_idx, int trk_id
                                    t->info_hash, s->peer_id, s->tts_down[tts_idx],
                                    trk_left(t), s->tts_up[tts_idx], event, s->trk_key,
                                    ntx_session_adv_port(s));
-    trk_store_pending(s, tid, tts_idx, trk_idx, ip, port);
+    trk_store_pending(s, tid, tts_idx, trk_idx, ip, port, event);
     trk_sendto_ip(s, ip, port, req, 98);
 }
 
@@ -227,7 +239,8 @@ static void trk_send_connect(struct ntx_session *s, int tts_idx, int trk_idx) {
     }
     int32_t tid = trk_new_tid(s);
     ntx_tracker_udp_connect_build(req, tid);
-    trk_store_pending(s, tid, tts_idx, trk_idx, ip, port);
+    /* a connect answer is not an announce answer: it carries no event */
+    trk_store_pending(s, tid, tts_idx, trk_idx, ip, port, NTX_TRACKER_EVENT_NONE);
     trk_sendto_ip(s, ip, port, req, 16);
 }
 
@@ -259,7 +272,7 @@ void ntx_session_trk_free(struct ntx_session *s) {
 }
 
 static void trk_http_apply(struct ntx_session *s, int tts_idx, int trk_idx, const char *url,
-                           const uint8_t *body, size_t bn);
+                           const uint8_t *body, size_t bn, int event);
 
 /* Announce fetch seam: tests swap this to inject NTX_HTTP_E_PIN without a TLS
  * server. Production always calls ntx_http_get. */
@@ -282,7 +295,19 @@ static void trk_http_announce(struct ntx_session *s, int tts_idx, int trk_idx, c
     }
     uint8_t body[8192];
     size_t bn = 0;
+    /* R38: the fetch is synchronous, so it carries an absolute wall-clock budget. A
+     * tracker that accepts the TCP connection and answers nothing used to hold the
+     * whole loop for 30.7 s per announce (TLS 1.3 times out at its 15 s I/O timeout,
+     * then the TLS 1.2 fallback does the same) — with five of them, minutes, with
+     * JSON, IPC and every peer waiting. The budget is consumed inside the TLS record
+     * layer and the plain-HTTP recv loop (ntx_tls_budget_arm), and it expires the
+     * fetch as an ordinary connect failure: one strike, dead after NTX_TRK_MAX_FAIL,
+     * revived by share_revive_trackers. The DoH lookup a named host needs rides inside
+     * the same budget (~0.1 s of it), so a stuck resolver costs the announce instead of
+     * stalling the loop — the budget covers connect through reply, which is the point. */
+    ntx_tls_set_io_deadline_ms(ntx_mono_ms() + NTX_TRK_HTTP_BUDGET_MS);
     int hrc = strk_http_get(full, body, sizeof body, &bn);
+    ntx_tls_set_io_deadline_ms(0);
     if (hrc == NTX_HTTP_E_PIN) { /* §5.5 fail-closed: never retry a rejected key */
         s->trk_pin_fail[tts_idx][trk_idx] = 1;
         s->trk_fail[tts_idx][trk_idx] = NTX_TRK_MAX_FAIL;
@@ -299,12 +324,13 @@ static void trk_http_announce(struct ntx_session *s, int tts_idx, int trk_idx, c
         return;
     }
     if (event == NTX_TRACKER_EVENT_STOPPED) return; /* goodbye: nothing in the reply is of use */
-    trk_http_apply(s, tts_idx, trk_idx, url, body, bn);
+    trk_http_apply(s, tts_idx, trk_idx, url, body, bn, event);
 }
 
-/* Handle one HTTP tracker response body: schedule the next announce and feed the peers to the session. */
+/* Handle one HTTP tracker response body: schedule the next announce and feed the peers to the session.
+ * `event` is the request's own event (R39), not the slot's current trk_http_event. */
 static void trk_http_apply(struct ntx_session *s, int tts_idx, int trk_idx, const char *url,
-                           const uint8_t *body, size_t bn) {
+                           const uint8_t *body, size_t bn, int event) {
     enum { MAX_PEERS = NTX_TRACKER_NUMWANT };
     uint8_t ips[MAX_PEERS * 4];
     uint16_t ports[MAX_PEERS];
@@ -327,7 +353,7 @@ static void trk_http_apply(struct ntx_session *s, int tts_idx, int trk_idx, cons
             ntx_diag( "ntx: trk http parse fail: %s (%s)\n", url, err);
         return;
     }
-    trk_note_ok(s, tts_idx, trk_idx);
+    trk_note_ok(s, tts_idx, trk_idx, event);
     interval = trk_interval_clamp(interval);
     s->trk_next[tts_idx] = ntx_mono_ms() + (uint64_t)interval * 1000;
     for (int k = 0; k < MAX_PEERS; k++) {
@@ -597,7 +623,7 @@ void ntx_session_trk_on_udp(struct ntx_session *s, int fd, void *ctx) {
             if (tts_idx < 0 || tts_idx >= NTX_SESSION_MAX_TTS) continue;
             if (trk_idx < 0 || trk_idx >= NTX_SESSION_MAX_TRK) continue;
             if (trk_is_dead(s, tts_idx, trk_idx)) continue;
-            trk_note_ok(s, tts_idx, trk_idx);
+            trk_note_ok(s, tts_idx, trk_idx, NTX_TRACKER_EVENT_NONE); /* connect answer, not an announce */
             s->trk_conn_done[tts_idx][trk_idx] = 1;
             s->trk_conn_id[tts_idx][trk_idx] = cid;
             s->trk_conn_t0[tts_idx][trk_idx] = ntx_mono_ms();
@@ -620,10 +646,11 @@ void ntx_session_trk_on_udp(struct ntx_session *s, int fd, void *ctx) {
             if (slot < 0) continue;
             int tts_idx = s->trk_pending_tts[slot];
             int trk_idx = s->trk_pending_trk[slot];
+            int pev = s->trk_pending_ev[slot]; /* the event THIS request was built with */
             s->trk_pending_used[slot] = 0;
             if (tts_idx < 0 || tts_idx >= NTX_SESSION_MAX_TTS) continue;
             if (trk_idx >= 0 && trk_idx < NTX_SESSION_MAX_TRK)
-                trk_note_ok(s, tts_idx, trk_idx);
+                trk_note_ok(s, tts_idx, trk_idx, pev);
             interval = trk_interval_clamp(interval);
             s->trk_interval[tts_idx] = interval;
             s->trk_next[tts_idx] = ntx_mono_ms() + (uint64_t)interval * 1000;

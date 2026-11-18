@@ -24,7 +24,10 @@
 
 static int http_wait_connect(int fd) {
     struct pollfd pfd = {.fd = fd, .events = POLLOUT};
-    if (poll(&pfd, 1, HTTP_CONNECT_MS) <= 0) return -1;
+    /* R38: a synchronous fetch may not outlive its own wall-clock budget. */
+    long left = ntx_tls_budget_left_ms();
+    int to = left < HTTP_CONNECT_MS ? (left > 0 ? (int)left : 1) : HTTP_CONNECT_MS;
+    if (poll(&pfd, 1, to) <= 0) return -1;
     int soerr = 0;
     socklen_t sl = sizeof soerr;
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) != 0 || soerr != 0) return -1;
@@ -35,7 +38,11 @@ static int http_wait_connect(int fd) {
 static void http_set_blocking(int fd) {
     int fl = fcntl(fd, F_GETFL);
     if (fl >= 0) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
-    struct timeval tv = {HTTP_IO_MS / 1000, (HTTP_IO_MS % 1000) * 1000};
+    /* R38: the timeout never outlives the fetch's budget (see ntx_tls.h). */
+    long ms = HTTP_IO_MS;
+    long left = ntx_tls_budget_left_ms();
+    if (left < ms) ms = left > 0 ? left : 1;
+    struct timeval tv = {ms / 1000, (ms % 1000) * 1000};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 }
@@ -80,7 +87,7 @@ static int http_connect(const char *host, uint16_t port, int *fd_out) {
         ntx_proxy px;
         ntx_proxy_init(&px, fd, &pa, port, NULL, NULL, NULL, NULL);
         /* The proxy answers in milliseconds, not microseconds: step, and wait for its reply between steps. */
-        for (int waited = 0; waited < HTTP_CONNECT_MS; waited += 50) {
+        for (int waited = 0; waited < HTTP_CONNECT_MS && ntx_tls_budget_left_ms() > 0; waited += 50) {
             int rc = ntx_proxy_step(&px, 1);
             if (rc < 0) break;
             if (rc == 1) {
@@ -278,6 +285,9 @@ int ntx_http_get_range(const char *url, uint64_t off, uint64_t len, uint8_t *out
     }
     size_t total = 0;
     for (;;) {
+        /* R38: same budget as the TLS path — a server that drips bytes never trips a
+         * plain socket timeout, so the deadline is re-armed before every recv. */
+        if (!ntx_tls_budget_arm(fd)) break;
         ssize_t n = recv(fd, buf + total, rcap - total, 0);
         if (n < 0) break;
         if (n == 0) break;

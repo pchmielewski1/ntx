@@ -412,6 +412,20 @@ static void share_announce(struct ntx_session *s, struct ntx_share_slot *sl) {
     sl->fstat_at = share_now_ms() + NTX_SHARE_FSTAT_MS;
 }
 
+/* Review focus 5: one info-hash may live in exactly one slot, because sp_match_tts
+ * returns the FIRST match and a second slot with the same hash could never be
+ * reached by an incoming handshake. Asked before anything is published, so the share
+ * that got there first is untouched. Returns the slot that owns the hash, or -1; the
+ * caller decides the unwinding (share_finish has a store and a .torrent buffer to
+ * drop, share_finish_from has nothing to undo yet). */
+static int share_dup_slot(const struct ntx_session *s, int ti, const uint8_t ih[20]) {
+    for (int j = 0; j < NTX_SESSION_MAX_TTS; j++) {
+        if (j == ti || !s->share[j] || s->share[j]->st == NTX_SHARE_FAILED) continue;
+        if (s->tts[j].np && memcmp(s->tts[j].info_hash, ih, 20) == 0) return j;
+    }
+    return -1;
+}
+
 /* §5.6.3: the piece hashes the file produced, against the two lists the
  * .torrent claims. A short read, a truncated or rewritten file lands here with
  * bytes that do not match — that is the `changed` of §5.6, never a share. */
@@ -442,14 +456,12 @@ static int share_finish_from(struct ntx_session *s, struct ntx_share_slot *sl) {
      * sp_match_tts returns the FIRST match and a second slot with the same hash
      * could never be reached by an incoming handshake. Checked before anything
      * is published, so the share that got there first is untouched. */
-    for (int j = 0; j < NTX_SESSION_MAX_TTS; j++) {
-        if (j == sl->ti || !s->share[j] || s->share[j]->st == NTX_SHARE_FAILED) continue;
-        if (s->tts[j].np && memcmp(s->tts[j].info_hash, sl->src_ih, 20) == 0) {
-            /* R27: names the share that got there first, set after share_fail. */
-            share_fail(s, sl, NTX_SHARE_E_EXISTS);
-            share_exists_msg_slot(s->share[j]->name);
-            return -1;
-        }
+    int dup = share_dup_slot(s, sl->ti, sl->src_ih);
+    if (dup >= 0) {
+        /* R27: names the share that got there first, set after share_fail. */
+        share_fail(s, sl, NTX_SHARE_E_EXISTS);
+        share_exists_msg_slot(s->share[dup]->name);
+        return -1;
     }
 
     const char *trks[NTX_SESSION_MAX_TRK];
@@ -579,25 +591,19 @@ static int share_finish(struct ntx_session *s, struct ntx_share_slot *sl) {
     t->have_n = t->np;
     t->verified_B = t->size;
     t->pre_complete = 1;
-    /* validate_metainfo leaves this to the store-open path a download uses; the
-     * read-only store over the share fd never sets it, and trk_left (left=0 of
-     * §5.5) plus ntx_torrent_done both read it. */
-    t->have_meta = 1;
-    /* have_meta is normally set by ntx_torrent_open_store, the write half a
-     * share never calls; without it trk_left reports "unknown size" instead of
-     * the left=0 the §5.5 readiness definition demands. */
+    /* validate_metainfo leaves have_meta to ntx_torrent_open_store — the write half a
+     * share never calls. Without it trk_left reports "unknown size" instead of the
+     * left=0 the §5.5 readiness definition demands, and ntx_torrent_done is blind. */
     t->have_meta = 1;
 
-    for (int j = 0; j < NTX_SESSION_MAX_TTS; j++) {
-        if (j == sl->ti || !s->share[j] || s->share[j]->st == NTX_SHARE_FAILED) continue;
-        if (s->tts[j].np && memcmp(s->tts[j].info_hash, ih, 20) == 0) {
-            ntx_store_close(&t->store);
-            free(tbuf);
-            /* R27: names the share that got there first, set after share_fail. */
-            share_fail(s, sl, NTX_SHARE_E_EXISTS);
-            share_exists_msg_slot(s->share[j]->name);
-            return -1;
-        }
+    int dup = share_dup_slot(s, sl->ti, ih);
+    if (dup >= 0) {
+        ntx_store_close(&t->store);
+        free(tbuf);
+        /* R27: names the share that got there first, set after share_fail. */
+        share_fail(s, sl, NTX_SHARE_E_EXISTS);
+        share_exists_msg_slot(s->share[dup]->name);
+        return -1;
     }
 
     const char *dir = share_store_dir(s);

@@ -7,13 +7,16 @@
 #include "../crypto/ntx_hmac.h"
 #include "../crypto/ntx_sha256.h"
 #include "../proto/ntx_wire.h"
+#include "../core/ntx_time.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #define VER12 0x0303u
@@ -24,6 +27,9 @@ int io_read(int fd, void *buf, size_t n) {
     uint8_t *p = buf;
     size_t g = 0;
     while (g < n) {
+        /* R38: a server that drips one byte per timeout would never trip the socket
+         * timeout on its own, so the budget is re-checked (and re-armed) per read. */
+        if (!ntx_tls_budget_arm(fd)) return -1;
         ssize_t r = read(fd, p + g, n - g);
         if (r == 0) return -1;
         if (r < 0) {
@@ -39,6 +45,7 @@ int io_write(int fd, const void *buf, size_t n) {
     const uint8_t *p = buf;
     size_t s = 0;
     while (s < n) {
+        if (!ntx_tls_budget_arm(fd)) return -1;
         ssize_t w = write(fd, p + s, n - s);
         if (w < 0) {
             if (errno == EINTR) continue;
@@ -104,9 +111,42 @@ void peer_ip_str(int fd, char *out, size_t outsz) {
     }
 }
 
+/* R38: wall-clock budget for one synchronous fetch. The TLS record layer is where a
+ * tracker that accepts the connection and then answers nothing actually blocks, so the
+ * budget lives here: the caller sets an absolute deadline and every read/write re-arms
+ * the socket timeout to fit what is left, so no single fetch can run past it. 0 = no
+ * bound (DoH, the golden TLS replay tests, everything that never sets one). */
+static uint64_t g_io_deadline_ms;
+
+void ntx_tls_set_io_deadline_ms(uint64_t abs_ms) { g_io_deadline_ms = abs_ms; }
+
+long ntx_tls_budget_left_ms(void) {
+    if (!g_io_deadline_ms) return LONG_MAX; /* unbounded */
+    int64_t left = (int64_t)g_io_deadline_ms - (int64_t)ntx_mono_ms();
+    return left > 0 ? (long)left : 0;
+}
+
+int ntx_tls_budget_arm(int fd) {
+    if (!g_io_deadline_ms) return 1;
+    int64_t left = (int64_t)g_io_deadline_ms - (int64_t)ntx_mono_ms();
+    if (left <= 0) return 0;
+    struct timeval tv = { .tv_sec = (time_t)(left / 1000), .tv_usec = (suseconds_t)(left % 1000 * 1000) };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    return 1;
+}
+
 void sock_timeouts(int fd, int sec) {
     if (sec <= 0) sec = 15;
-    struct timeval tv = { .tv_sec = sec, .tv_usec = 0 };
+    long ms = (long)sec * 1000;
+    /* R38: never arm a timeout that outlives the fetch's own budget, or the last
+     * read of a dead tracker would still hold the loop for its full 15 s. */
+    if (g_io_deadline_ms) {
+        long left = ntx_tls_budget_left_ms();
+        if (left < 1) left = 1;
+        if (left < ms) ms = left;
+    }
+    struct timeval tv = { .tv_sec = (time_t)(ms / 1000), .tv_usec = (suseconds_t)(ms % 1000 * 1000) };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 }
