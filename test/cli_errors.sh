@@ -135,7 +135,23 @@ printf 'x' > "$TMP/$(printf 'a\303\050b')"
 expect share-tab-name    1 'cannot share' -- --share="$TMP/$(printf 'a\tb')"
 expect share-del-name    1 'cannot share' -- --share="$TMP/$(printf 'a\177b')"
 expect share-nl-name     1 'cannot share' -- --share="$TMP/$(printf 'a\nb')"
-expect share-badutf8-name 1 'cannot share' -- --share="$TMP/$(printf 'a\303\050b')"
+# The ill-formed name is built inside the child shell, not passed through `timeout`:
+# uutils-coreutils' timeout (ubuntu-latest) refuses an argv that is not valid UTF-8
+# (exit 125) before ntx runs, while GNU's passes it on. ntx still gets the same bytes.
+timeout -k 1 3 sh -c 'exec ./ntx --store-dir="$1/store" --share="$1/$(printf "a\303\050b")"' \
+    sh "$TMP" >"$TMP/out" 2>"$TMP/err" </dev/null
+rc=$?
+if [ "$rc" -ne 1 ]; then
+  echo "FAIL share-badutf8-name: exit $rc, want 1" >&2
+  sed 's/^/    | /' "$TMP/err" | head -5 >&2
+  fails=$((fails + 1))
+elif ! grep -Eq -- 'cannot share' "$TMP/err"; then
+  echo "FAIL share-badutf8-name: stderr lacks /cannot share/" >&2
+  sed 's/^/    | /' "$TMP/err" | head -5 >&2
+  fails=$((fails + 1))
+else
+  echo "PASS share-badutf8-name"
+fi
 # and the reason on stderr is the name module's text, not a read error
 if timeout -k 1 3 ./ntx --store-dir="$TMP/store" --share="$TMP/$(printf 'a\tb')" \
      >"$TMP/out" 2>"$TMP/err" </dev/null; then :; fi
