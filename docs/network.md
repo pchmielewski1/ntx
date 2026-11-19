@@ -287,11 +287,20 @@ and `announce` is what the budget has to fit:
 250 announces, p95 480 ms, p99 496 ms — and an earlier set, taken while the box was busier, had a
 **worst successful announce of 1303 ms**, on `1337.abcvg.info`, which is 45 % over the 900 ms the
 budget had. That host is also the one the §6 survey accepted with peers for the hash, so it is
-exactly the announce `--share` depends on, and it is the one that was being killed. (For
-comparison: `test/trk_http_probe.c` in survey mode prints ~1.4–2.0 s per host. That figure is the
-fetch **plus its own `sleep(1)`** between the two announces of the §6.3 probe — the fetch inside it
-is the 1303 ms above, not 2 s. Quoting the wall time around that tool would have inflated this
-table by a second per row.)
+exactly the announce `--share` depends on, and it is the one that was being killed.
+
+Do not read the `test/trk_http_probe.c` survey numbers as the cost of an announce. That tool
+(`make probe`) prints ~1.4–2.0 s per host — e.g. `tracker.pmman.tech` 1464/1443/1426,
+`tracker.7471.top` 1495/1447/2066, `tracker.zhuqiy.com` 1702/1674/1674, `1337.abcvg.info`
+1556/1649/1560 (the run that printed `peers_for_hash=2`, i.e. a genuine SUCCESS),
+`tracker.yume-hatsuyuki.moe` 1798/1824/1847 ms. Re-timed here with `time`, the same tool gives
+1.46/1.46/1.47, 1.44/1.44/1.45 and 1.60/1.55/1.57 s, so the figures are reproducible — but
+`probe_url` makes **two** announces and `sleep(1)`s between them so the tracker can commit the
+registration, and the process itself starts in ~2 ms. Its wall time is therefore
+`2 × fetch + 1000 ms`, not a fetch: for `tracker.pmman.tech` that is `2 × 261 + 1000 = 1522 ms`
+against the 1426–1464 ms measured, consistent within the noise of the fetch itself. Reading the
+worst of those, 1556 ms, as an announce would have overstated the budget's job by a factor of ~1.7
+and would have been the wrong number to size against.
 
 Splitting the fetch by where the time goes (same client, marks around `http_connect`, the
 handshake, the request write and the response read; 32 runs) says the two waits are different in
