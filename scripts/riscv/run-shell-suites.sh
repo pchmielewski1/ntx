@@ -85,7 +85,9 @@ gate() { # gate <name> <command...>
 
 gate test-cli   sh   "$W/test/cli_errors.sh"
 gate test-net   sh   "$W/test/net_loopback.sh"
-gate test-ipc   bash "$W/test/interop/ipc/interop_ipc.sh"
+# NTX_IPC_SKIP_V04: the share-stream leg builds its own client from the source
+# tree, which the staged root above does not carry (see interop_ipc.sh).
+gate test-ipc   env NTX_IPC_SKIP_V04=1 bash "$W/test/interop/ipc/interop_ipc.sh"
 gate test-tls13 bash "$W/test/tls13_interop.sh" "$W/tls_probe"
 
 echo

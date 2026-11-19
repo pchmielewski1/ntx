@@ -165,6 +165,15 @@ printf 'R30FILE\n' > "$WORK/a"
 say "{\"cmd\":\"share\",\"seq\":12,\"path\":\"$WORK/a\\u0000b\"}"
 wait_for '"seq":12,"cmd":"share","ok":0,"code":"bad_json"' 3 "$MAIN_OUT" main
 
+# The V04 leg below compiles its OWN client from the source tree ($ROOT/src, the
+# share fixtures, tracker_https.py). scripts/riscv/run-shell-suites.sh runs this
+# script from a staged root that holds the scripts only and gates a prebuilt
+# riscv64 binary under qemu, so there is nothing to build from and the native
+# build would not be the binary under test anyway. It sets NTX_IPC_SKIP_V04 and
+# the leg says so out loud; the x86_64 and aarch64 gates run it for real.
+if [ -n "${NTX_IPC_SKIP_V04:-}" ]; then
+    log "V04 leg SKIPPED (NTX_IPC_SKIP_V04 set): it builds its own client from the source tree, which this root does not carry"
+else
 # ---------------------------------------------------------------------------
 # V04 (d): the asynchronous half of §11 over the REAL pipe.
 #
@@ -380,6 +389,7 @@ MT1=$(md5sum < "$V4/meta.torrent")
     || vdie "V04 leg: a from-torrent share wrote a .torrent into $V4/store: $(find "$V4/store" -type f)"
 
 log "V04 leg: stats -> ack -> share -> stats over a real pipe, from-torrent identity, rc=0"
+fi # NTX_IPC_SKIP_V04
 pid=$main_PID                    # wait_for's liveness handle goes back to the main pass
 
 # Variant A: quit is the LAST command; fd stays open until the ack lands.
