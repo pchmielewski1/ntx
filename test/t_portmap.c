@@ -211,10 +211,11 @@ static void mk_file(const char *path, uint64_t size, uint8_t seed) {
  * ipv6_route_seq_show — the 10-token layout the parser above documents) and re-checked
  * against `cat /proc/net/ipv6_route` on this box, but the ROW SET is a capture taken at
  * an earlier moment: the on-link prefix below is not the one this host advertises today
- * (its RA prefix has since been renumbered, and the live table has no ::/0 at all), and
- * the blackhole on lo is the only row that is still byte for byte what the kernel
- * prints now. So: shape verified against the kernel format, content captured earlier —
- * not a live dump, and not a claim that any of these rows is installed today. */
+ * (its RA prefix has since been renumbered, and the live table has no ::/0 that is a
+ * default — its only two ::/0 rows are the lo blackhole below), and the blackhole on lo
+ * is the only row that is still byte for byte what the kernel prints now. So: shape
+ * verified against the kernel format, content captured earlier — not a live dump, and
+ * not a claim that any of these rows is installed today. */
 static const char V6_ROUTES_REAL[] =
     "20011b81051170000000000000000000 40 00000000000000000000000000000000 00 "
     "00000000000000000000000000000000 00000258 00000001 00000000 00000001   wlP9s9\n"
