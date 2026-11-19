@@ -666,15 +666,66 @@ static void r11_routes(uint16_t port) {
     if (!f) fail("r11_route4_open");
     fputs(line, f);
     fclose(f);
+    /* The v6 table, in the shape `cat /proc/net/ipv6_route` really has:
+     * dst(32hex) dpl(2hex) src(32hex) spl(2hex) nexthop(32hex) metric(8hex)
+     * refcnt(8hex) use(8hex) flags(8hex) iface — the addresses as 16 raw bytes in
+     * network order and EVERY number hex, prefix lengths included. The two rows are the
+     * ones t_portmap.c builds from its V6_* macros and the live table of this box
+     * agrees on: the RA-learned ::/0 via fe80::1 on wlP9s9 (flags 00000003 =
+     * RTF_UP|RTF_GATEWAY, metric 00000258, the nexthop in the NEXTHOP slot, spl 00) and
+     * the blackhole networkd keeps on lo (no RTF_UP, RTF_REJECT, metric ffffffff), so a
+     * bare "dst is :: and dpl is 0" check is still refused by the fixture it should be.
+     *
+     * What this file used to write here was no one's line: the nexthop in the `src`
+     * slot as ::ffff:127.0.0.1 with spl 40 and all-zero nexthop — a v4-mapped address
+     * in the v6 table is the bug R15 was about, and the real parser rejects the row
+     * outright (zero nexthop = directly connected, nothing to ask). So the old fixture
+     * could only ever have meant "no v6 default", and it meant that by accident rather
+     * than by construction. These R11/R12 cases drive the v4 half (the gateway is a v4
+     * 127.0.0.1 port above); the v6 table is here so the parser reads a table a kernel
+     * writes, and the v6 half is expected to come up NONE in this sandbox, where a
+     * connect to fe80::1 is ENETUNREACH — the fact t_portmap.c's S17b block pins. */
     snprintf(line, sizeof line,
-             "00000000000000000000000000000000 00 00000000000000000000FFFF7F000001 40 "
-             "00000000000000000000000000000000 00000100 00000001 00000000 00000001 lo\n");
+             "00000000000000000000000000000000 00 00000000000000000000000000000000 00 "
+             "fe800000000000000000000000000001 00000258 00000015 00000000 00000003   wlP9s9\n"
+             "00000000000000000000000000000000 00 00000000000000000000000000000000 00 "
+             "00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo\n");
     f = fopen(r11_v6, "w");
     if (!f) fail("r11_route6_open");
     fputs(line, f);
     fclose(f);
     ntx_portmap_test_set_route_files(r11_v4, r11_v6);
     ntx_portmap_test_set_gateway_port(port);
+
+    /* V08: the fixture is worth writing only if the parser the driver actually uses
+     * reads it, so that is asserted rather than assumed — pm_route6 is the function
+     * pm_start calls, run here on the file just written. The old row never reached the
+     * flags/metric checks at all: with the nexthop in the `src` slot and the nexthop
+     * column zero, pm_route6_line returned 0 at the "directly connected" guard, so this
+     * table was indistinguishable from having no v6 default, and nothing in the suite
+     * noticed. The paired negative below is what stops this assertion from being a check
+     * that accepts anything: the blackhole row ALONE, same column widths and same
+     * dst/dpl, must still be refused (no RTF_UP, RTF_REJECT, metric ffffffff). */
+    struct pm_gw6 g6;
+    if (!pm_route6(&g6)) fail("r11_route6_fixture_rejected_by_parser");
+    static const uint8_t fe80_nh[16] = {0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+                                        0,    0,    0, 0, 0, 0, 0, 0x01};
+    if (memcmp(g6.addr, fe80_nh, 16) != 0) fail("r11_route6_wrong_gateway");
+    if (strcmp(g6.iface, "wlP9s9") != 0) fail("r11_route6_wrong_iface");
+    {
+        char only_bh[256];
+        snprintf(only_bh, sizeof only_bh, "%s/r11_route6_bh", scratch_root);
+        FILE *bf = fopen(only_bh, "w");
+        if (!bf) fail("r11_route6_bh_open");
+        fputs("00000000000000000000000000000000 00 00000000000000000000000000000000 00 "
+              "00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo\n",
+              bf);
+        fclose(bf);
+        ntx_portmap_test_set_route_files(r11_v4, only_bh);
+        if (pm_route6(&g6)) fail("r11_route6_blackhole_accepted_as_default");
+        ntx_portmap_test_set_route_files(r11_v4, r11_v6);
+    }
+    printf("PASS r11_route6_parser_reads_fixture (gw fe80::1 iface=%s)\n", g6.iface);
 }
 
 /* A UDP socket bound and never read: the driver's datagrams go there, nothing
