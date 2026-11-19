@@ -265,6 +265,32 @@ fi
 grep -q 'NTX-TEST-TRACKERS' "$V4/help.err" \
     || vdie "V04 leg: the client was not built with the test tracker table"
 
+# The per-tick order of the three emitters, pinned where it is actually decided.
+#
+# docs/json-api.md promises "per event-loop tick: ack, then share, then stats",
+# and that order is a property of main()'s for(;;) loop — src/ntx_main.c calls
+# ipc_pump_tick (acks + the status snapshot), then ipc_share_events, then the
+# 100 ms snapshot. No stream observation can pin it: a share needs seconds to
+# hash, so by the time the event lands the loop has emitted a hundred cadence
+# snapshots on both sides of it and the relative position of ONE snapshot says
+# nothing (moving the drain below the snapshot block leaves this leg green).
+# t_ipc_ctrl.c pins the contract per tick, but it calls the three functions
+# itself, so it too would stay green if the loop reordered them. This is the
+# assertion that is not vacuous against that change, and it is the same style of
+# structural check the seam grep above is.
+V4SRC="$ROOT/src/ntx_main.c"
+n_pump=$(grep -n 'ipc_pump_tick(s);' "$V4SRC" | head -1 | cut -d: -f1)
+n_evq=$(grep -n 'ipc_share_events(s);' "$V4SRC" | head -1 | cut -d: -f1)
+n_snap=$(grep -n 'ntx_stats_to_json(&st, g_js' "$V4SRC" | sed -n '2p' | cut -d: -f1)
+[ -n "$n_pump" ] && [ -n "$n_evq" ] && [ -n "$n_snap" ] \
+    || vdie "V04 leg: an emitter call vanished from $V4SRC (pump=$n_pump evq=$n_evq snap=$n_snap)"
+[ "$(grep -c 'ipc_pump_tick(s);' "$V4SRC")" = "1" ] \
+    && [ "$(grep -c 'ipc_share_events(s);' "$V4SRC")" = "1" ] \
+    || vdie "V04 leg: an emitter is called from two places — the tick order is no longer one place to read"
+{ [ "$n_pump" -lt "$n_evq" ] && [ "$n_evq" -lt "$n_snap" ]; } \
+    || vdie "V04 leg: the tick emits out of order — pump@$n_pump share@$n_evq snapshot@$n_snap (docs/json-api.md wants ack, share, stats)"
+log "V04 leg: tick order pinned in source — pump@$n_pump < share@$n_evq < snapshot@$n_snap"
+
 # --- the run: real pipe, --stats-json, quit last ----------------------------
 log "V04 leg: scripted share (from a .torrent) to READY over a real pipe"
 # The braces keep bash's "coproc [main] still exists" notice off the gate's own
