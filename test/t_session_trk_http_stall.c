@@ -130,11 +130,27 @@ static uint64_t now_us(void) {
  *   blocked 30 721-30 809 ms per iteration (e507d6f, measured 3x red), which is >20x the
  *   1400 ms the formula gives at the 900 ms budget and >6x what it gives at any budget the
  *   fetch has carried since: the slack absorbs a slow CPU, it does not hide the stall.
+ * V01 interaction, stated because both changes land in the same tree: NTX_TRK_HTTP_BUDGET_MS
+ * is now 4500, and trk_http_announce arms a SECOND, tighter leg with
+ * NTX_TRK_HTTP_PRE_REPLY_MS = 900 over resolve + connect + handshake + request write. The
+ * black hole below accepts the TCP connection and answers nothing, so it lives entirely
+ * inside that pre-reply leg: the trap is still bounded by ~900 ms of budget, which is what
+ * the 934-963 ms measured here is. Only the CEILING moved, from 1000 to budget+slack =
+ * 5000, because the ceiling is the thing that must not be tight when a healthy announce
+ * needs 1303 ms end to end. The test does not name 900, 4500 or 5000 anywhere: it reads
+ * NTX_TRK_HTTP_BUDGET_MS from the driver, so moving either leg moves the bound with it, and
+ * the pre-reply value being tightened further cannot make this gate pass for the wrong
+ * reason — the floor and the armed-and-cleared probe below are what establish that a real
+ * budget-driven failure happened at all.
  * Two signals, not one. The wall clock (worst_ms) is bounded above and floored below — the
  * floor is the anti-vacuous guard, since a trap that stopped being a black hole would
  * return in microseconds and prove nothing. On top of it the assertion below asks the
  * driver itself whether each fetch was ended BY the budget, which a stopwatch cannot tell
- * from a fetch that bailed early for an unrelated reason. */
+ * from a fetch that bailed early for an unrelated reason. With a 5000 ms ceiling the floor
+ * carries more of the non-vacuity than it did at 1000: a stall of 30.7 s is still 6x the
+ * ceiling, so the bound still fails the defect, while the 100 ms floor is 1/9 of what a
+ * budgeted announce actually costs — the trap has to be a real black hole for the test to
+ * report anything at all. */
 #define NTX_TRK_HTTP_SLACK_MS 500u
 #define ITER_LIMIT_MS (NTX_TRK_HTTP_BUDGET_MS + NTX_TRK_HTTP_SLACK_MS)
 #define STALL_FLOOR_MS 100 /* below this the "dead tracker" is not stalling us at all */
