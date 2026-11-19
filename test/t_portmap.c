@@ -1036,11 +1036,21 @@ static int natpmp_grant(sess *x, uint8_t op, uint16_t ext, uint32_t lifetime, co
  * schedule had already run out (a wait of 0 means the driver did not wait at all). */
 static int pm_send_at_due(sess *x) {
     uint8_t buf[2048];
+    /* pm_now() is the real clock plus the virtual offset, and only the offset is
+     * the test's: the real clock keeps running between reading the wait and the
+     * tick, and a loaded host or qemu-user stalls it by milliseconds. The driver
+     * may therefore send one virtual ms before the due instant exactly when the
+     * real clock has really moved on by that much, so "early" is judged against
+     * what the real clock did (read first, so the elapsed time is never
+     * under-counted), not against zero. A send with no real time elapsed is still
+     * a send before its instant. */
+    uint64_t t0 = ntx_mono_ms();
     long w = pm_wait_ms(x->s->pm);
     if (w <= 0) return 0;
     ntx_portmap_test_advance_ms((uint64_t)w - 1);
     pm_tick(x);
-    if (gw_get(buf, sizeof buf) >= 0) return 0;
+    uint64_t real_ms = ntx_mono_ms() - t0;
+    if (gw_get(buf, sizeof buf) >= 0) return real_ms >= 1;
     /* The due instant, plus up to 5 ms of slack for the real clock the driver's
      * pm_now() also sees (the virtual offset is the only thing the test moves). */
     for (int i = 0; i < 6; i++) {
