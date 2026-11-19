@@ -238,6 +238,213 @@ static int r31_cap_cb(void *ud, const char *line) {
 }
 static void r31_bad_cb(void *ud) { (void)ud; r31_nbad++; }
 
+/* ── V04 (§6, open part) helpers: the announce seam, the test tracker table,
+   the stdout capture and the line scanner the ordering assertions run on.
+   The seam is the shipped one (src/core/ntx_session_trk.c:289 — "tests swap
+   this to inject … without a TLS server"), the same hook t_share_session.c
+   arms for NTX_HTTP_E_PIN; everything above it (hasher, .torrent write,
+   share_tick's started/READY machine, the event queue, the emitter) is the
+   production code path. ── */
+static int v04_n_announce;
+static int v04_http_get(const char *url, uint8_t *out, size_t cap, size_t *out_n) {
+    (void)url;
+    static const char body[] = "d8:intervali60ee"; /* what the forked tracker of
+                                                      test/t_share_session.c answers */
+    size_t n = sizeof body - 1;
+    if (cap < n) return -1;
+    memcpy(out, body, n);
+    *out_n = n;
+    v04_n_announce++;
+    return 0;
+}
+
+static ntx_share_tracker v04_trk[2];
+static const char *const v04_trk_url[2] = { "http://127.0.0.1:65001/announce",
+                                            "http://127.0.0.1:65002/announce" };
+static void v04_use_test_trackers(void) {
+    for (int k = 0; k < 2; k++) {
+        v04_trk[k].url = v04_trk_url[k];
+        v04_trk[k].host = "127.0.0.1";
+        v04_trk[k].npins = 1;
+        memset(v04_trk[k].pins[0], k + 1, 32);
+    }
+    ntx_share_trackers_test_set(v04_trk, 2);
+}
+
+/* The B5 port-map park of t_share_session.c: §5.5 holds `started` back while
+   the mapping is PENDING, so pin the ENUM to OFF and the announce goes out on
+   the listen port at once. Parked AFTER share_add — that call is what asks for
+   a mapping (src/core/ntx_share.c:941). */
+static void v04_pm_park(ntx_session *s) {
+    if (!s->pm) ntx_session_portmap_want(s, 1);
+    if (!s->pm) return;
+    s->pm->want = 0;
+    s->pm->st = NTX_PM_OFF;
+}
+
+/* The cadence snapshot of main()'s loop body (src/ntx_main.c:573-581), the same
+   three shipped calls into the shipped g_js. The status-triggered snapshot does
+   NOT need this helper: ipc_on_line emits it itself (NTX_IPC_F_EMIT_STATUS),
+   which is why the ack-before-stats leg below is production code, not test code. */
+static void v04_emit_stats(ntx_session *s) {
+    ntx_session_stats_refresh(s, 0);
+    ntx_stats st;
+    ntx_session_snapshot(s, &st);
+    if (ntx_stats_to_json(&st, g_js, sizeof g_js) > 0) {
+        puts(g_js);
+        fflush(stdout);
+    }
+}
+
+static int v04_cap_open(const char *path, int *save) {
+    fflush(stdout);
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fd < 0) return -1;
+    *save = dup(1);
+    dup2(fd, 1);
+    close(fd);
+    return 0;
+}
+static void v04_cap_close(int save) {
+    fflush(stdout);
+    dup2(save, 1);
+    close(save);
+}
+
+/* Drives a slot out of HASHING and on to READY exactly the way the process does:
+   the shipped session tick (hasher, share_finish_from, the §5.5 announce arm) and
+   the shipped HTTP pump with its jitter cleared, the same two lines
+   pump_to_ready() in test/t_share_session.c runs. Nothing here pushes a state
+   field — READY is reached only through a `started` the seam answered. */
+static int v04_pump_ready(ntx_session *s, int ti) {
+    for (int k = 0; k < 200 && ntx_session_share_state(s, ti) != NTX_SHARE_READY; k++) {
+        ntx_session_tick(s);
+        for (int q = 0; q < NTX_SESSION_MAX_TRK; q++) s->trk_http_due[ti][q] = 0;
+        ntx_session_trk_pump_http(s, NTX_SESSION_MAX_TRK);
+    }
+    return ntx_session_share_state(s, ti) == NTX_SHARE_READY ? 0 : -1;
+}
+
+/* one "k:v" scalar out of test/vectors/share/<fixture>/manifest.txt — the hashes
+   the ordering assertions compare against come from the fixture's own witness
+   file, never from a copy typed into this test. */
+static int v04_manifest_hex(const char *dir, const char *key, char *out, size_t cap) {
+    char path[512], line[256];
+    if ((size_t)snprintf(path, sizeof path, "%s/manifest.txt", dir) >= sizeof path) return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    size_t kl = strlen(key);
+    int found = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, key, kl) != 0) continue;
+        const char *v = line + kl;
+        while (*v == ' ' || *v == '\t') v++;
+        size_t n = 0;
+        while (n + 1 < cap && v[n] && v[n] != ' ' && v[n] != '\n' && v[n] != '\r') { out[n] = v[n]; n++; }
+        out[n] = 0;
+        found = n > 0;
+        break;
+    }
+    fclose(f);
+    return found ? 0 : -1;
+}
+
+/* the captured stream, split into lines for the ordering assertions */
+static char v04_buf[200000];
+static char *v04_ln[512];
+static int v04_nln;
+static int v04_load(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    size_t n = fread(v04_buf, 1, sizeof v04_buf - 1, f);
+    fclose(f);
+    v04_buf[n] = 0;
+    v04_nln = 0;
+    for (char *p = v04_buf; *p && v04_nln < 512; ) {
+        v04_ln[v04_nln++] = p;
+        char *nl = strchr(p, '\n');
+        if (!nl) break;
+        *nl = 0;
+        p = nl + 1;
+    }
+    return 0;
+}
+static int v04_first(const char *needle) {
+    for (int k = 0; k < v04_nln; k++) if (strstr(v04_ln[k], needle)) return k;
+    return -1;
+}
+static int v04_count(const char *needle) {
+    int c = 0;
+    for (int k = 0; k < v04_nln; k++) if (strstr(v04_ln[k], needle)) c++;
+    return c;
+}
+/* every captured line: structurally sound JSON and strictly decodable UTF-8 */
+static int v04_all_lines_ok(const char *tag) {
+    for (int k = 0; k < v04_nln; k++) {
+        if (!ipc_ok_local(v04_ln[k]) || !utf8_strict(v04_ln[k], NULL)) {
+            printf("V04 %s: line %d torn: %s\n", tag, k, v04_ln[k]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* one "key":"value" pull out of a captured line — the ordering assertions read
+   the event's own ih back out of it instead of trusting a hand-typed copy */
+static int v04_field(const char *line, const char *key, char *out, size_t cap) {
+    char pat[34];
+    /* the key is matched with BOTH quotes and the colon: a bare `torrent"` would
+       also hit the tail of a value that ends in ".torrent" */
+    if (snprintf(pat, sizeof pat, "\"%s\":", key) >= (int)sizeof pat) return 0;
+    const char *p = strstr(line, pat);
+    if (!p) return 0;
+    p += strlen(pat);
+    if (*p != '"') return 0;
+    p++;
+    const char *e = strchr(p, '"');
+    if (!e) return 0;
+    size_t n = (size_t)(e - p);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, p, n);
+    out[n] = 0;
+    return 1;
+}
+
+/* bytes of a repo file into the scratch tree, so the fixture paths stay short;
+   -1 when the fixture is not next to this test (the riscv scratch root case,
+   same SKIP discipline as r33's missing /dev/full) */
+/* byte-identity of two files (the "the .torrent is never rewritten" leg) */
+static int v04_same_bytes(const char *a, const char *b) {
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+    int same = fa && fb;
+    if (same) {
+        for (;;) {
+            int ca = fgetc(fa), cb = fgetc(fb);
+            if (ca == EOF || cb == EOF) { if (ca != cb) same = 0; break; }
+            if (ca != cb) { same = 0; break; }
+        }
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return same;
+}
+
+static int v04_copy_file(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb"), *out = fopen(dst, "wb");
+    if (!in || !out) {
+        if (in) fclose(in);
+        if (out) fclose(out);
+        return -1;
+    }
+    char tmp[8192];
+    size_t r;
+    while ((r = fread(tmp, 1, sizeof tmp, in)) > 0)
+        if (fwrite(tmp, 1, r, out) != r) { fclose(in); fclose(out); return -1; }
+    fclose(in);
+    fclose(out);
+    return 0;
+}
+
 /* R31 oracle: the RFC 3986 length a magnet field has after the generator's
    percent-encoding (unreserved raw, everything else %XX). Deliberately a second,
    independent implementation — the same role utf8_strict plays for R8 — so the
@@ -2025,6 +2232,517 @@ int main(void) {
             drop(s, nx);
             if (ok("r33_epipe_reports_failure")) return 1;
         }
+    }
+
+    { /* ── V04 (a)+(b) · §6: the REAL command path, ack → share → stats ───────
+         docs/json-api.md §"Event ordering": "Per event-loop tick the order is
+         always `ack` first, then `share`, then the `stats` snapshot." Today
+         nothing on the command path pins that. `bud_order`/`bud2_order` pin the
+         64-lines-per-tick budget and the post-quit stop over ping/add lines only —
+         neither has a share, neither sees a "share" event, and `c3_dispatch_share`
+         stops at the synchronous ack (its own comment says the ready line is
+         "covered synthetically in c3_share_event_json"). This block drives the
+         shipped ipc_pump_tick + ipc_share_events + the main() cadence snapshot in
+         main()'s own order (src/ntx_main.c:561/570/573-581) over a real command
+         stream on fd 0, with a real share reaching READY through the real hasher,
+         the real share_finish_from and a real `started` answered by the shipped
+         announce seam. ── */
+        ntx_config cfg;
+        ntx_netx *nx;
+        char dir[96], wire[4096];
+        const char *VEC = "test/vectors/share/one_piece_16k";
+        if (mkdir("test/.scratch", 0755) != 0 && errno != EEXIST) return fail("v04_scratch");
+        snprintf(dir, sizeof dir, "test/.scratch/ntx-ipc-v04");
+        if (mkdir(dir, 0755) != 0 && errno != EEXIST) return fail("v04_dir");
+        /* same SKIP discipline as r33's missing /dev/full and r36's missing dir */
+        if (access("test/vectors/share/one_piece_16k/meta.torrent", R_OK) != 0) {
+            printf("SKIP v04 (the share fixtures are not next to this test — riscv scratch root)\n");
+            goto v04_done;
+        }
+        memset(&cfg, 0, sizeof cfg);
+        cfg.store_dir = dir;
+
+        /* The three legs of the ordering contract, in ONE stream:
+           seq 1 share        → ack(1)
+           seq 2 status       → stats (ipc_on_line's own NTX_IPC_F_EMIT_STATUS
+                                 snapshot — production code, not the cadence one)
+           the ready event    → share line (ipc_share_events)
+           then the cadence   → stats line (main()'s 100 ms snapshot)
+           A reordering in main() — snapshot before the drain, or the drain before
+           the dispatch — is exactly what the index assertions below catch. */
+        {
+            int save_out = 0;
+            if (v04_cap_open("test/.scratch/ntx-ipc-v04-order.ndjson", &save_out) != 0)
+                return fail("v04_cap_file");
+            /* the table must be the test one BEFORE the dispatch: share_add copies
+               the tracker urls into the slot at add time (src/core/ntx_share.c:936) */
+            v04_use_test_trackers();
+            ntx_ipc_reader_init(&g_rd);
+            g_ipc_open = 1; g_ipc_quit = 0; g_ipc_stash_len = 0;
+            ntx_session *s = mk(&nx, &cfg);
+            char p[256];
+            snprintf(p, sizeof p, "%s/v04-plain.bin", dir);
+            FILE *wf = fopen(p, "wb");
+            if (!wf) { v04_cap_close(save_out); drop(s, nx); return fail("v04_plain_file"); }
+            for (int k = 0; k < 4096; k++) fputc(k & 0xff, wf);
+            fclose(wf);
+            snprintf(wire, sizeof wire,
+                     "{\"cmd\":\"share\",\"seq\":1,\"path\":\"%s\"}\n"
+                     "{\"cmd\":\"status\",\"seq\":2}\n", p);
+            if (feed_stdin(wire, strlen(wire)) != 0) {
+                v04_cap_close(save_out); drop(s, nx); return fail("v04_stdin");
+            }
+            ipc_pump_tick(s); /* ack(1) + the status snapshot, in dispatch order */
+            if (ntx_session_share_state(s, 0) != NTX_SHARE_HASHING) {
+                v04_cap_close(save_out); drop(s, nx); return fail("v04_plain_hashing");
+            }
+            /* The async leg: hasher → share_finish → ANNOUNCING → `started` → READY,
+               all through ntx_session_tick and the HTTP pump, nothing forced. The
+               mapping is parked exactly like t_share_session.c's pm_park (a PENDING
+               mapping holds `started` back, §5.5), the tracker table is the test one
+               and the announce goes out through the shipped seam. */
+            v04_use_test_trackers();
+            v04_pm_park(s);
+            int (*saved_get)(const char *, uint8_t *, size_t, size_t *) = strk_http_get;
+            v04_n_announce = 0;
+            strk_http_get = v04_http_get;
+            int pr = v04_pump_ready(s, 0);
+            strk_http_get = saved_get;
+            if (pr != 0 || v04_n_announce < 1) {
+                v04_cap_close(save_out); drop(s, nx);
+                printf("V04 plain share: ready=%d announces=%d\n", pr, v04_n_announce);
+                return fail("v04_plain_not_ready");
+            }
+            ipc_share_events(s); /* the share line — after the ack, by contract */
+            ipc_share_events(s); /* the queue is drained: must add nothing */
+            v04_emit_stats(s);   /* the cadence snapshot of the same tick */
+            fflush(stdout);
+            v04_cap_close(save_out);
+            g_ipc_open = 0;
+            if (v04_load("test/.scratch/ntx-ipc-v04-order.ndjson") != 0) {
+                drop(s, nx); return fail("v04_order_read");
+            }
+            /* status has NO ack (§6.2): its only footprint is the extra stats
+               line, emitted by ipc_on_line itself. So the stream is exactly
+               ack, stats(status), share, stats(cadence) and the two stats lines
+               are identified by position, first and last. */
+            int a_ack = v04_first("\"seq\":1,\"cmd\":\"share\"");
+            int a_sta = v04_first("\"type\":\"stats\"");
+            int s_evt = v04_first("\"type\":\"share\"");
+            int s_sta = -1;
+            for (int k = v04_nln - 1; k > s_evt; k--)
+                if (strstr(v04_ln[k], "\"type\":\"stats\"")) { s_sta = k; break; }
+            if (a_ack < 0 || s_evt < 0 || s_sta < 0 || v04_count("\"type\":\"stats\"") != 2) {
+                printf("V04 order: ack=%d status=%d share=%d stats=%d lines=%d\n",
+                       a_ack, a_sta, s_evt, v04_count("\"type\":\"stats\""), v04_nln);
+                for (int k = 0; k < v04_nln && k < 8; k++)
+                    printf("V04  line %d: %.120s\n", k, v04_ln[k]);
+                drop(s, nx); return fail("v04_order_shape");
+            }
+            if (!(a_ack < a_sta && a_sta < s_evt && s_evt < s_sta)) {
+                printf("V04 order broken: ack=%d status-stats=%d share=%d cadence-stats=%d\n",
+                       a_ack, a_sta, s_evt, s_sta);
+                drop(s, nx); return fail("v04_order_sequence");
+            }
+            /* no line lost, none doubled: exactly one ack, two stats, one share */
+            if (v04_count("\"type\":\"ack\"") != 1 || v04_count("\"type\":\"share\"") != 1 ||
+                v04_count("\"type\":\"stats\"") != 2) {
+                printf("V04 counts: ack=%d share=%d stats=%d\n", v04_count("\"type\":\"ack\""),
+                       v04_count("\"type\":\"share\""), v04_count("\"type\":\"stats\""));
+                drop(s, nx); return fail("v04_order_no_loss_no_dup");
+            }
+            if (v04_all_lines_ok("order")) { drop(s, nx); return fail("v04_order_lines"); }
+            drop(s, nx);
+            if (ok("v04_ack_share_stats_order")) return 1;
+        }
+
+        { /* (b) THE SAME STREAM FOR A `share` THAT CARRIES THE `torrent` KEY.
+             docs/json-api.md §share: "`torrent`: re-share under an existing
+             .torrent (the --share-from equivalent) — the name, piece length and
+             both hash lists come from that file and the bytes are compared
+             against them, so the link does not change; the .torrent itself is
+             never rewritten." Pinned here end to end over the command path: the
+             ack, then the ready event whose ih/ih2/name are the fixture's OWN
+             witness hashes and whose `torrent` is the path we handed in, while
+             the .torrent on disk keeps its bytes (§5.6 "never rewritten"). */
+            int save_out = 0;
+            if (v04_cap_open("test/.scratch/ntx-ipc-v04-from.ndjson", &save_out) != 0)
+                return fail("v04_from_cap");
+            v04_use_test_trackers(); /* before the dispatch: share_add copies the urls */
+            ntx_ipc_reader_init(&g_rd);
+            g_ipc_open = 1; g_ipc_quit = 0; g_ipc_stash_len = 0;
+            ntx_session *s = mk(&nx, &cfg);
+            char data[256], meta[256];
+            snprintf(data, sizeof data, "%s/v04-data.bin", dir);
+            snprintf(meta, sizeof meta, "%s/v04-meta.torrent", dir);
+            if (v04_copy_file("test/vectors/share/one_piece_16k/data.bin", data) != 0 ||
+                v04_copy_file("test/vectors/share/one_piece_16k/meta.torrent", meta) != 0) {
+                v04_cap_close(save_out); drop(s, nx); return fail("v04_from_fixture");
+            }
+            /* Snapshot the .torrent BEFORE the share runs: with a `torrent` the
+               slot's torrent_path IS this file (src/core/ntx_share.c:912), so a
+               "never rewritten" check taken after the fact compares the file with
+               itself and can never notice a write. */
+            if (v04_copy_file(meta, "test/.scratch/ntx-ipc-v04-before.torrent") != 0) {
+                v04_cap_close(save_out); drop(s, nx); return fail("v04_from_before_copy");
+            }
+            char ih_exp[80], ih2_exp[80];
+            if (v04_manifest_hex(VEC, "ih_sha1:", ih_exp, sizeof ih_exp) != 0 ||
+                v04_manifest_hex(VEC, "ih_sha256:", ih2_exp, sizeof ih2_exp) != 0) {
+                v04_cap_close(save_out); drop(s, nx); return fail("v04_from_manifest");
+            }
+            snprintf(wire, sizeof wire,
+                     "{\"cmd\":\"share\",\"seq\":3,\"path\":\"%s\",\"torrent\":\"%s\"}\n"
+                     "{\"cmd\":\"status\",\"seq\":4}\n", data, meta);
+            if (feed_stdin(wire, strlen(wire)) != 0) {
+                v04_cap_close(save_out); drop(s, nx); return fail("v04_from_stdin");
+            }
+            ipc_pump_tick(s);
+            /* §11: the ack of a share carries i + state and NO ih — state 4 is
+               VERIFY, i.e. hashing, which is exactly the synchronous verdict of a
+               --share-from add. (The reply itself is asserted from the stream
+               below, once it is loaded.) */
+            if (ntx_session_share_state(s, 0) != NTX_SHARE_HASHING) {
+                v04_cap_close(save_out); drop(s, nx); return fail("v04_from_hashing");
+            }
+            v04_use_test_trackers();
+            v04_pm_park(s);
+            int (*saved2)(const char *, uint8_t *, size_t, size_t *) = strk_http_get;
+            v04_n_announce = 0;
+            strk_http_get = v04_http_get;
+            int pr2 = v04_pump_ready(s, 0);
+            strk_http_get = saved2;
+            if (pr2 != 0 || v04_n_announce < 1) {
+                v04_cap_close(save_out); drop(s, nx);
+                printf("V04 share-from: ready=%d announces=%d\n", pr2, v04_n_announce);
+                return fail("v04_from_not_ready");
+            }
+            ipc_share_events(s);
+            v04_emit_stats(s);
+            fflush(stdout);
+            v04_cap_close(save_out);
+            g_ipc_open = 0;
+            if (v04_load("test/.scratch/ntx-ipc-v04-from.ndjson") != 0) {
+                drop(s, nx); return fail("v04_from_read");
+            }
+            int f_ack = v04_first("\"seq\":3,\"cmd\":\"share\"");
+            int f_sta = v04_first("\"type\":\"stats\""); /* status: a line, not an ack */
+            int f_evt = v04_first("\"type\":\"share\"");
+            int f_cad = -1;
+            for (int k = v04_nln - 1; k > f_evt; k--)
+                if (strstr(v04_ln[k], "\"type\":\"stats\"")) { f_cad = k; break; }
+            if (f_ack < 0 || f_sta < 0 || f_evt < 0 || f_cad < 0 ||
+                !(f_ack < f_sta && f_sta < f_evt && f_evt < f_cad)) {
+                printf("V04 from order: ack=%d status=%d share=%d cadence=%d lines=%d\n",
+                       f_ack, f_sta, f_evt, f_cad, v04_nln);
+                for (int k = 0; k < v04_nln && k < 8; k++)
+                    printf("V04 from line %d: %.120s\n", k, v04_ln[k]);
+                drop(s, nx); return fail("v04_from_order");
+            }
+            if (v04_count("\"type\":\"ack\"") != 1 || v04_count("\"type\":\"share\"") != 1 ||
+                v04_count("\"type\":\"stats\"") != 2) {
+                printf("V04 from counts: ack=%d share=%d stats=%d\n",
+                       v04_count("\"type\":\"ack\""), v04_count("\"type\":\"share\""),
+                       v04_count("\"type\":\"stats\""));
+                drop(s, nx); return fail("v04_from_counts");
+            }
+            if (v04_all_lines_ok("from")) { drop(s, nx); return fail("v04_from_lines"); }
+            const char *evl = v04_ln[f_evt];
+            char got[128];
+            /* the hash the link is built on IS the .torrent's, not a fresh salt */
+            if (!v04_field(evl, "ih", got, sizeof got) || strcmp(got, ih_exp) != 0) {
+                printf("V04 from event ih: got=%s want=%s\n%s\n", got, ih_exp, evl);
+                drop(s, nx); return fail("v04_from_ih");
+            }
+            if (!v04_field(evl, "ih2", got, sizeof got) || strcmp(got, ih2_exp) != 0) {
+                printf("V04 from event ih2: got=%s want=%s\n", got, ih2_exp);
+                drop(s, nx); return fail("v04_from_ih2");
+            }
+            if (!v04_field(evl, "name", got, sizeof got) || strcmp(got, "one_piece_16k.bin") != 0) {
+                printf("V04 from event name: got=%s\n", got);
+                drop(s, nx); return fail("v04_from_name");
+            }
+            if (!v04_field(evl, "torrent", got, sizeof got) || strcmp(got, meta) != 0) {
+                printf("V04 from event torrent: got=%s want=%s\n", got, meta);
+                drop(s, nx); return fail("v04_from_torrent_field");
+            }
+            if (!strstr(evl, "\"ok\":1") || !strstr(evl, "\"magnet\":\"magnet:")) {
+                printf("V04 from event: %s\n", evl);
+                drop(s, nx); return fail("v04_from_ok_magnet");
+            }
+            /* the ack says VERIFY and carries no ih (§11), and the stats line of
+               that same tick reports share:1 — the ordering claim is only worth
+               something if the row it brackets is the share's own. */
+            if (!strstr(v04_ln[f_ack], "\"i\":0,\"ok\":1,\"state\":4") ||
+                strstr(v04_ln[f_ack], "\"ih\"")) {
+                printf("V04 from ack: %s\n", v04_ln[f_ack]);
+                drop(s, nx); return fail("v04_from_ack_shape");
+            }
+            if (!strstr(v04_ln[f_evt], "\"i\":0")) { drop(s, nx); return fail("v04_from_evt_i"); }
+            if (!strstr(v04_ln[f_cad], "\"share\":1")) {
+                printf("V04 from cadence stats: %.200s\n", v04_ln[f_cad]);
+                drop(s, nx); return fail("v04_from_stats_share");
+            }
+            /* §5.6: with a `torrent` the metainfo is never rewritten — the file the
+               share read must still match the snapshot taken before it ran. */
+            if (v04_copy_file(meta, "test/.scratch/ntx-ipc-v04-after.torrent") != 0) {
+                drop(s, nx); return fail("v04_from_after_copy");
+            }
+            if (!v04_same_bytes("test/.scratch/ntx-ipc-v04-before.torrent",
+                                "test/.scratch/ntx-ipc-v04-after.torrent")) {
+                printf("V04 the share rewrote %s\n", meta);
+                drop(s, nx); return fail("v04_from_torrent_rewritten");
+            }
+            if (!v04_same_bytes("test/vectors/share/one_piece_16k/meta.torrent",
+                                "test/.scratch/ntx-ipc-v04-after.torrent")) {
+                printf("V04 the shared .torrent drifted from the fixture\n");
+                drop(s, nx); return fail("v04_from_torrent_drift");
+            }
+            { /* §5.6: a --share-from share writes no metainfo. The path it WOULD
+                 have used is asked of the shipped builder itself, so the name
+                 cannot drift from what share_finish would have written. */
+                char tp[NTX_SHARE_PATH_MAX];
+                uint8_t wih[21];
+                if (hexb(ih_exp, wih, sizeof wih) != 20) { drop(s, nx); return fail("v04_from_wih"); }
+                if (ntx_share_torrent_path(tp, sizeof tp, dir, "one_piece_16k.bin", wih) != 0) {
+                    printf("V04 the plain-path builder refused the fixture name\n");
+                    drop(s, nx); return fail("v04_from_builder");
+                }
+                if (access(tp, F_OK) == 0) {
+                    printf("V04 wrote a .torrent for a --share-from share: %s\n", tp);
+                    drop(s, nx); return fail("v04_from_wrote_torrent");
+                }
+            }
+            /* the event's ih is also what the slot now announces with — proof the
+               `started` that made it READY was for the .torrent's hash */
+            {
+                char ih[41];
+                ntx_hex40(ih, s->tts[0].info_hash);
+                if (strcmp(ih, ih_exp) != 0) {
+                    printf("V04 slot ih=%s want=%s\n", ih, ih_exp);
+                    drop(s, nx); return fail("v04_from_slot_ih");
+                }
+            }
+            drop(s, nx);
+            if (ok("v04_share_torrent_success_path")) return 1;
+        }
+    }
+v04_done:;
+
+    { /* ── V04 (c) · a share event at MAXIMUM size through the emitter ────────
+         r29 pins the OVERFLOW fallback (every field at 0x1f, the escape blow-up
+         that no longer fits) and r31 pins the one 2048/4096 magnet length; r8 (d)
+         cuts a 600-B name in half. None of them sends the longest LEGAL event
+         through ntx_ipc_share_event_json and asks whether the line comes out
+         complete and decodable. A line cut by a buffer off-by-one would still be
+         "not the fallback", so this is the missing boundary: 511 B of legal name,
+         a 2048 B legal magnet, a maximum-length torrent path, asserted byte-exact
+         — not torn, not repaired (no U+FFFD anywhere), and inside the consumer
+         buffer g_share_evt. ── */
+        ntx_share_event ev;
+        static char line[40960 + 16];
+        memset(&ev, 0, sizeof ev);
+        ev.i = 15; ev.ok = 1;
+        for (int k = 0; k < 20; k++) ev.ih[k] = (uint8_t)(0xa0 + k);
+        for (int k = 0; k < 32; k++) ev.ih2[k] = (uint8_t)(0x10 + k);
+
+        /* longest legal name: 511 B, no control byte, no '/', valid UTF-8
+           (ntx_share_name_ok's own rules) — 255 × U+0142 + one ASCII byte */
+        for (int k = 0; k < 255; k++) { ev.name[2 * k] = (char)0xC5; ev.name[2 * k + 1] = (char)0x82; }
+        ev.name[510] = '~';
+        ev.name[511] = 0;
+        if (strlen(ev.name) != 511 || !ntx_share_name_ok(ev.name) || !utf8_strict(ev.name, NULL))
+            return fail("v04_max_name_setup");
+
+        /* longest legal magnet: exactly NTX_IPC_MAGNET_MAX bytes, and NOT the
+           unreserved-only 1946 B of r31 — this one carries the percent-escapes a
+           real dn=/tr= produces, so the emitter's escape path is exercised at the
+           same boundary. */
+        {
+            char nm2[512], tl1[128];
+            for (int k = 0; k < 255; k++) { nm2[2 * k] = (char)0xC5; nm2[2 * k + 1] = (char)0x82; }
+            nm2[510] = '~'; nm2[511] = 0;
+            snprintf(tl1, sizeof tl1, "https://127.0.0.3:8080/announce");
+            uint8_t mih[20], mih2[32];
+            for (int k = 0; k < 20; k++) mih[k] = (uint8_t)(0xa0 + k);
+            for (int k = 0; k < 32; k++) mih2[k] = (uint8_t)(0x10 + k);
+            /* Grow the query of the first tracker with unreserved bytes until the
+               magnet lands on the cap exactly — the length is a property of the
+               generator, not something this test gets to choose. */
+            int built = -1;
+            for (int extra = 0; extra <= 600; extra++) {
+                char q[768];
+                if ((size_t)snprintf(q, sizeof q, "https://127.0.0.2:8080/announce?") >= sizeof q)
+                    return fail("v04_max_q_setup");
+                size_t ql = strlen(q);
+                if (ql + (size_t)extra + 1 >= sizeof q) break;
+                memset(q + ql, 'a', (size_t)extra);
+                q[ql + (size_t)extra] = 0;
+                const char *pair[2] = { q, tl1 };
+                ev.magnet[0] = 0;
+                if (ntx_share_magnet(ev.magnet, sizeof ev.magnet, mih, mih2, nm2, pair, 2) == 0 &&
+                    strlen(ev.magnet) == (size_t)NTX_IPC_MAGNET_MAX) { built = extra; break; }
+            }
+            if (built < 0) {
+                printf("V04 could not build a %d B magnet\n", NTX_IPC_MAGNET_MAX);
+                return fail("v04_max_magnet_setup");
+            }
+        }
+        if (strlen(ev.magnet) != (size_t)NTX_IPC_MAGNET_MAX) return fail("v04_max_magnet_len");
+        /* maximum legal torrent path (ntx_share.c copies it from the request, which
+           caps at NTX_IPC_ARGS_MAX-1, but the event field is NTX_SHARE_PATH_MAX) */
+        memset(ev.torrent_path, '/', sizeof ev.torrent_path - 1);
+        {
+            size_t n = 0;
+            for (size_t k = 0; k < sizeof ev.torrent_path - 5; k++) ev.torrent_path[k] = (k % 7) ? 'w' : '.';
+            while (ev.torrent_path[n]) n++;
+            memcpy(ev.torrent_path + n - 8, ".torrent", 9);
+        }
+        if (strlen(ev.torrent_path) != NTX_SHARE_PATH_MAX - 1) return fail("v04_max_path_setup");
+
+        int w = ntx_ipc_share_event_json(line, sizeof g_share_evt, &ev);
+        if (w <= 0) { printf("V04 max-size emitter refused the line (fallback?)\n"); return fail("v04_max_len"); }
+        if ((size_t)w >= sizeof g_share_evt) return fail("v04_max_exceeds_consumer_buf");
+        if ((size_t)w != strlen(line)) return fail("v04_max_torn_return");
+        if (r8_line("max-size share event", line)) return fail("v04_max_line_invalid");
+        if (strstr(line, "\xef\xbf\xbd")) {
+            printf("V04 max line needed a repair: %s\n", line);
+            return fail("v04_max_repaired"); /* legal input must arrive whole */
+        }
+        if (strncmp(line, "{\"type\":\"share\",\"i\":15,\"ok\":1,", 27) != 0) {
+            printf("V04 max head: %.40s\n", line);
+            return fail("v04_max_head");
+        }
+        { /* the three long fields come back byte-for-byte, so a cut anywhere inside
+             one of them cannot hide behind "it is still valid UTF-8" */
+            char got[2200];
+            if (!v04_field(line, "name", got, sizeof got)) return fail("v04_max_name_field");
+            size_t el = strlen(got);
+            char *cut = strstr(line, "\"name\":\"");
+            if (!cut) return fail("v04_max_name_pos");
+            /* name: 511 legal bytes -> escaped to 1022 */
+            if (el != 511 || memcmp(got, ev.name, 511) != 0) {
+                printf("V04 max name round trip: %zu B\n", el);
+                return fail("v04_max_name_lost");
+            }
+            if (!v04_field(line, "magnet", got, sizeof got) || strcmp(got, ev.magnet) != 0) {
+                printf("V04 max magnet round trip: %zu B want %zu\n", strlen(got), strlen(ev.magnet));
+                return fail("v04_max_magnet_lost");
+            }
+            if (!v04_field(line, "torrent", got, sizeof got) || strcmp(got, ev.torrent_path) != 0) {
+                printf("V04 max path round trip: %zu B\n", strlen(got));
+                return fail("v04_max_path_lost");
+            }
+            /* the escape really expanded the name (otherwise the case would be the
+               ASCII one r29 already covers): 255 two-byte characters stay raw */
+            if (strstr(cut, "\xc5\x82") == NULL) return fail("v04_max_no_multibyte");
+        }
+        /* non-vacuity, in-test: one byte less of cap than the line needs is the
+           r29 fallback, and the line's real width is what makes that so. */
+        {
+            static char tight[40960 + 16];
+            memcpy(tight, line, 8);
+            if (ntx_ipc_share_event_json(tight, (size_t)w, &ev) <= 0 ||
+                strcmp(tight, "{\"type\":\"share\",\"i\":15,\"ok\":0,\"code\":\"io\"}") != 0) {
+                printf("V04 tight cap %d did not reach the fallback: %.60s\n", w, tight);
+                return fail("v04_max_bound_real");
+            }
+        }
+        printf("V04 max-size share event = %d B (name 511 B, magnet %d B, path %d B, buf %zu B)\n",
+               w, NTX_IPC_MAGNET_MAX, NTX_SHARE_PATH_MAX - 1, sizeof g_share_evt);
+        if (ok("v04_share_event_max_size")) return 1;
+    }
+
+    { /* ── V04 (d) · `add` with a REAL magnet longer than 511 B ───────────────
+         docs/json-api.md §Limits: "`magnet` at most **2048** bytes after unescaping
+         (longer: `io`) — the old 511-byte cap was relaxed for `add`, so a magnet
+         with many `tr=` parameters fits". So the 512 B framer line buffer makes
+         this a SUCCESS test, not a rejection test — and r31 only ever drives
+         generated magnets (1946 B, unreserved-only). This one is a real magnet
+         with many percent-encoded tr= parameters, >511 B: it must survive the
+         framer, the parser and the dispatcher, and its trackers must reach the
+         session. The >2048 B verdict stays pinned by r31's probe; the 512 B itself
+         is pinned here as the width r31's 1946 B magnet already cleared, so the
+         relaxation is measured, not assumed. ── */
+        ntx_config cfg;
+        ntx_netx *nx;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.store_dir = "test/.scratch/ntx-ipc-v04";
+        uint8_t mih[20], mih2[32];
+        for (int k = 0; k < 20; k++) mih[k] = (uint8_t)(0x30 + k);
+        for (int k = 0; k < 32; k++) mih2[k] = (uint8_t)(0x70 + k);
+        const char *tl[6];
+        char urls[6][128];
+        for (int k = 0; k < 6; k++)
+            snprintf(urls[k], sizeof urls[k],
+                     "https://tracker%d.example.org:443/%02d/announce?q=%%C5%%82%%C5%%82", k, k);
+        for (int k = 0; k < 6; k++) tl[k] = urls[k];
+        char mag[NTX_SHARE_MAGNET_MAX];
+        if (ntx_share_magnet(mag, sizeof mag, mih, mih2, "V04 Long Name 01.bin", tl, 6) != 0)
+            return fail("v04_real_magnet_build");
+        size_t mlen = strlen(mag);
+        if (mlen <= 511) { printf("V04 real magnet is only %zu B\n", mlen); return fail("v04_real_magnet_short"); }
+        if (mlen > (size_t)NTX_IPC_MAGNET_MAX) {
+            printf("V04 real magnet %zu B past the add cap\n", mlen);
+            return fail("v04_real_magnet_long");
+        }
+        char line[4608];
+        snprintf(line, sizeof line, "{\"cmd\":\"add\",\"seq\":5,\"magnet\":\"%s\"}\n", mag);
+        if (strlen(line) >= (size_t)NTX_IPC_LINE_MAX) return fail("v04_real_frame_fit");
+
+        /* over the SHIPPED framer + pump, on a real fd 0, so the 512 B question is
+           answered by the product and not by a hand-fed parser */
+        ntx_session *s = mk(&nx, &cfg);
+        if (feed_stdin(line, strlen(line)) != 0) { drop(s, nx); return fail("v04_real_stdin"); }
+        int save_out = 0;
+        if (v04_cap_open("test/.scratch/ntx-ipc-v04-add.ndjson", &save_out) != 0) {
+            drop(s, nx); return fail("v04_real_cap");
+        }
+        ntx_ipc_reader_init(&g_rd);
+        g_ipc_open = 1; g_ipc_quit = 0; g_ipc_stash_len = 0;
+        ipc_pump_tick(s);
+        fflush(stdout);
+        v04_cap_close(save_out);
+        g_ipc_open = 0;
+        if (v04_load("test/.scratch/ntx-ipc-v04-add.ndjson") != 0) { drop(s, nx); return fail("v04_real_read"); }
+        int ia = v04_first("\"seq\":5,\"cmd\":\"add\"");
+        if (ia < 0 || !strstr(v04_ln[ia], "\"ok\":1") || strstr(v04_ln[ia], "\"code\"")) {
+            printf("V04 add of a %zu B magnet: %s\n", mlen, ia < 0 ? "(no reply)" : v04_ln[ia]);
+            drop(s, nx); return fail("v04_real_add_refused");
+        }
+        if (v04_count("\"code\":\"bad_json\"") != 0) {
+            printf("V04 the framer dropped the %zu B line (§3.7)\n", strlen(line));
+            drop(s, nx); return fail("v04_real_frame_dropped");
+        }
+        char ih[41];
+        ntx_hex40(ih, mih);
+        if (!strstr(v04_ln[ia], ih) || !strstr(v04_ln[ia], "\"state\":0")) {
+            printf("V04 add ack: %s\n", v04_ln[ia]);
+            drop(s, nx); return fail("v04_real_add_ih");
+        }
+        /* the many tr= the docs promise really arrived */
+        int nurl = 0;
+        for (int k = 0; k < 6; k++) if (s->trk_urls[0][k][0]) nurl++;
+        if (s->trk_n[0] != 6 || nurl != 6) {
+            printf("V04 long magnet kept trk_n=%d urls=%d, want 6/6\n", s->trk_n[0], nurl);
+            drop(s, nx); return fail("v04_real_trackers");
+        }
+        if (strcmp(s->tts[0].name, "V04 Long Name 01.bin") != 0) {
+            printf("V04 long magnet dn=%s\n", s->tts[0].name);
+            drop(s, nx); return fail("v04_real_dn");
+        }
+        /* the relaxation is measured, not assumed: the same line one byte past
+           511 is still accepted, and the 512 B boundary itself is only meaningful
+           because a magnet this long is what the docs promise to fit — one byte
+           past the 2048 cap stays `io` (r31's probe pins that width exactly). */
+        if (mlen < 512) {
+            printf("V04 magnet %zu B never crossed the old 511 B cap\n", mlen);
+            drop(s, nx); return fail("v04_real_below_old_cap");
+        }
+        drop(s, nx);
+        printf("V04 real add: %zu B magnet (past the old 511 B cap), %zu B line, 6 trackers\n",
+               mlen, strlen(line));
+        if (ok("v04_add_long_magnet_success")) return 1;
     }
 
     return 0; /* tasks append here; keep the final line intact */
