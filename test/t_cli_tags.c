@@ -724,8 +724,9 @@ int main(void) {
         }
         memset(pad, 'b', 17); pad[17] = 0;
         {
-            char col[64];
-            snprintf(col, sizeof col, "%s   ", pad); /* 17 kept + 3 pad to 20 */
+            char col[24];
+            memcpy(col, pad, 17);     /* 17 kept ... */
+            memcpy(col + 17, "   ", 4); /* ... + 3 pad to 20, and the NUL */
             if (strncmp(line, col, strlen(col)) != 0) {
                 fprintf(stderr, "line: %s\nwant: [%s]\n", line, col);
                 return fail("r8_cli_name_4byte_cut");
