@@ -686,7 +686,6 @@ int main(void) {
     test_mse_hash_mismatch_silent_drop();
     test_hashing_share_not_matchable();
     test_mse_zero_skey_dropped();
-    test_mse_zero_skey_dropped();
     test_share_ready_matches_real_hash();
     printf("ALL PASS\n");
     return 0;

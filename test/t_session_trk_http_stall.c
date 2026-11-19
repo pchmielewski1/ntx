@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <limits.h> /* LONG_MAX: what a cleared fetch budget reports */
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
@@ -115,8 +116,28 @@ static uint64_t now_us(void) {
 }
 
 #define N_TRK 5
-#define ITER_LIMIT_MS 1000 /* the plan's bound for one loop iteration */
-#define STALL_FLOOR_MS 100 /* below this the "dead tracker" is not stalling us */
+/* V02: the ceiling is DERIVED from the production budget instead of a bare 1000, so it
+ * cannot quietly lose its headroom when the budget moves. NTX_TRK_HTTP_BUDGET_MS lives in
+ * src/core/ntx_session_trk.c (visible here because this file includes the .c) and is what
+ * one announce is allowed to spend; NTX_TRK_HTTP_SLACK_MS is what a slow box may add on
+ * top of it before this test calls it a defect.
+ *   measured on this host at the 900 ms budget: 948-963 ms per announce, i.e. 48-63 ms
+ *   over it (docs/network.md records 958-964). Against the old bare `1000` that left
+ *   ~37-52 ms of headroom on a wall clock, and this suite gates every release — release.yml
+ *   runs it on riscv64 under qemu-user, where one unlucky iteration stops a release or
+ *   forces a flaky re-run.
+ *   500 ms of slack is ~8x the worst measured overshoot. The defect this test exists for
+ *   blocked 30 721-30 809 ms per iteration (e507d6f, measured 3x red), which is >20x the
+ *   1400 ms the formula gives at the 900 ms budget and >6x what it gives at any budget the
+ *   fetch has carried since: the slack absorbs a slow CPU, it does not hide the stall.
+ * Two signals, not one. The wall clock (worst_ms) is bounded above and floored below — the
+ * floor is the anti-vacuous guard, since a trap that stopped being a black hole would
+ * return in microseconds and prove nothing. On top of it the assertion below asks the
+ * driver itself whether each fetch was ended BY the budget, which a stopwatch cannot tell
+ * from a fetch that bailed early for an unrelated reason. */
+#define NTX_TRK_HTTP_SLACK_MS 500u
+#define ITER_LIMIT_MS (NTX_TRK_HTTP_BUDGET_MS + NTX_TRK_HTTP_SLACK_MS)
+#define STALL_FLOOR_MS 100 /* below this the "dead tracker" is not stalling us at all */
 
 static int held[64];
 static int n_held;
@@ -169,17 +190,35 @@ int main(void) {
     s->trk_http_event[0] = NTX_TRACKER_EVENT_NONE;
 
     uint64_t worst_ms = 0, total_ms = 0;
+    int budget_path_ran = 1;
     for (int i = 0; i < N_TRK; i++) {
         drain_accepts(lfd);
+        /* The logic signal, not a stopwatch reading. trk_http_announce arms the fetch with
+         * ntx_tls_set_io_deadline_ms(now + budget) and clears it back to 0 on the way out,
+         * so the deadline is a fact about WHICH code ended this announce, not about how
+         * long it took. Handing the fetch a destroyed sentinel first (absolute ms 1,
+         * already expired) and reading LONG_MAX back afterwards — LONG_MAX being what a
+         * cleared deadline reports — proves both halves at once: the budget path really
+         * was the one that ran (a fetch that bailed without ever arming, or a stand-in that
+         * never arms, leaves the sentinel in place and the read says 0, i.e. bounded), and
+         * no deadline leaked out of the iteration to starve the next fetch or the rest of
+         * the event loop. Nothing else in this process arms a deadline: the tracker address
+         * is a literal, so no DoH lookup runs. */
+        ntx_tls_set_io_deadline_ms(1);
         uint64_t t0 = now_us();
         ntx_session_trk_pump_http(s, 1); /* one loop iteration's worth of announces */
         uint64_t ms = (now_us() - t0 + 999) / 1000;
-        printf("announce %d: %llu ms\n", i, (unsigned long long)ms);
+        int armed_and_cleared = ntx_tls_budget_left_ms() == LONG_MAX;
+        printf("announce %d: %llu ms, budget armed-and-cleared by the fetch: %s\n", i, (unsigned long long)ms,
+               armed_and_cleared ? "yes" : "NO — the R38 budget path did not run");
+        if (!armed_and_cleared) budget_path_ran = 0;
         if (ms > worst_ms) worst_ms = ms;
         total_ms += ms;
     }
-    printf("5 dead HTTPS trackers: worst iteration %llu ms, total %llu ms\n",
-           (unsigned long long)worst_ms, (unsigned long long)total_ms);
+    printf("5 dead HTTPS trackers: worst iteration %llu ms, total %llu ms "
+           "(ceiling %u ms = budget %u + slack %u)\n",
+           (unsigned long long)worst_ms, (unsigned long long)total_ms,
+           (unsigned)ITER_LIMIT_MS, (unsigned)NTX_TRK_HTTP_BUDGET_MS, (unsigned)NTX_TRK_HTTP_SLACK_MS);
 
     int rc = 0;
     for (int i = 0; i < N_TRK; i++)
@@ -192,13 +231,24 @@ int main(void) {
                (unsigned long long)worst_ms);
         rc |= fail("stall_below_floor");
     }
-    if (worst_ms > ITER_LIMIT_MS) {
-        printf("one loop iteration blocked %llu ms (limit %d ms)\n",
-               (unsigned long long)worst_ms, ITER_LIMIT_MS);
-        rc |= fail("iteration_over_1s");
+    /* A logic signal, not a stopwatch reading: every announce must have been ended by the
+     * R38 budget path itself. An announce that returned for some other reason (a refused
+     * connect, a reset, an early bail in the TLS client) leaves the sentinel armed and
+     * reads back as still bounded, so it cannot pass for a budget-driven failure. This is
+     * the assertion that does not depend on how big the budget currently is. */
+    if (!budget_path_ran) {
+        printf("an announce ran without the R38 budget path — this proves nothing about the bound\n");
+        rc |= fail("budget_never_armed");
     }
-    if (rc == 0) printf("PASS trk_http_stall bounded (worst %llu ms <= %d ms)\n",
-                        (unsigned long long)worst_ms, ITER_LIMIT_MS);
+    if (worst_ms > ITER_LIMIT_MS) {
+        printf("one loop iteration blocked %llu ms (limit %u ms = budget %u + slack %u)\n",
+               (unsigned long long)worst_ms, (unsigned)ITER_LIMIT_MS, (unsigned)NTX_TRK_HTTP_BUDGET_MS,
+               (unsigned)NTX_TRK_HTTP_SLACK_MS);
+        rc |= fail("iteration_over_budget");
+    }
+    if (rc == 0)
+        printf("PASS trk_http_stall bounded (worst %llu ms <= %u ms, every announce failed on the %u ms budget)\n",
+               (unsigned long long)worst_ms, (unsigned)ITER_LIMIT_MS, (unsigned)NTX_TRK_HTTP_BUDGET_MS);
     for (int i = 0; i < n_held; i++) close(held[i]);
     close(lfd);
     ntx_session_free(s);
