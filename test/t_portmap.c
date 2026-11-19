@@ -1128,6 +1128,67 @@ static int pcp_answer_all(sess *x, uint8_t proto, uint16_t ext_port, const uint8
     return q;
 }
 
+/* pcp_replay_copies: N copies of ONE MAP reply, every copy built from the request the
+ * driver has OUTSTANDING at the instant the copy goes out.
+ *
+ * This is the teeth the re-delivery case H5 was missing. A reply whose nonce matches
+ * nothing is answered rc=-2 — "not an answer to our query" — by pcp_parse_map long
+ * before the receive path sees it, so five copies carrying the nonce of the ORIGINAL
+ * ask are ONE accepted reply plus four datagrams the codec ignored: such a fixture
+ * cannot fail, in this tree or any other (the review's V07). Answering the request that
+ * is actually on the wire makes every copy an answer the codec accepts, so a driver that
+ * re-enters the lost-packet path from inside pm_on_rw is handed a fresh accepted reply
+ * for every request it emits, and the ask count grows with the copies. The fixed driver
+ * accepts the first copy, is owed exactly one re-request by the tick, and the copies
+ * after that have nothing left to be re-delivered to — which is what a re-delivery IS
+ * once the answer to it has been consumed.
+ *
+ * Returns the number of FRESH asks (distinct nonces) the driver emitted. `seen`/`*q` are
+ * the caller's tally, so a probe can be split over calls; a pre-existing nonce in `seen`
+ * is not counted again (a retransmission repeats it, updates the request the next copy
+ * answers, and is not a second ask). Copies stop as soon as nothing is outstanding: with
+ * no request on the wire there is nothing left to re-deliver, and waiting longer would
+ * only measure the renewal schedule. */
+#define PCP_ASK_CAP 64
+
+static void pcp_replay_collect(uint8_t proto, uint8_t last[60], int *have, uint8_t seen[PCP_ASK_CAP][12], int *q) {
+    uint8_t buf[2048];
+    ssize_t r;
+    while ((r = gw_get(buf, sizeof buf)) > 0) {
+        if (!req_is(buf, r, proto, 7200)) continue; /* 7200: the lifetime pm_build asks for */
+        int k = 0;
+        while (k < *q && memcmp(seen[k], buf + 24, 12) != 0) k++;
+        if (k == *q && *q < PCP_ASK_CAP) memcpy(seen[(*q)++], buf + 24, 12);
+        memcpy(last, buf, 60); /* a retransmission is still the ask that is outstanding */
+        *have = 1;
+    }
+}
+
+static int pcp_replay_copies(sess *x, uint8_t last[60], uint8_t seen[PCP_ASK_CAP][12], int *q, uint8_t proto,
+                             uint16_t ext_port, const uint8_t ext_ip[16], uint32_t reply_life, uint32_t epoch,
+                             int copies, uint64_t step_ms, int steps) {
+    uint8_t rsp[64];
+    int have = 0;
+    for (int c = 0; c < copies; c++) {
+        int waited = 0;
+        while (!have && waited++ < steps) { /* walk the schedule until the ask is on the wire */
+            ntx_portmap_test_advance_ms(step_ms);
+            pm_tick(x);
+            pump_ms(x->n, 10);
+            pcp_replay_collect(proto, last, &have, seen, q);
+        }
+        if (!have) break;
+        pcp_resp(rsp, last, ext_port, ext_ip, reply_life, epoch);
+        gw_send(rsp, 60);
+        pump_ms(x->n, 20);
+        pm_tick(x); /* the fixed driver's re-request goes out HERE, never from pm_on_rw */
+        pump_ms(x->n, 20);
+        pcp_replay_collect(proto, last, &have, seen, q);
+    }
+    gw_drain();
+    return *q;
+}
+
 static void both_active(sess *x, uint16_t ext, const uint8_t ip[16]) {
     pcp_grant(x, NTX_PCP_PROTO_TCP, ext, ip, 7200);
     pcp_grant(x, NTX_PCP_PROTO_UDP, ext, ip, 7200);
@@ -1990,11 +2051,18 @@ int main(void) {
         ck_eq(x.s->pm->phase, -1, "H3_nothing_outstanding");
         ck_eq(x.s->pm->tries, 0, "H3_no_retries");
         ck_eq(ntx_session_adv_port(x.s), ntx_netx_port(x.n), "H3_none_adv_port");
+        /* And it stays that way while the gateway keeps answering — where "keeps
+         * answering" means answering whatever the driver has OUTSTANDING at that instant
+         * (see pcp_replay_copies). Re-delivering this refusal five times to a nonce the
+         * driver no longer holds answers nothing and pins nothing, which is why the old
+         * form of this assertion could not fail; while the sequence is still live it does:
+         * the driver that re-requests from its rx path is handed a fresh lifetime-0 on
+         * the very nonce it just drew, and each answer buys another ask. */
+        uint8_t last[60], seen[PCP_ASK_CAP][12];
+        int q = 0;
+        ck_eq(pcp_replay_copies(&x, last, seen, &q, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 0, PCP_EPOCH_LIVE,
+                                5, 1000, 30), 0, "H3_zero_lifetime_no_loop");
         ck_eq(pm_sends_in(&x, 60000, 6), 0, "H3_no_further_resend");
-        /* And it stays that way while the gateway keeps answering: a driver that
-         * re-requests from the rx path is handed a fresh refusal with every answer. */
-        ck_eq(pcp_answer_all(&x, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 0, PCP_EPOCH_LIVE, "H3b", 1000, 30), 0,
-              "H3_zero_lifetime_no_loop");
         ck(ntx_session_portmap_state(x.s) == NTX_PM_NONE, "H3_stays_none");
         ntx_session_portmap_stop(x.s);
         sess_close(&x);
@@ -2046,16 +2114,25 @@ int main(void) {
         pm_tick(&x);
         uint8_t req[2048], rsp[64];
         ck_eq(gw_get(req, sizeof req), 60, "H5_renew_sent");
-        pcp_resp(rsp, req, EXT_PORT, pub, 7200, 0);
-        for (int i = 0; i < 5; i++) {
-            gw_send(rsp, 60);
-            pump_ms(x.n, 20);
-        }
-        pm_tick(&x);
+        pcp_resp(rsp, req, EXT_PORT, pub, 7200, 0); /* the rolled-back answer to THAT ask */
+        gw_send(rsp, 60);
+        pump_ms(x.n, 20);
+        pm_tick(&x); /* the fixed driver asks again HERE — once, on the tick, never from pm_on_rw */
         ck(ntx_session_portmap_state(x.s) == NTX_PM_PENDING, "H5_rollback_pending");
-        ck_eq(pcp_answer_all(&x, NTX_PCP_PROTO_TCP, 40126, pub, 7200, PCP_EPOCH_LIVE, "H5", 1000, 30), 1,
-              "H5_one_re_request_for_five_replies");
+        /* The four further copies of the rolled-back answer. Each is rebuilt from the
+         * request the driver has outstanding at the instant it goes out, so the codec
+         * accepts every one of them (a copy answering a nonce the driver never asked
+         * about is dropped by pcp_parse_map as "not an answer to our query" and the
+         * case would prove nothing — see the helper). A driver that asks again from
+         * inside its receive path is therefore answered for THAT ask as well, and the
+         * tally of fresh nonces is what this asserts on: one, not five. */
+        uint8_t last[60], seen[PCP_ASK_CAP][12];
+        int q = 0;
+        ck_eq(pcp_replay_copies(&x, last, seen, &q, NTX_PCP_PROTO_TCP, EXT_PORT, pub, 7200, 0, 4, 1000, 30),
+              1, "H5_one_re_request_for_five_replies");
         ck(ntx_session_portmap_state(x.s) == NTX_PM_ACTIVE, "H5_recovered");
+        ck_eq(ntx_session_adv_port(x.s), EXT_PORT, "H5_recovered_adv_port");
+        ck_eq(pm_sends_in(&x, 60000, 6), 0, "H5_stays_quiet_after_the_replays");
         ntx_session_portmap_stop(x.s);
         sess_close(&x);
     }
