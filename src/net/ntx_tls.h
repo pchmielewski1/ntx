@@ -79,8 +79,21 @@ void peer_ip_str(int fd, char *out, size_t outsz);
 void sock_timeouts(int fd, int sec);
 /* R38: absolute CLOCK_MONOTONIC deadline (ms) for one synchronous fetch; 0 = unbounded.
  * ntx_tls_budget_arm returns 0 once the deadline has passed, so the record layer can
- * bail out instead of sitting in a socket timeout for a tracker that never answers. */
+ * bail out instead of sitting in a socket timeout for a tracker that never answers.
+ *
+ * V01: a fetch has two very different waits, and one number cannot bound both. The
+ * pre-reply phases (resolve, connect, the TLS handshake including its TLS 1.2 retry,
+ * and writing the request) are the ones a tracker that accepts the connection and
+ * answers nothing blocks in, and a live tracker spends only a few hundred ms on them
+ * (docs/network.md, measured). The reply wait is the server's own think time, which a
+ * healthy tracker legitimately spends about a second on. So the pre-reply deadline is
+ * the tight one and ntx_tls_enter_reply_phase drops it as soon as the request is on
+ * the wire, leaving the whole fetch under the hard cap. Setting the io deadline clears
+ * the pre-reply one, so a stale leg can never shorten a later fetch; setting a
+ * pre-reply leg without an armed fetch is a no-op. */
 void ntx_tls_set_io_deadline_ms(uint64_t abs_ms);
+void ntx_tls_set_pre_reply_deadline_ms(uint64_t abs_ms);
+void ntx_tls_enter_reply_phase(void);
 long ntx_tls_budget_left_ms(void);
 int ntx_tls_budget_arm(int fd);
 int rec_send(ntx_tls *t, uint8_t type, const uint8_t *body, size_t body_len, tls_dir *d);

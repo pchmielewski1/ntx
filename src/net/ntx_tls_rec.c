@@ -117,18 +117,38 @@ void peer_ip_str(int fd, char *out, size_t outsz) {
  * the socket timeout to fit what is left, so no single fetch can run past it. 0 = no
  * bound (DoH, the golden TLS replay tests, everything that never sets one). */
 static uint64_t g_io_deadline_ms;
+static uint64_t g_pre_reply_ms; /* V01: tighter leg for resolve/connect/handshake, 0 = none */
 
-void ntx_tls_set_io_deadline_ms(uint64_t abs_ms) { g_io_deadline_ms = abs_ms; }
+/* The leg that is actually in force: the tighter of the two, 0 = unbounded. */
+static uint64_t budget_deadline(void) {
+    if (!g_io_deadline_ms) return 0;
+    if (!g_pre_reply_ms || g_pre_reply_ms > g_io_deadline_ms) return g_io_deadline_ms;
+    return g_pre_reply_ms;
+}
+
+void ntx_tls_set_io_deadline_ms(uint64_t abs_ms) {
+    g_io_deadline_ms = abs_ms;
+    g_pre_reply_ms = 0; /* a stale leg must not shorten the next fetch */
+}
+
+void ntx_tls_set_pre_reply_deadline_ms(uint64_t abs_ms) {
+    if (!g_io_deadline_ms) return; /* nothing armed: the fetch has no budget to leg */
+    g_pre_reply_ms = abs_ms;
+}
+
+void ntx_tls_enter_reply_phase(void) { g_pre_reply_ms = 0; }
 
 long ntx_tls_budget_left_ms(void) {
-    if (!g_io_deadline_ms) return LONG_MAX; /* unbounded */
-    int64_t left = (int64_t)g_io_deadline_ms - (int64_t)ntx_mono_ms();
+    uint64_t d = budget_deadline();
+    if (!d) return LONG_MAX; /* unbounded */
+    int64_t left = (int64_t)d - (int64_t)ntx_mono_ms();
     return left > 0 ? (long)left : 0;
 }
 
 int ntx_tls_budget_arm(int fd) {
-    if (!g_io_deadline_ms) return 1;
-    int64_t left = (int64_t)g_io_deadline_ms - (int64_t)ntx_mono_ms();
+    uint64_t d = budget_deadline();
+    if (!d) return 1;
+    int64_t left = (int64_t)d - (int64_t)ntx_mono_ms();
     if (left <= 0) return 0;
     struct timeval tv = { .tv_sec = (time_t)(left / 1000), .tv_usec = (suseconds_t)(left % 1000 * 1000) };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);

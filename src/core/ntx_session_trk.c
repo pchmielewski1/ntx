@@ -25,8 +25,18 @@
 #define TRK_DNS_CACHE 32
 
 /* R38 (spec §5.3 keeps one loop iteration near 50 ms): the wall-clock budget of ONE synchronous
- * announce fetch, connect through reply. A dead host must cost one strike, not half a minute. */
-#define NTX_TRK_HTTP_BUDGET_MS 900u
+ * announce fetch, connect through reply. A dead host must cost one strike, not half a minute.
+ *
+ * V01: one number cannot bound both of the fetch's waits, so it has two legs.
+ * NTX_TRK_HTTP_PRE_REPLY_MS bounds resolve + connect + the TLS handshake (including the
+ * TLS 1.2 fallback) + writing the request — the phases a tracker that accepts the
+ * connection and answers nothing blocks in. NTX_TRK_HTTP_BUDGET_MS bounds the whole
+ * fetch and is what the server's own think time is measured against: a healthy pinned
+ * tracker was measured taking 1303 ms end to end, 981 ms of it waiting for the reply
+ * after the request was already sent (docs/network.md). At the 900 ms this budget used
+ * to have, that announce — a SUCCESSFUL one — was killed and struck. */
+#define NTX_TRK_HTTP_BUDGET_MS 4500u
+#define NTX_TRK_HTTP_PRE_REPLY_MS 900u
 
 static struct {
     char host[128];
@@ -303,9 +313,16 @@ static void trk_http_announce(struct ntx_session *s, int tts_idx, int trk_idx, c
      * layer and the plain-HTTP recv loop (ntx_tls_budget_arm), and it expires the
      * fetch as an ordinary connect failure: one strike, dead after NTX_TRK_MAX_FAIL,
      * revived by share_revive_trackers. The DoH lookup a named host needs rides inside
-     * the same budget (~0.1 s of it), so a stuck resolver costs the announce instead of
-     * stalling the loop — the budget covers connect through reply, which is the point. */
-    ntx_tls_set_io_deadline_ms(ntx_mono_ms() + NTX_TRK_HTTP_BUDGET_MS);
+     * the same budget, so a stuck resolver costs the announce instead of stalling the
+     * loop. V01: measured against live trackers, the wait that a healthy announce
+     * actually spends is the SERVER'S THINK TIME after the request went out (981 ms of
+     * a 1303 ms announce), not the handshake, so the tight leg is armed only up to
+     * that point and ntx_http.c drops it once the request is written. The dead-host
+     * trap of t_session_trk_http_stall lives entirely in the armed leg, so it keeps
+     * its old bound; a live tracker gets the whole NTX_TRK_HTTP_BUDGET_MS. */
+    uint64_t now_ms = ntx_mono_ms();
+    ntx_tls_set_io_deadline_ms(now_ms + NTX_TRK_HTTP_BUDGET_MS);
+    ntx_tls_set_pre_reply_deadline_ms(now_ms + NTX_TRK_HTTP_PRE_REPLY_MS);
     int hrc = strk_http_get(full, body, sizeof body, &bn);
     ntx_tls_set_io_deadline_ms(0);
     if (hrc == NTX_HTTP_E_PIN) { /* §5.5 fail-closed: never retry a rejected key */

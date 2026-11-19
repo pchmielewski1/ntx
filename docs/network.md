@@ -253,24 +253,91 @@ s again. Five dead trackers — the size of the share pool — meant a **153 s**
 JSON, IPC, DHT and every peer connection went hungry. Design §5.3 caps only the hashing at ~50 ms
 per iteration, so nothing bounded this. It is a code-change case (> 1 s per iteration).
 
-The fix is `NTX_TRK_HTTP_BUDGET_MS` (900 ms) in `ntx_session_trk.c`: `trk_http_announce` sets an
+The fix is `NTX_TRK_HTTP_BUDGET_MS` in `ntx_session_trk.c`: `trk_http_announce` sets an
 absolute deadline with `ntx_tls_set_io_deadline_ms` around the fetch and clears it after. Every
 blocking wait inside the fetch — the read/write arms and the `SO_RCVTIMEO`/`SO_SNDTIMEO` of
 `sock_timeouts` in `ntx_tls_rec.c`, the `poll` in `tls13_fallback`, the plain-HTTP recv loop, the
 connect `poll` and the socket timeouts of `ntx_http.c` — clamps itself to the time left
 (`ntx_tls_budget_arm` / `ntx_tls_budget_left_ms`), so the fetch ends on the budget rather than on
 its own timeouts. The deadline is armed only around the tracker announce: a web-seed fetch or a
-DoH request of its own keeps its timeouts. The DoH lookup a *named* tracker host needs
-(`ntx_sock_resolve` inside `http_connect`) does ride inside the armed window, so a stuck resolver
-now costs the announce instead of stalling the loop — the budget covers connect through reply,
-which is the point.
+DoH request of its own keeps its timeouts.
 
-After the fix the same test reports **worst iteration 964 ms, total 4805 ms** in the recorded run
-(the figure tracks the 900 ms budget plus connect overhead, so it comes out a few ms under 1 s on
-every run). The test asserts both the bound (each iteration ≤ 1000 ms) and, as a floor, that the
-trap is still stalling us (≥ 100 ms per announce) — otherwise the assertion would be vacuous. A
-dead tracker now costs one strike, goes away after `NTX_TRK_MAX_FAIL`, and is revived by
-`share_revive_trackers`.
+### Two legs, because a dead host and a slow host are not the same wait (V01, measured 2026-11-18)
+
+The budget was first validated against the dead listener only, and set to one number — 900 ms.
+That number turned out to be **below the cost of a healthy announce**, so every successful
+HTTPS announce was killed as a failure: one strike each, `NTX_TRK_MAX_FAIL` strikes, every pinned
+tracker dropped, and `--share` never READY.
+
+The healthy half of the measurement, on this box, with the shipped stack (`ntx_sock_resolve` +
+`ntx_http_get` — DoH, TCP connect, TLS 1.3, request, reply — one announce per host per process,
+fresh random info-hash, cold DNS cache and no TLS session reuse; 50 announces per host, a scratch
+build of `make probe`'s source list, nothing left in the repo). `resolve` is the DoH lookup,
+`fetch` is everything from the TCP connect to the last reply byte, `announce` is the two together —
+and `announce` is what the budget has to fit:
+
+| host | resolve min/med/max | fetch min/med/max | announce min/med/max | n |
+| --- | --- | --- | --- | --- |
+| `tracker.pmman.tech` | 105/115/126 ms | 135/147/299 ms | 244/261/417 ms | 50 |
+| `tracker.7471.top` | 104/118/137 ms | 124/141/178 ms | 237/260/291 ms | 50 |
+| `tracker.zhuqiy.com` | 101/118/150 ms | 251/269/294 ms | 366/385/429 ms | 50 |
+| `1337.abcvg.info` | 98/118/128 ms | 195/207/254 ms | 302/326/374 ms | 50 |
+| `tracker.yume-hatsuyuki.moe` | 106/119/166 ms | 305/345/376 ms | 419/466/519 ms | 50 |
+
+250 announces, p95 480 ms, p99 496 ms — and an earlier set, taken while the box was busier, had a
+**worst successful announce of 1303 ms**, on `1337.abcvg.info`, which is 45 % over the 900 ms the
+budget had. That host is also the one the §6 survey accepted with peers for the hash, so it is
+exactly the announce `--share` depends on, and it is the one that was being killed. (For
+comparison: `test/trk_http_probe.c` in survey mode prints ~1.4–2.0 s per host. That figure is the
+fetch **plus its own `sleep(1)`** between the two announces of the §6.3 probe — the fetch inside it
+is the 1303 ms above, not 2 s. Quoting the wall time around that tool would have inflated this
+table by a second per row.)
+
+Splitting the fetch by where the time goes (same client, marks around `http_connect`, the
+handshake, the request write and the response read; 32 runs) says the two waits are different in
+kind:
+
+| phase | what it is | measured min/med/max |
+| --- | --- | --- |
+| resolve + connect + TLS handshake | the phases the **dead-host trap** blocks in | 66/93/**311** ms |
+| request written | | < 1 ms |
+| wait for the reply | the **server's own think time** | 142/330/**981** ms |
+
+So the phases a silent tracker can hold are cheap (≤ 311 ms measured) and the phase a live tracker
+legitimately spends a second on is the one after the request is already on the wire. One bound
+cannot be tight for the first and generous for the second, so there are two:
+
+- `NTX_TRK_HTTP_PRE_REPLY_MS = 900` — armed by `trk_http_announce` for resolve, connect, the whole
+  handshake including the TLS 1.2 fallback, and the request write. 900 ms is ~2.9× the worst
+  measured 311 ms, and it is exactly the bound the dead-host test was validated at.
+- `NTX_TRK_HTTP_BUDGET_MS = 4500` — the hard cap on the whole fetch. `ntx_http.c` calls
+  `ntx_tls_enter_reply_phase()` once the request is written, which drops the tight leg and leaves
+  the reply the rest of the budget. 4500 ms is 3.45× the worst measured healthy announce and 3.5×
+  the 1292 ms sum of the two worst measured phases, so a connection three times slower than this
+  one still announces. It is still a large improvement on what it replaced: the cap alone is 6.8×
+  under the 30.7 s a dead host used to cost, and in practice a dead tracker is ended by the tight
+  leg at ~960 ms — 32× better, five of them 4.8 s of loop instead of 153 s.
+
+`ntx_tls_budget_arm` / `ntx_tls_budget_left_ms` use whichever leg is in force; setting the io
+deadline clears the pre-reply leg so a stale one cannot shorten a later fetch. The DoH lookup a
+*named* tracker host needs (`ntx_sock_resolve` inside `http_connect`) stays **inside** the armed
+window — it is one resolver round trip (104–152 ms cold, 0 ms from the 60 s TTL cache), it rides
+the tight leg with 3× headroom, and a stuck resolver must still cost the announce rather than
+stall the loop. Pulling it out would buy nothing measurable and would re-open the stall.
+
+The dead-host test still reports the same shape it always did — **worst iteration 961 ms, total
+4755 ms** for five black-holed trackers, measured again after this change, because the trap never
+gets past the pre-reply leg. The healthy half is now gated too: `test/t_session_trk_http_slow.c`
+forks `test/interop/share/tracker_https_slow.py`, a pinned loopback HTTPS tracker that finishes
+TLS and answers the announce but sleeps `--accept-ms`/`--handshake-ms`/`--request-ms`/
+`--response-ms`, one sleep per phase. It asserts that a 1500 ms announce (the measured healthy
+worst case) and a 65 %-of-budget announce both end OK with the reply's compact peer in the session,
+and that a budget+800 ms announce still fails, at the bound. Case A is the red-before-green
+evidence: with only the budget define reverted to 900 ms it prints
+`FAIL slow_healthy_announce_killed`.
+
+A dead tracker costs one strike, goes away after `NTX_TRK_MAX_FAIL`, and is revived by
+`share_revive_trackers`; a slow-but-live one now costs nothing at all.
 
 ## Share tracker survey (2026-11)
 

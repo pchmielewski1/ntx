@@ -227,6 +227,11 @@ static int http_get_range_tls(const char *url, uint64_t off, uint64_t len,
     int rl = http_build_get(up.path, host_hdr, off, len, req, sizeof req);
     if (rl < 0) goto cleanup;
     if (ntx_tls_write(&tls, req, (size_t)rl) != (ssize_t)rl) goto cleanup;
+    /* V01: the request is on the wire — from here the only thing left to wait for is
+     * the server's own answer, so the tight pre-reply leg comes off and the reply gets
+     * the rest of NTX_TRK_HTTP_BUDGET_MS. A tracker that answers nothing is already
+     * caught by that leg; see trk_http_announce. */
+    ntx_tls_enter_reply_phase();
     rb = malloc(cap + 8192);
     if (!rb) goto cleanup;
     if (ntx_https_read_response(&tls, rb, cap + 8192, &rn) != 0) goto cleanup;
@@ -277,6 +282,9 @@ int ntx_http_get_range(const char *url, uint64_t off, uint64_t len, uint8_t *out
         close(fd);
         return -1;
     }
+    /* V01: same two legs as the TLS path — the tight pre-reply leg covered resolve,
+     * connect and this send; what is left is the server's own think time. */
+    ntx_tls_enter_reply_phase();
     const size_t rcap = cap + 8192; /* headers (and chunk framing) come on top of the body */
     uint8_t *buf = malloc(rcap);
     if (!buf) {
