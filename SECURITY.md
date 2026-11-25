@@ -104,7 +104,12 @@ Other things to know:
 - **No CA store.** Trust is SPKI pinning. With the default **TOFU** mode, the first
   connection to a host that has no pin is trusted and remembered — an attacker present on
   that first connection is not detected. Use `--no-https-tofu` with `--https-pin-file` for
-  strict pinning.
+  strict pinning. Because trust is host→SPKI pin (a known_hosts model), the certificate's
+  own fields carry no trust: `notBefore`/`notAfter` and the subject name are **not
+  checked** — deliberate, so a clock-less embedded host (no RTC, no NTP yet) still
+  connects, and key revocation is a re-pin, not an expiry. The X.509 families this makes
+  moot (chain/CA-bit/critical-extension CVEs, BadCert hostname classes) are recorded as
+  structurally N/A in `docs/security-cve-checklist.md` §4.
 - **Tracker announces, PEX and DHT are plaintext**; the info-hash and your IP address are
   visible to the network path. Peer-wire encryption (MSE/PE) is obfuscation, not
   authentication. **Share slots are the exception:** a peer of a `--share` must complete
