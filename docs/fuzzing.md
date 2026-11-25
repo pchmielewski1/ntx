@@ -2,7 +2,7 @@
 
 ## Fuzzing
 
-There are four libFuzzer harnesses in `test/fuzz/`. They cover the parsers that handle bytes from the network. There is no `make` target for fuzzing; the only entry point is the runner script `test/fuzz/run_fuzz.sh`.
+There are six libFuzzer harnesses in `test/fuzz/`. They cover the parsers that handle bytes from the network. There is no `make` target for fuzzing; the only entry point is the runner script `test/fuzz/run_fuzz.sh`.
 
 | Harness | Entry points exercised | Input |
 |---------|------------------------|-------|
@@ -17,7 +17,7 @@ Notes:
 
 - Every harness `#include`s the `.c` files it needs (the tracker and HTTP harnesses pull in the TLS and crypto sources too, because the parsers live next to them), like the unit tests do, so each builds with a single compiler command.
 - The harnesses keep no state between calls: outputs are locals and the bencode tree is freed each iteration.
-- `fuzz_tracker.c` does not include `src/net/ntx_sock.c`. That file defines weak DoH stubs that would collide with the real definitions from `ntx_doh.c` inside one translation unit, so the harness provides six link-only stubs for the socket functions instead (`ntx_sock_tcp4`, `ntx_sock_tcp6`, `ntx_sock_connect_addr`, `ntx_sock_resolve`, `ntx_sock_tcp_connect_host`, `ntx_sock_local_port`). The parsers under test never call them.
+- `fuzz_tracker.c` does not include `src/net/ntx_sock.c`. That file defines weak DoH stubs that would collide with the real definitions from `ntx_doh.c` inside one translation unit, so the harness provides eight link-only stubs for the socket functions instead (`ntx_sock_tcp4`, `ntx_sock_tcp6`, `ntx_sock_udp4`, `ntx_sock_bind0`, `ntx_sock_connect_addr`, `ntx_sock_resolve`, `ntx_sock_tcp_connect_host`, `ntx_sock_local_port`). The parsers under test never call them.
 
 ### Running
 
@@ -28,8 +28,8 @@ test/fuzz/run_fuzz.sh
 The script, from the repository root:
 
 1. Detects a toolchain: first `cc -ffuzz-target -fsanitize=address,undefined`, then `clang -fsanitize=fuzzer,address,undefined`. If neither works it prints a `TOOLCHAIN:` message, skips the fuzzing and exits 0. In practice you need `clang` with the libFuzzer runtime.
-2. Creates the seed corpus under `test/fuzz/corpus/<name>/` (`bencode`, `tracker`, `dht`, `http`) by copying vectors from `test/vectors/bencode/` and `test/vectors/doh/` and generating the rest (UDP tracker replies, a DHT query and response, a URL, a tracker dictionary) with `python3`.
-3. For each of the four targets, builds the harness with `-O1 -g -std=c11 -Wall -Wextra -D_POSIX_C_SOURCE=200809L` plus the sanitizer flags (no `-Werror`) and runs it for 60 seconds with `-corpus=test/fuzz/corpus/<name> -max_len=4096 -timeout=5`.
+2. Creates the seed corpus under `test/fuzz/corpus/<name>/` (`bencode`, `tracker`, `dht`, `http`, `utp`, `x509`) by copying vectors from `test/vectors/bencode/` and `test/vectors/doh/` and generating the rest (UDP tracker replies, a DHT query and response, a URL, a tracker dictionary) with `python3`.
+3. For each of the six targets, builds the harness with `-O1 -g -std=c11 -Wall -Wextra -D_POSIX_C_SOURCE=200809L` plus the sanitizer flags (no `-Werror`) and runs it for 60 seconds with `-corpus=test/fuzz/corpus/<name> -max_len=4096 -timeout=5`.
 4. Prints `OK [name]: no crash, ...` or `CRASH [name]` with the artifact path and a hex dump of the first bytes. The script does not change its exit status on a crash, so read its output.
 
 Build products, logs and crash artifacts go to `test/.scratch/` (a gitignored scratch directory): the binaries `fuzz_<name>`, the logs `fuzz_<name>.log`, and crash files `fuzz_<name>_crash-*`.

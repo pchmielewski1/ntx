@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke fuzz (60s/target) for the 4 parser families.
+# Smoke fuzz (60s/target) for the 6 parser families.
 # Toolchain: gcc lacks -ffuzz-target -> clang -fsanitize=fuzzer,address,undefined (auto-detected).
 # All outputs go to test/.scratch/ (binaries, logs, crash artifacts). Never touches build/, ./ntx, .test.tmp.
 set -euo pipefail
@@ -28,7 +28,7 @@ fi
 echo "TOOLCHAIN: $CC ($FUZZ_FLAGS)"
 
 # --- seed corpus (valid inputs from fixtures / test files) ------------------
-mkdir -p "$CORPUS"/bencode "$CORPUS"/tracker "$CORPUS"/dht "$CORPUS"/http
+mkdir -p "$CORPUS"/bencode "$CORPUS"/tracker "$CORPUS"/dht "$CORPUS"/http "$CORPUS"/utp "$CORPUS"/x509
 cp test/vectors/bencode/spam.encoded   "$CORPUS/bencode/seed_spam"
 cp test/vectors/bencode/nested.encoded "$CORPUS/bencode/seed_nested"
 cp test/vectors/bencode/torrent.encoded "$CORPUS/bencode/seed_torrent"
@@ -74,6 +74,33 @@ w("dht/seed_nodes_compact", node + node)
 w("http/seed_url", b"http://tracker.example.com:8080/announce?info_hash=%AA%BB")
 w("http/seed_dict",
   be({"peers": b"\x01\x02\x03\x04\x1a\x41", "seeders": 1, "interval": 1800, "leechers": 2}))
+
+# utp: plain DATA, STATE with a 4-byte SACK extension, SYN
+def utp_hdr(t, ext=0):
+    return struct.pack(">BBHIHHHH", (t << 4) | 1, ext, 7, 1234, 5, 3000, 42, 41)
+w("utp/seed_data", utp_hdr(0) + b"handshake-bytes")
+w("utp/seed_state_sack", utp_hdr(2, 1) + struct.pack(">BB", 1, 4) + b"\xff\xff\x00\x00" + struct.pack(">BB", 0, 0))
+w("utp/seed_syn", utp_hdr(4))
+w("utp/seed_sack_only", bytes(range(64)))
+
+# x509: one valid PKCS#1 v1.5 and one PSS tuple from the checked-in vectors,
+# plus a valid ECDSA sig DER and P-256 SPKI (same bytes as t_p256_ecdsa.c)
+import glob
+for mode, vf in ((0, "test/vectors/rsa_pkcs1/vectors.txt"), (1, "test/vectors/rsa_pss/vectors.txt")):
+    for line in open(vf):
+        f = line.split()
+        if len(f) == 6 and f[4] == "1":
+            w("x509/seed_%s" % ("pkcs1" if mode == 0 else "pss"),
+              bytes([mode]) + bytes.fromhex(f[0]) + bytes.fromhex(f[3]) + bytes.fromhex(f[2]))
+            break
+der = bytes.fromhex("3046022100914d52011344b43cf280b169a35f31ac8b47a5f9b3e2bae70989797496"
+                    "9e33ba022100ec499be92f70d359c6671c06575979dee9b8ade36b23c648f26aab2f"
+                    "3c1dd35b")
+spki = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d03010703420004f50b530908b6fe"
+                     "b23ced7a7cb90a3c0bcad11c34517fce18e1b0b7f6a114302731323a0b38319b91"
+                     "f90f758ab4fd1d6b255be008465e651926629dc7a333ce53")
+w("x509/seed_sig_der", bytes([2]) + der)
+w("x509/seed_spki", bytes([3]) + spki)
 PYEOF
 
 # --- build + smoke fuzz ------------------------------------------------------
@@ -82,9 +109,11 @@ declare -A HARNESS=(
   [tracker]=fuzz_tracker.c
   [dht]=fuzz_dht.c
   [http]=fuzz_http.c
+  [utp]=fuzz_utp.c
+  [x509]=fuzz_x509.c
 )
 
-for name in bencode tracker dht http; do
+for name in bencode tracker dht http utp x509; do
   bin="$WORK/fuzz_$name"
   echo "== [$name] build"
   "$CC" -O1 -g -std=c11 -Wall -Wextra -D_POSIX_C_SOURCE=200809L $FUZZ_FLAGS \

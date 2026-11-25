@@ -1,5 +1,5 @@
 /* ntx_sock.c excluded: its weak DoH stubs redefine ntx_doh.c symbols in one TU;
-   the 6 ntx_sock stubs below are link-only (parse paths never call them). */
+   the 8 ntx_sock stubs below are link-only (parse paths never call them). */
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -32,6 +32,8 @@
 
 int ntx_sock_tcp4(void) { return -1; }
 int ntx_sock_tcp6(void) { return -1; }
+int ntx_sock_udp4(void) { return -1; }
+uint16_t ntx_sock_bind0(int fd) { (void)fd; return 0; }
 int ntx_sock_connect_addr(int fd, const ntx_addr *addr, uint16_t port) {
     (void)fd; (void)addr; (void)port; return -1;
 }
