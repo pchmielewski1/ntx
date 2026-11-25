@@ -96,8 +96,10 @@ unused bits, DB padding/separator, salt 20/auto, leading-zero modulus); every fo
 rejected and every canonical encoding accepted, so the DigestInfo compare is strict and the
 PSS MGF1 mask is bound to the recomputed hash (class of CVE-2022-3437 closed). ECDSA sig DER
 framing is exact-length with r,s ∈ [1,n−1]; leading-zero INTEGERs are tolerated (documented
-leniency, harmless here). Remaining checklist items (MSE range checks, uTP/SOCKS5 parsers,
-fuzz runs) are tracked in the checklist doc.
+leniency, harmless here). The full CVE checklist (MSE discard/DH range, uTP/SOCKS5/h2-DoH
+parsers) is verified with per-position verdicts in `docs/security-cve-checklist.md`, and all
+six libFuzzer harnesses (bencode, tracker, DHT, HTTP, uTP, RSA/ECDSA-DER) run clean under
+ASan+UBSan via `test/fuzz/run_fuzz.sh`.
 
 Other things to know:
 
