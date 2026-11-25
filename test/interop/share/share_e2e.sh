@@ -258,6 +258,29 @@ poll 60 "$WORK/leech.ndjson" '"pct":100' || fail "leech did not complete within 
 poll 15 "$B/$NAME" '.' >/dev/null 2>&1 || true
 [ -f "$B/$NAME" ] || fail "downloaded file absent from store B" "$WORK/leech.err"
 
+# Extra leech for the landing page (site/capture.sh): same download again
+# against a fresh store, WITHOUT --stats-json, so ntx paints its real status
+# line on stderr. The @hash -> @dl -> @seed progression recorded here is what
+# the hero terminal replays; the NDJSON run above stays the machine-read one.
+# Only taken when the caller asked to keep evidence, so plain `make test-share`
+# pays nothing for it.
+if [ "${KEEP_EVIDENCE:-0}" = 1 ]; then
+  say "leech(status): replay without --stats-json for status-line capture"
+  C="$WORK/storeC"
+  mkdir -p "$C" || fail "cannot create $C"
+  timeout -k 5 150 "$ROOT/$BIN" --allow-local-peers --store-dir="$C" --no-port-map \
+      --port-lo=0 --port-hi=0 --verbose --log="$WORK/leech_status.diag.log" \
+      "$WORK/magnet.txt" </dev/null >/dev/null 2>"$WORK/leech_status.err" &
+  spawn
+  STATUS_PID=$!
+  poll 60 "$WORK/leech_status.err" '@seed' \
+    || say "leech(status): no @seed within 60s, keeping whatever lines exist"
+  kill "$STATUS_PID" 2>/dev/null || true
+  cmp "$SRC/$NAME" "$C/$NAME" \
+    || fail "status leech bytes differ source" "$WORK/leech_status.err"
+  say "leech(status): status lines captured to leech_status.err"
+fi
+
 # ------------------------------------------------------------ assertions -----
 # 1 — bytes
 cmp "$SRC/$NAME" "$B/$NAME" || fail "cmp: downloaded bytes differ from the source" "$WORK/leech.err"

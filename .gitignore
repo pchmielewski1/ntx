@@ -77,3 +77,5 @@ CLAUDE.md
 /trk_http_probe
 .test-live.tmp
 .tls_probe.tmp
+# Generated project landing page (site/ is rendered from the tree, not published)
+site/
