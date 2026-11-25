@@ -17,7 +17,7 @@ protector, fortify), a sanitizer sweep of all suites, and a "crypto freeze" (eve
 
 ## Review items
 
-Tracked in this document: a self-review of the crypto code raised eight items (R1-R8). All of
+Tracked below: a self-review of the crypto code raised eight items (R1-R8). All of
 them have been **addressed in code and tests**; "addressed" means the specific weakness is
 closed or its contract is enforced, not that the primitive has been independently audited.
 
@@ -68,6 +68,28 @@ measured on a binary (no dudect-style testing), and compilers are free to reintr
 
 RC4 is used only because BitTorrent MSE/PE mandates it; its known biases and timing
 behaviour are inherent to the algorithm.
+
+### Third review pass (CVE-checklist audit, 2026-11-25)
+
+`docs/security-cve-checklist.md` maps published TLS/X.509/RC4/DH/uTP vulnerabilities
+(OpenSSL, GnuTLS, Go, Firefox, PHP, libutp/Transmission, curl) onto our own code. The first
+verification item (TLS 1.2 state machine + 1.3→1.2 downgrade) confirmed the existing controls
+(CCS ordering, no renegotiation, no heartbeat, `DOWNGRD\x01` sentinel covered by the SKX
+signature, extension-whitelisted 1.3 ServerHello) and found three gaps, fixed test-first
+(each new test failed on the old code, then passed):
+
+| ID | Finding | Fix | Where |
+|----|---------|-----|-------|
+| F1 | Client sent an empty `renegotiation_info` but never checked the ServerHello echo (RFC 5746 3.5/4) | ServerHello without the empty RI echo aborts the handshake | `ntx_tls_handshake_12`; test `tls12-missing-ri-echo-rejected` (`test/t_tls_pin.c`) |
+| F2 | NewSessionTicket accepted in plaintext **before** the server CCS (RFC 5246 7.4.3 requires it after); fail-closed via Finished mismatch, but out of spec | NST before the server CCS aborts | `ntx_tls_handshake_12`; test `tls12-nst-before-ccs-rejected` |
+| F5 | `rsa_from_spki` accepted RSA moduli below 2048-bit (class of CVE-2018-0739) | modulus must be 256..512 bytes (2048..4096-bit) | `rsa_from_spki`; tests `rsa-modulus-256bit-rejected`, `rsa-modulus-2040bit-rejected`, `rsa-modulus-2048bit-accepted` |
+
+Known-and-accepted from the same audit: server CCS may repeat before the first encrypted
+record (F3, harmless), negotiated ALPN is not checked against the offered list (F4, pinned
+servers only), TLS_FALLBACK_SCSV is not sent on the 1.3→1.2 reconnect (the signed
+`DOWNGRD\x01` sentinel plus the mandatory 0x0303 ServerHello version cover the downgrade
+class). Remaining checklist items (X.509 chain/CA-bit, PSS/PKCS#1 structure, MSE range
+checks, uTP/SOCKS5 parsers, fuzz runs) are tracked in the checklist doc.
 
 Other things to know:
 

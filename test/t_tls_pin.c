@@ -179,8 +179,10 @@ static size_t build_cert(uint8_t *out, const uint8_t qx[32], const uint8_t qy[32
 }
 
 /* Misbehaving-server switches for the TLS 1.2 mock (set in the parent before fork). */
-static int g_mock_sentinel;  /* server_random ends in "DOWNGRD\x01" (RFC 8446 4.1.3) */
-static int g_mock_dup_cert;  /* Certificate message sent twice */
+static int g_mock_sentinel;       /* server_random ends in "DOWNGRD\x01" (RFC 8446 4.1.3) */
+static int g_mock_dup_cert;       /* Certificate message sent twice */
+static int g_mock_no_ri;          /* ServerHello omits the renegotiation_info echo (F1) */
+static int g_mock_nst_before_ccs; /* NewSessionTicket in plaintext before the server CCS (F2) */
 
 typedef struct {
     int fd;
@@ -214,7 +216,9 @@ static void mock_srv_run(mock_srv_t *m) {
 
     uint8_t msg[18432];
     size_t o = 0;
-    size_t sh_len = 38 + (m->sh_alpn ? 17 : 0);
+    int with_ri = !g_mock_no_ri; /* F1: honest servers echo renegotiation_info (RFC 5746 3.7) */
+    size_t elen = (m->sh_alpn ? 15 : 0) + (with_ri ? 5 : 0);
+    size_t sh_len = 38 + 2 + elen;
     msg[o++] = 2;
     ntx_wire_wr24(msg + o, (uint32_t)sh_len); o += 3;
     ntx_wire_wr16(msg + o, 0x0303); o += 2;
@@ -222,13 +226,18 @@ static void mock_srv_run(mock_srv_t *m) {
     msg[o++] = 0;
     ntx_wire_wr16(msg + o, 0xC02B); o += 2;
     msg[o++] = 0;
+    ntx_wire_wr16(msg + o, (uint16_t)elen); o += 2;
     if (m->sh_alpn) {
-        ntx_wire_wr16(msg + o, 15); o += 2;
         ntx_wire_wr16(msg + o, 16); o += 2;
         ntx_wire_wr16(msg + o, 11); o += 2;
         ntx_wire_wr16(msg + o, 9); o += 2;
         msg[o++] = 8;
         memcpy(msg + o, "http/1.1", 8); o += 8;
+    }
+    if (with_ri) {
+        ntx_wire_wr16(msg + o, 0xff01); o += 2; /* renegotiation_info, empty */
+        ntx_wire_wr16(msg + o, 1); o += 2;
+        msg[o++] = 0;
     }
     uint32_t clist = 3 + (uint32_t)m->cert_len;
     size_t cert_msg_start = o;
@@ -311,6 +320,13 @@ static void mock_srv_run(mock_srv_t *m) {
     tls12_prf(master, 48, "client finished", hs_hash, 32, verify, 12);
     if (memcmp(verify, rec + 4, 12) != 0) return;
     ntx_sha256_update(&hs, rec, rlen);
+    if (g_mock_nst_before_ccs) {
+        /* RFC 5246 7.4.3: NewSessionTicket MUST follow the server CCS. */
+        static const uint8_t nst[12] = { 4, 0, 0, 8, 0, 0, 0, 0x10, 0, 0, 0, 0 };
+        if (rec_send(&st, 22, nst, sizeof nst, &plain) != 0) return;
+        ntx_sha256_update(&hs, nst, sizeof nst); /* honest transcript: a client that
+                                                    accepts the early NST must complete */
+    }
     tmp = hs;
     ntx_sha256_final(&tmp, hs_hash);
     uint8_t ccs = 1;
@@ -455,6 +471,55 @@ static void run_alpn_case(const char *name, int sh_alpn, int pin_slot, int expec
     printf("PASS %s\n", name);
 }
 
+/* ---- F5 helpers: synthetic RSA SubjectPublicKeyInfo with an nlen-byte modulus ---- */
+
+static size_t der_hdr(uint8_t *out, uint8_t tag, size_t len) {
+    size_t o = 0;
+    out[o++] = tag;
+    if (len < 128) {
+        out[o++] = (uint8_t)len;
+    } else if (len < 256) {
+        out[o++] = 0x81;
+        out[o++] = (uint8_t)len;
+    } else {
+        out[o++] = 0x82;
+        out[o++] = (uint8_t)(len >> 8);
+        out[o++] = (uint8_t)len;
+    }
+    return o;
+}
+
+static size_t build_rsa_spki(uint8_t *out, size_t nlen) {
+    uint8_t ints[280];
+    size_t ik = 0;
+    ik += der_hdr(ints + ik, 0x02, nlen + 1); /* INTEGER: 0x00 pad + nlen bytes, high bit set */
+    ints[ik++] = 0x00;
+    ints[ik++] = 0x81;
+    for (size_t i = 1; i < nlen; i++) ints[ik++] = 0xa5;
+    ints[ik++] = 0x02;
+    ints[ik++] = 0x03; /* INTEGER 65537 */
+    ints[ik++] = 0x01;
+    ints[ik++] = 0x00;
+    ints[ik++] = 0x01;
+    uint8_t rsa[300]; /* RSAPublicKey ::= SEQUENCE { modulus, exponent } */
+    size_t rk = der_hdr(rsa, 0x30, ik);
+    memcpy(rsa + rk, ints, ik);
+    rk += ik;
+    uint8_t body[600];
+    size_t bo = 0;
+    static const uint8_t ai[15] = { 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7,
+                                    0x0d, 0x01, 0x01, 0x01, 0x05, 0x00 };
+    memcpy(body + bo, ai, sizeof ai); /* AlgorithmIdentifier: rsaEncryption */
+    bo += sizeof ai;
+    bo += der_hdr(body + bo, 0x03, rk + 1); /* BIT STRING */
+    body[bo++] = 0x00;
+    memcpy(body + bo, rsa, rk);
+    bo += rk;
+    size_t o = der_hdr(out, 0x30, bo);
+    memcpy(out + o, body, bo);
+    return o + bo;
+}
+
 int main(void) {
     size_t der_len;
     uint8_t *der;
@@ -573,6 +638,15 @@ int main(void) {
     g_mock_dup_cert = 1;
     run_alpn_case("tls12-duplicate-certificate-rejected", 1, 0, NTX_TLS_FAIL);
     g_mock_dup_cert = 0;
+    /* F1 (RFC 5746 3.5/4): the client sent an empty renegotiation_info; a ServerHello
+       without the echo must abort the handshake (secure-renegotiation downgrade). */
+    g_mock_no_ri = 1;
+    run_alpn_case("tls12-missing-ri-echo-rejected", 1, 0, NTX_TLS_FAIL);
+    g_mock_no_ri = 0;
+    /* F2 (RFC 5246 7.4.3): NewSessionTicket before the server CCS must be rejected. */
+    g_mock_nst_before_ccs = 1;
+    run_alpn_case("tls12-nst-before-ccs-rejected", 1, 0, NTX_TLS_FAIL);
+    g_mock_nst_before_ccs = 0;
     run_alpn_case("tls12-still-ok-after-negatives", 1, 0, NTX_TLS_OK);
 
     {
@@ -605,6 +679,36 @@ int main(void) {
         }
         printf("PASS rsa-spki-oid-checked\n");
         free(cert);
+    }
+
+    {
+        /* F5 (class of CVE-2018-0739): rsa_from_spki must refuse small RSA moduli
+           (>= 2048-bit accepted, < 2048-bit rejected). */
+        size_t sl;
+        const uint8_t *n, *e;
+        size_t nl, el;
+        uint8_t spki[600];
+
+        sl = build_rsa_spki(spki, 32); /* 256-bit modulus */
+        if (ntx_tls_rsa_pub_from_spki(spki, sl, &n, &nl, &e, &el) == 0) {
+            fprintf(stderr, "FAIL rsa-modulus-256bit-accepted\n");
+            exit(1);
+        }
+        printf("PASS rsa-modulus-256bit-rejected\n");
+
+        sl = build_rsa_spki(spki, 255); /* 2040-bit: one bit under the floor */
+        if (ntx_tls_rsa_pub_from_spki(spki, sl, &n, &nl, &e, &el) == 0) {
+            fprintf(stderr, "FAIL rsa-modulus-2040bit-accepted\n");
+            exit(1);
+        }
+        printf("PASS rsa-modulus-2040bit-rejected\n");
+
+        sl = build_rsa_spki(spki, 256); /* 2048-bit: at the floor */
+        if (ntx_tls_rsa_pub_from_spki(spki, sl, &n, &nl, &e, &el) != 0 || nl != 256) {
+            fprintf(stderr, "FAIL rsa-modulus-2048bit-rejected\n");
+            exit(1);
+        }
+        printf("PASS rsa-modulus-2048bit-accepted\n");
     }
 
     printf("ALL t_tls_pin PASS\n");

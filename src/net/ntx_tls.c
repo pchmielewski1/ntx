@@ -182,7 +182,9 @@ static int rsa_from_spki(const uint8_t *spki, size_t spki_len,
         exp++;
         elen--;
     }
-    if (mlen == 0 || mlen > 512 || elen == 0 || elen > 8) return -1;
+    if (mlen < 256 || mlen > 512 || elen == 0 || elen > 8) return -1; /* F5 (CVE-2018-0739
+                                                                          class): refuse
+                                                                          RSA below 2048-bit */
     *n_out = mod;
     *n_len = mlen;
     *e_out = exp;
@@ -495,7 +497,7 @@ static int ntx_tls_handshake_12(ntx_tls *t, int fd, const char *sni,
 
     uint8_t acc[MAX_HS_ACC];
     size_t acc_len = 0;
-    int got_sh = 0, got_cert = 0, got_skx = 0, got_shd = 0, pinned = 0;
+    int got_sh = 0, got_cert = 0, got_skx = 0, got_shd = 0, pinned = 0, ri_ok = 0;
     /* Server flight order (RFC 5246 7.4): ServerHello, Certificate, ServerKeyExchange,
        ServerHelloDone - each exactly once. */
     enum { S_SH, S_CERT, S_SKX, S_SHD, S_DONE } fl = S_SH;
@@ -563,10 +565,17 @@ static int ntx_tls_handshake_12(ntx_tls *t, int fd, const char *sni,
                                     t->alpn[pl] = 0;
                                 }
                             }
+                        } else if (et == 0xff01) {
+                            /* RFC 5746 3.5/3.7: we sent an empty renegotiation_info, so the
+                               server must echo it with an empty renegotiated_connection.
+                               No echo -> abort (secure-renegotiation downgrade). */
+                            if (el != 1 || body[sh_off] != 0) return NTX_TLS_FAIL;
+                            ri_ok = 1;
                         }
                         sh_off += el;
                     }
                 }
+                if (!ri_ok) return NTX_TLS_FAIL; /* F1: RFC 5746 requires the RI echo */
                 got_sh = 1;
             } else if (mt == HS_CERT) {
                 if (fl != S_CERT || ml < 3) return NTX_TLS_FAIL;
@@ -716,6 +725,8 @@ static int ntx_tls_handshake_12(ntx_tls *t, int fd, const char *sni,
             uint32_t ml = ntx_wire_rd24(rec + off + 1);
             if (off + 4 + ml > rlen) return NTX_TLS_FAIL;
             if (mt == HS_NST) {
+                if (!got_sccs) return NTX_TLS_FAIL; /* F2: RFC 5246 7.4.3 — NST must
+                                                       follow the server CCS */
                 ntx_sha256_update(&hs, rec + off, 4 + ml);
             } else if (mt == HS_FIN) {
                 if (!got_sccs || ml != 12) return NTX_TLS_FAIL;
