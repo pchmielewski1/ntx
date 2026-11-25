@@ -929,7 +929,7 @@ a verdict in one never moves the other.
 - **The source rule.** A datagram is fed to the parsers only when its source is the gateway: the
   same 16 bytes, the same scope the socket was connected through, and port 5351 (`pm_src6_ok`).
   Nothing else on the LAN is believed. That is the one place `ntx` accepts unsolicited UDP — see
-  [SECURITY.md](../SECURITY.md#network-exposure).
+  [SECURITY.md](../SECURITY.md#pre-release-security-audit-october-2026).
 - **No NAT-PMP after IPv6.** RFC 6886 defines no IPv6 form, so the v6 half speaks PCP only: an
   `UNSUPP_VERSION` there is a refusal, and a socket error ends the sequence with `none` — no
   fallback is attempted, and none of it reaches the v4 sequence.

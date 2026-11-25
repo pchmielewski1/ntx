@@ -27,7 +27,7 @@ the right to download or share.
 
 ## Why bother
 
-`ntx` is about 25 kloc of C (sources and headers, comments included) that you can read end to
+`ntx` is about 31 kloc of C (sources and headers, comments included; 25 kloc without them) that you can read end to
 end: the wire protocol, the crypto, the event loop. If you want to know exactly what a
 BitTorrent client does on the wire, or want a client whose DNS and TLS trust path (DoH and
 SPKI pins instead of system DNS and a CA store) is small enough to audit yourself, start here.
@@ -318,7 +318,7 @@ src/
 └── ui/               status line, NDJSON, verbose log
 ```
 
-74 C sources and 64 headers, no dependencies. See [docs/architecture.md](docs/architecture.md)
+81 C sources and 71 headers, no dependencies. See [docs/architecture.md](docs/architecture.md)
 and [docs/module-map.md](docs/module-map.md).
 
 ## Testing
@@ -335,6 +335,7 @@ make probe        # optional tracker/DoH probe binary
 make pins-check   # release gate: are the pinned share-tracker keys still valid? (needs network)
 make pins-update  # absorb verified new share-tracker keys, print the diff (needs network)
 make ntx-sharetest # ./ntx-sharetest, built against the test share-tracker table
+make test-share   # end-to-end --share: share a file, leech it back via the pinned test HTTPS tracker
 make static       # musl static build (optional)
 make mips         # static OpenWrt mipsel binary ./ntx-mipsel (needs cross toolchain)
 make test-mipsel  # cross-compile every test/t_*.c and run under qemu-mipsel
@@ -354,7 +355,7 @@ See [docs/testing.md](docs/testing.md) for the suite map.
 |--------------|--------|
 | Linux x86_64 | built and tested in CI (`make test` and the other targets above) |
 | Linux aarch64 (ARM64) | built and tested in CI |
-| Linux riscv64 (RV64GC, lp64d, glibc) | built in CI (cross) and tested under `qemu-riscv64`; binary and `.deb` on every release. Local: `make riscv` → `./ntx-riscv64`, `make test-riscv`, `make test-riscv-shell`. Not tested on real hardware in CI. |
+| Linux riscv64 (RV64GC, lp64d, glibc) | built in CI (cross) and tested under `qemu-riscv64`; binary and `.deb` on every release. Local: `make riscv` → `./ntx-riscv64`, `make size-riscv`, `make test-riscv`, `make test-riscv-shell`. Not tested on real hardware in CI. |
 | Linux mipsel (MIPS32r2, soft-float, musl static) | Pre-built on [Releases](https://github.com/pchmielewski1/ntx/releases) as `ntx-<version>-linux-mipsel` (attached manually). Local: `make mips` → `./ntx-mipsel`; `make test-mipsel` under `qemu-mipsel`. OpenWrt `mipsel_24kc` (e.g. MediaTek MT7621). Not built in CI. |
 
 **riscv64 locally:** either install the cross toolchain and emulator yourself
