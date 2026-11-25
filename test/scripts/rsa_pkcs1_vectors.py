@@ -22,9 +22,12 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 PREFIX_SHA256 = bytes.fromhex("3031300d060960864801650304020105000420")
 
 
-def emsa(digest, k):
-    t = PREFIX_SHA256 + digest
+def emsa_bytes(t, k):
     return b"\x00\x01" + b"\xff" * (k - len(t) - 3) + b"\x00" + t
+
+
+def emsa(digest, k):
+    return emsa_bytes(PREFIX_SHA256 + digest, k)
 
 
 def main():
@@ -65,6 +68,29 @@ def main():
         add(n, 2, dg, emsa(dg, k), 0, "e=2")
         add(n - 1, 1, dg, emsa(dg, k), 0, "even-n-e=1")
         add(n - 1, 65537, dg, emsa(dg, k), 0, "even-n")
+        # --- crafted EMs signed with the real key (Bleichenbacher-2006 class): the
+        # verifier must refuse every variant but the canonical EMSA-PKCS1-v1__5.
+        d = key.private_numbers().d
+
+        def rawsign(em):
+            return pow(int.from_bytes(em, "big"), d, n)
+
+        t = PREFIX_SHA256 + dg
+        add(n, e, dg, rawsign(emsa(dg, k)), 1, "bt1-crafted-%d" % bits)
+        # block type 02 instead of 01
+        add(n, e, dg, rawsign(b"\x00\x02" + b"\xff" * (k - len(t) - 3) + b"\x00" + t), 0,
+            "bt2-%d" % bits)
+        # one trailing byte after DigestInfo (PS shrunk by one, still >= 8)
+        add(n, e, dg, rawsign(b"\x00\x01" + b"\xff" * (k - len(t) - 4) + b"\x00" + t + b"\x00"), 0,
+            "di-trailing-%d" % bits)
+        # non-minimal DigestInfo: 04 81 20 instead of 04 20 (fixed-position compare
+        # makes the whole T shift by one byte)
+        t_nonmin = PREFIX_SHA256[:-1] + b"\x81\x20" + dg
+        add(n, e, dg, rawsign(b"\x00\x01" + b"\xff" * (k - len(t_nonmin) - 3) + b"\x00" + t_nonmin), 0,
+            "di-nonminimal-%d" % bits)
+        # right framing, wrong digest OID (last byte of the SHA-256 OID -> 0x02)
+        t_oid = PREFIX_SHA256[:-1] + bytes([PREFIX_SHA256[-1] ^ 0x03]) + dg
+        add(n, e, dg, rawsign(emsa_bytes(t_oid, k)), 0, "di-wrong-oid-%d" % bits)
 
     out = os.path.join(ROOT, "test", "vectors", "rsa_pkcs1")
     os.makedirs(out, exist_ok=True)

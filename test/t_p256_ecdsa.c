@@ -59,6 +59,37 @@ int main(void) {
     }
     printf("PASS p256-sig-der\n");
 
+    /* adversarial sig DER: framing must be exact, r/s bounds enforced */
+    {
+        static uint8_t buf[96];
+        size_t dlen = sizeof der;
+        memcpy(buf, der, dlen);
+        buf[dlen] = 0x00; /* trailing byte after SEQUENCE */
+        if (ntx_p256_sig_from_der(buf, dlen + 1, r2, s2) == 0) { fprintf(stderr, "FAIL der trailing byte\n"); return 1; }
+        if (ntx_p256_sig_from_der(der, dlen - 1, r2, s2) == 0) { fprintf(stderr, "FAIL der truncated\n"); return 1; }
+        buf[1] = 0x49; memcpy(buf + dlen, "\x02\x01\x00", 3); /* third INTEGER */
+        if (ntx_p256_sig_from_der(buf, dlen + 3, r2, s2) == 0) { fprintf(stderr, "FAIL der third element\n"); return 1; }
+        buf[1] = 0x46; /* r/s zero-pad tolerated (lenient int_to_32), same integers */
+        static uint8_t padded[80];
+        padded[0] = 0x30; padded[1] = 0x47; /* SEQ content = 36 + 35 */
+        padded[2] = 0x02; padded[3] = 0x22; padded[4] = 0x00; padded[5] = 0x00;
+        memcpy(padded + 6, r, 32);
+        padded[38] = 0x02; padded[39] = 0x21;
+        memcpy(padded + 40, der + 39, 33); /* 00 || s as in der */
+        if (ntx_p256_sig_from_der(padded, 73, r2, s2) != 0 || memcmp(r, r2, 32)) {
+            fprintf(stderr, "FAIL der zero-pad\n"); return 1;
+        }
+        static const uint8_t r_zero[32] = {0};
+        uint8_t nm1[32], n_b[32];
+        memcpy(n_b, N, 32);
+        if (ntx_p256_ecdsa_verify_sha256(qx, qy, r_zero, s, h)) { fprintf(stderr, "FAIL r=0 verify\n"); return 1; }
+        if (ntx_p256_ecdsa_verify_sha256(qx, qy, n_b, s, h)) { fprintf(stderr, "FAIL r=n verify\n"); return 1; }
+        uint8_t one[32] = {0}; one[31] = 1;
+        if (ntx_p256_ecdsa_verify_sha256(qx, qy, r, one, h)) { fprintf(stderr, "FAIL s=1 verify\n"); return 1; }
+        (void)nm1;
+    }
+    printf("PASS p256-sig-der-adversarial\n");
+
     static const uint8_t spki[] = {
         0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
         0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04, 0xf5, 0x0b, 0x53, 0x09, 0x08,

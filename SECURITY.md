@@ -88,8 +88,16 @@ Known-and-accepted from the same audit: server CCS may repeat before the first e
 record (F3, harmless), negotiated ALPN is not checked against the offered list (F4, pinned
 servers only), TLS_FALLBACK_SCSV is not sent on the 1.3→1.2 reconnect (the signed
 `DOWNGRD\x01` sentinel plus the mandatory 0x0303 ServerHello version cover the downgrade
-class). Remaining checklist items (X.509 chain/CA-bit, PSS/PKCS#1 structure, MSE range
-checks, uTP/SOCKS5 parsers, fuzz runs) are tracked in the checklist doc.
+class). The RSA signature path (checklist item 3) was verified with offline-crafted vectors
+signed by the real private key: `test/scripts/rsa_pkcs1_vectors.py` (88 vectors — Bleichenbacher-
+2006-class forgeries: block type 02, trailing byte after DigestInfo, non-minimal `04 81 20`,
+wrong digest OID, degenerate e/n) and `test/scripts/rsa_pss_vectors.py` (45 vectors — trailer,
+unused bits, DB padding/separator, salt 20/auto, leading-zero modulus); every forgery is
+rejected and every canonical encoding accepted, so the DigestInfo compare is strict and the
+PSS MGF1 mask is bound to the recomputed hash (class of CVE-2022-3437 closed). ECDSA sig DER
+framing is exact-length with r,s ∈ [1,n−1]; leading-zero INTEGERs are tolerated (documented
+leniency, harmless here). Remaining checklist items (MSE range checks, uTP/SOCKS5 parsers,
+fuzz runs) are tracked in the checklist doc.
 
 Other things to know:
 
