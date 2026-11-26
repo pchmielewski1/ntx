@@ -22,7 +22,7 @@ typedef struct {
 /* BEGIN GENERATED (make pins-update) — survey 2026-11-08, docs/network.md */
 static const strk_raw strk_raw_tab[] = {
     {"https://tracker.pmman.tech:443/announce", "tracker.pmman.tech",
-     {"2f7626b32aeffb4442ce9253fd9fffbe037408da90e6f2bbc7d89a77b16cc5f2", "8a219385c7334700275ece920c3753bda8450637c04241ece7b5c09e14a54251", 0, 0}},
+     {"2f7626b32aeffb4442ce9253fd9fffbe037408da90e6f2bbc7d89a77b16cc5f2", "8a219385c7334700275ece920c3753bda8450637c04241ece7b5c09e14a54251", "24d17dd2585c6951b4d5974a6b3ea3299a4c6a347da3e7831b0af6f07c31a34b", 0}},
     {"https://tracker.7471.top:443/announce", "tracker.7471.top",
      {"c9c26afbf190405d98a328c6fb758ddb92d0e6697f4b3ca6aed8c9a6a13478ef", "2830ed22c79e6ca1e066fe0dd79997c3f9646d83eca106d40c070de3354a6023", "47121edc3dc3d457a063f2da925f5c02f71e4e4e14b18a207e67f93c508fa951", 0}},
     {"https://tracker.zhuqiy.com:443/announce", "tracker.zhuqiy.com",
@@ -30,7 +30,7 @@ static const strk_raw strk_raw_tab[] = {
     {"https://1337.abcvg.info:443/announce", "1337.abcvg.info",
      {"e1e5e48f542eee53816db2bba6c398c867d9e755ff615956763fa7dc8b8bf332", "7d57ae6ebdd6015aaad6f04b56c86f789a6c7949930ca405ce07f3684e20c1e3", "6ab58ac07ffbe75a3b6e57197d77fbfc23fc9f4422d872c29225a765e5c4444b", 0}},
     {"https://tracker.yume-hatsuyuki.moe:443/announce", "tracker.yume-hatsuyuki.moe",
-     {"8c30b82302fe1b70a8007ae1ed5cbb0b256e5ae4185880d22ecd78466c67b956", "5bfc4a4a6371a802d59ce90d8fe0f3c79da1695f5faddb10ca368df6a8c48939", 0, 0}},
+     {"8c30b82302fe1b70a8007ae1ed5cbb0b256e5ae4185880d22ecd78466c67b956", "5bfc4a4a6371a802d59ce90d8fe0f3c79da1695f5faddb10ca368df6a8c48939", "4b3651723a2e9b0af1499f0d0baa3fdd3b82d51b6685020188ecfa146a262f21", 0}},
 };
 /* END GENERATED */
 #endif
